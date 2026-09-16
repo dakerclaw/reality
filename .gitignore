@@ -1,0 +1,15 @@
+# Local development scaffolding
+.orig-backup/
+.selftest-tmp/
+.tmp/
+*.diff
+
+# WorkBuddy workspace state
+.workbuddy/
+
+.selftest*.sh
+.selftest_tgbot.py
+
+# Python
+__pycache__/
+*.py[cod]
