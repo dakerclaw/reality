@@ -33,6 +33,8 @@ with three design rules on top of the upstream feature set:
 * Transports: `tcp`, `http`, `grpc`, `ws`, `tuic`, `hysteria2`, `shadowtls`
 * Multi-user with per-user UUID/password, client links and QR codes
 * Cloudflare WARP outbound (free and WARP+ license), zero extra images
+* BBR congestion control switched on automatically (`tcp_bbr` + the `fq` qdisc,
+  written to `/etc/sysctl.d`), plus kernel socket/backlog tunables
 * Letsencrypt certificate issuance and renewal through certbot
 * Optional "safe internet" mode (blocks ads/malware, optionally adult content)
 * Text-based user interface and Telegram bot for user management
@@ -53,6 +55,9 @@ with three design rules on top of the upstream feature set:
 * A public IP. **A domain of your own is not required** — see
   [Do I need my own domain?](#do-i-need-my-own-domain). One is needed only for
   `letsencrypt`.
+* Linux 4.9 or newer if you want BBR — older kernels are still fine, BBR is
+  skipped with a warning there (see
+  [Kernel tuning and BBR](#kernel-tuning-and-bbr))
 
 ---
 
@@ -238,6 +243,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `-c, --core <xray\|sing-box>` | Engine (default `sing-box`) |
 | `--security <reality\|letsencrypt\|selfsigned>` | TLS mode (default `reality`) |
 | `--enable-safenet <true\|false>` | Block ads/malware, plus adult content on sing-box |
+| `--enable-bbr <true\|false>` | Enable the BBR congestion control and the `fq` qdisc (default `true`; skipped with a warning on kernels that lack BBR) |
 | `--enable-warp <true\|false>` | Route outbound traffic through Cloudflare WARP |
 | `--warp-license <license>` | WARP+ license key |
 | `--regenerate` | Regenerate Reality keys and short id |
@@ -299,6 +305,48 @@ Registration creates a free WARP device against Cloudflare, stores the device id
 token, client id, interface addresses and the locally generated private key in
 `/opt/reality-ezpz/config`, and uses the device as the engine's outbound. Turning
 WARP off deletes the device on Cloudflare's side.
+
+## Kernel tuning and BBR
+
+Every run writes `/etc/sysctl.d/99-reality-ezpz.conf` and applies it, so the
+tuning survives reboots by being a normal sysctl drop-in. On top of the socket
+buffer, backlog and conntrack values, **BBR is enabled by default**:
+
+```ini
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+```
+
+BBR lives in the kernel, so there is nothing to install from a repository — the
+installer loads `tcp_bbr` and `sch_fq` and writes the two keys. What it does *not*
+do is pretend: the state is read back from `/proc` and reported.
+
+```
+$ bash /opt/reality-ezpz/reality-ezpz.sh --show-server-config
+...
+BBR: ON (kernel: bbr, qdisc: fq)
+```
+
+| Situation | What happens |
+| --- | --- |
+| Normal kernel (4.9+) | The module is loaded, both keys are written and BBR is active immediately |
+| Kernel without BBR (older than 4.9, or a container that cannot load its host's modules) | A warning is printed and **the two keys are left out of the file**, so nothing fails on every reboot afterwards. Every other tunable is still applied |
+| You pass `--enable-bbr false` | The two lines are dropped from the file, and the live kernel is only reset if it was `bbr`/`fq` — a congestion control you picked yourself is never overwritten |
+| The kernel rejects one key | That key is named in a warning and the remaining keys are still applied |
+
+Because each key is written on its own, a kernel that refuses one setting can no
+longer leave BBR quietly unapplied while the installer reports success.
+
+Note that this is the **kernel** congestion control. The `hysteria2` transport
+additionally advertises `congestion_control=bbr` in its QUIC configuration, which
+is a client-side transport setting and is independent of this.
+
+```bash
+bash /opt/reality-ezpz/reality-ezpz.sh --enable-bbr false   # turn it off
+bash /opt/reality-ezpz/reality-ezpz.sh --enable-bbr true    # turn it back on
+```
+
+---
 
 ## Backup and restore
 
@@ -367,6 +415,8 @@ bash /opt/reality-ezpz/reality-ezpz.sh --uninstall   # keeps the Docker packages
 | Container restarts in a loop | `docker logs $(docker compose -p reality-ezpz ps -q engine)` |
 | Client cannot connect | The main port is reachable (firewall/security group), and the SNI domain matches |
 | `WARP account creation has been failed!` | Outbound access to `api.cloudflareclient.com` |
+| `BBR was requested but is not active` | The running kernel has no BBR (needs 4.9+) or is a container that cannot load its host's modules; `--enable-bbr false` silences it |
+| `these kernel settings ... were skipped` | The listed keys do not exist on this kernel; the rest were applied and BBR is unaffected |
 | `the SNI (...) differs from the camouflage site (...)` | You passed both `--domain` and `--camouflage`; point them at the same site unless you have a reason not to |
 | The HTTP port shows the placeholder page | Put your files into `/opt/reality-ezpz/config/website` — `index.html` is only created when nothing is there |
 | The camouflage site is unreachable from the server | `--camouflage` must be a real site the machine can reach; nothing is served locally for it |

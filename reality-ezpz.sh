@@ -88,6 +88,12 @@ defaults[port]=8443
 # HTTP-01 challenge. "OFF" keeps it unpublished entirely.
 defaults[http_port]=8080
 defaults[safenet]=OFF
+# BBR is a kernel feature, so "enabling" it means loading tcp_bbr/sch_fq and
+# writing two sysctls - nothing is installed from a package repository. It is
+# switched on by default and falls back to leaving the kernel as it is when the
+# running kernel does not offer bbr (older than 4.9, or a container that cannot
+# load its host's modules).
+defaults[bbr]=ON
 defaults[warp]=OFF
 defaults[warp_license]=""
 defaults[warp_private_key]=""
@@ -117,6 +123,7 @@ config_items=(
   "port"
   "http_port"
   "safenet"
+  "bbr"
   "warp"
   "warp_license"
   "warp_private_key"
@@ -156,7 +163,7 @@ regex[url]="^(http|https)://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[0-9]{1,3}(\.[0-9]{1,3
 function show_help {
   echo ""
   echo "Usage: reality-ezpz.sh [-t|--transport=tcp|http|grpc|ws|tuic|hysteria2|shadowtls] [-d|--domain=<domain>] [--camouflage=<domain[:port]>] [--server=<server>]
-  [--regenerate] [--default] [-r|--restart] [--enable-safenet=true|false] [--port=<port>] [--http-port=<port|off>] [-c|--core=xray|sing-box]
+  [--regenerate] [--default] [-r|--restart] [--enable-safenet=true|false] [--enable-bbr=true|false] [--port=<port>] [--http-port=<port|off>] [-c|--core=xray|sing-box]
   [--enable-warp=true|false] [--warp-license=<license>] [--security=reality|letsencrypt|selfsigned] [-m|--menu] [--show-server-config]
   [--add-user=<username>] [--lists-users] [--show-user=<username>] [--delete-user=<username>] [--backup] [--restore=<url|file>]
   [--backup-password=<password>] [-u|--uninstall]"
@@ -172,6 +179,9 @@ function show_help {
   echo "  -r  --restart             Restart services"
   echo "  -u, --uninstall           Uninstall reality"
   echo "      --enable-safenet <true|false> Enable or disable safenet (blocking malware and adult content)"
+  echo "      --enable-bbr <true|false> Enable or disable the BBR congestion control (default: ${defaults[bbr]})"
+  echo "                            BBR is a kernel feature: this loads tcp_bbr/sch_fq and writes the matching sysctls,"
+  echo "                            and is skipped with a warning on kernels that do not offer it (needs 4.9+)"
   echo "      --port <port>         Server port (default: ${defaults[port]}; 80 and 443 are never used unless asked for)"
   echo "      --http-port <port|off> Host port of the local website served by nginx out of ./website, and the ACME challenge"
   echo "                            in the letsencrypt mode (default: ${defaults[http_port]}, \"off\" leaves it unpublished)"
@@ -197,7 +207,7 @@ function show_help {
 
 function parse_args {
   local opts
-  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,help -- "$@")
+  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,help -- "$@")
   if [[ $? -ne 0 ]]; then
     return 1
   fi
@@ -268,6 +278,18 @@ function parse_args {
             ;;
           *)
             echo "Invalid safenet option: $2"
+            return 1
+            ;;
+        esac
+        ;;
+      --enable-bbr)
+        case "$2" in
+          true|false)
+            if [[ $2 == true ]]; then args[bbr]=ON; else args[bbr]=OFF; fi
+            shift 2
+            ;;
+          *)
+            echo "Invalid bbr option: $2"
             return 1
             ;;
         esac
@@ -2111,6 +2133,7 @@ function show_server_config {
   server_config=$server_config$'\n'"Transport: ${config[transport]}"
   server_config=$server_config$'\n'"Security: ${config[security]}"
   server_config=$server_config$'\n'"Safenet: ${config[safenet]}"
+  server_config=$server_config$'\n'"BBR: $(bbr_summary)"
   server_config=$server_config$'\n'"WARP: ${config[warp]}"
   server_config=$server_config$'\n'"WARP License: ${config[warp_license]}"
   server_config=$server_config$'\n'"Telegram Bot: ${config[tgbot]}"
@@ -2191,13 +2214,14 @@ function configuration_menu {
       "7" "HTTP Port (website / ACME)" \
       "8" "Camouflage Site" \
       "9" "Safe Internet" \
-      "10" "WARP" \
-      "11" "Telegram Bot" \
-      "12" "Restart Services" \
-      "13" "Regenerate Keys" \
-      "14" "Restore Defaults" \
-      "15" "Create Backup" \
-      "16" "Restore Backup" \
+      "10" "BBR" \
+      "11" "WARP" \
+      "12" "Telegram Bot" \
+      "13" "Restart Services" \
+      "14" "Regenerate Keys" \
+      "15" "Restore Defaults" \
+      "16" "Create Backup" \
+      "17" "Restore Backup" \
       3>&1 1>&2 2>&3)
     if [[ $? -ne 0 ]]; then
       break
@@ -2231,24 +2255,27 @@ function configuration_menu {
         config_safenet_menu
         ;;
       10 )
-        config_warp_menu
+        config_bbr_menu
         ;;
       11 )
-        config_tgbot_menu
+        config_warp_menu
         ;;
       12 )
-        restart_menu
+        config_tgbot_menu
         ;;
       13 )
-        regenerate_menu
+        restart_menu
         ;;
       14 )
-        restore_defaults_menu
+        regenerate_menu
         ;;
       15 )
-        backup_menu
+        restore_defaults_menu
         ;;
       16 )
+        backup_menu
+        ;;
+      17 )
         restore_backup_menu
         ;;
     esac
@@ -2534,6 +2561,24 @@ function config_safenet_menu {
   fi
   config[safenet]=$([[ $safenet == 'Enable' ]] && echo ON || echo OFF)
   update_config_file
+}
+
+function config_bbr_menu {
+  local bbr
+  bbr=$(whiptail --clear --backtitle "$BACKTITLE" --title "BBR" \
+    --radiolist --noitem "Enable the BBR congestion control algorithm" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+    "Enable" "$([[ "${config[bbr]}" == 'ON' ]] && echo 'on' || echo 'off')" \
+    "Disable" "$([[ "${config[bbr]}" == 'OFF' ]] && echo 'on' || echo 'off')" \
+    3>&1 1>&2 2>&3)
+  if [[ $? -ne 0 ]]; then
+    return
+  fi
+  config[bbr]=$([[ $bbr == 'Enable' ]] && echo ON || echo OFF)
+  update_config_file
+  # Unlike the other toggles this one is not carried by a container config, so
+  # the kernel is updated here instead of waiting for the next invocation.
+  tune_kernel
+  message_box "BBR" "BBR: $(bbr_summary)"
 }
 
 function config_warp_menu {
@@ -3024,8 +3069,67 @@ function generate_file_list {
   done
 }
 
+# The current kernel state, read back from /proc instead of assumed. Both helpers
+# are tolerant so they can also run where /proc/sys is not mounted.
+function current_congestion_control {
+  cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true
+}
+
+function current_qdisc {
+  cat /proc/sys/net/core/default_qdisc 2>/dev/null || true
+}
+
+function bbr_supported {
+  local available
+  available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)
+  [[ ${available} == *bbr* ]]
+}
+
+# One place decides how the BBR state is described, so the installer output, the
+# TUI and --show-server-config can never disagree.
+function bbr_summary {
+  local kernel_cc
+  local kernel_qdisc
+  if [[ ${config[bbr]} != 'ON' ]]; then
+    echo "${config[bbr]}"
+    return 0
+  fi
+  kernel_cc=$(current_congestion_control); kernel_cc="${kernel_cc:-unknown}"
+  kernel_qdisc=$(current_qdisc); kernel_qdisc="${kernel_qdisc:-unknown}"
+  echo "${config[bbr]} (kernel: ${kernel_cc}, qdisc: ${kernel_qdisc})"
+}
+
+function load_bbr_modules {
+  # Writing net.ipv4.tcp_congestion_control only auto-loads the module on some
+  # kernels and net.core.default_qdisc never does, so both are loaded explicitly.
+  # Inside a container that cannot see its host's /lib/modules this fails, which
+  # is why the outcome is not treated as an error here - bbr_supported decides.
+  modprobe tcp_bbr >/dev/null 2>&1 || true
+  modprobe sch_fq >/dev/null 2>&1 || true
+}
+
 function tune_kernel {
-  cat >/etc/sysctl.d/99-reality-ezpz.conf <<EOF
+  # The path is a parameter only so the regression suite can write to a scratch
+  # file instead of the real /etc; every caller in this script omits it.
+  local sysctl_file="${1:-/etc/sysctl.d/99-reality-ezpz.conf}"
+  local bbr_block
+  local line key value
+  local failed=()
+  if [[ ${config[bbr]} == 'OFF' ]]; then
+    bbr_block='# BBR is turned off'
+  else
+    load_bbr_modules
+    if bbr_supported; then
+      bbr_block=$'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr'
+    else
+      bbr_block='# BBR was requested but this kernel does not offer it'
+      echo 'Warning: this kernel does not offer the bbr congestion control algorithm (it ships with Linux 4.9 and newer, and a container cannot load modules from a host it cannot see). Continuing without BBR; every other tunable below is still applied.'
+    fi
+  fi
+  # nf_conntrack_max below is meaningless until the module is there, and on a
+  # minimal system that is what used to make one key fail silently.
+  modprobe nf_conntrack >/dev/null 2>&1 || true
+  cat >"${sysctl_file}" <<EOF
 fs.file-max = 200000
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
@@ -3043,11 +3147,43 @@ net.ipv4.tcp_mem = 25600 51200 102400
 net.ipv4.tcp_rmem = 4096 65536 67108864
 net.ipv4.tcp_wmem = 4096 65536 67108864
 net.ipv4.tcp_mtu_probing = 1
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
+${bbr_block}
 net.netfilter.nf_conntrack_max=1000000
 EOF
-  sysctl -qp /etc/sysctl.d/99-reality-ezpz.conf >/dev/null 2>&1 || true
+  # Every key is written on its own instead of relying on `sysctl -p`, whose
+  # errors used to be thrown away: a kernel that rejected one line could leave
+  # BBR unapplied while the installer reported success. Failures are collected
+  # and reported rather than hidden.
+  while IFS= read -r line; do
+    [[ ${line} == *=* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key// /}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    if ! sysctl -qw "${key}=${value}" >/dev/null 2>&1; then
+      failed+=("${key}")
+    fi
+  done <"${sysctl_file}"
+  if [[ ${#failed[@]} -gt 0 ]]; then
+    echo "Warning: these kernel settings are not available on this system and were skipped: ${failed[*]}"
+  fi
+  if [[ ${config[bbr]} == 'OFF' ]]; then
+    # Revert only what this script would have set, so a congestion control the
+    # user picked themselves is never overwritten.
+    if [[ "$(current_congestion_control)" == 'bbr' ]]; then
+      sysctl -qw net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+    fi
+    if [[ "$(current_qdisc)" == 'fq' ]]; then
+      sysctl -qw net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
+    fi
+    echo "BBR is disabled (congestion control: $(current_congestion_control), qdisc: $(current_qdisc))."
+    return 0
+  fi
+  if [[ "$(current_congestion_control)" == 'bbr' ]]; then
+    echo "BBR is enabled (congestion control: $(current_congestion_control), qdisc: $(current_qdisc))."
+  else
+    echo "Warning: BBR was requested but is not active; the kernel reports \"$(current_congestion_control)\" as the congestion control."
+  fi
 }
 
 function configure_docker {

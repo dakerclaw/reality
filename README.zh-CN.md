@@ -27,6 +27,8 @@
 * 传输协议：`tcp`、`http`、`grpc`、`ws`、`tuic`、`hysteria2`、`shadowtls`
 * 多用户，每用户独立 UUID / 密码，输出客户端链接与二维码
 * Cloudflare WARP 出口（支持免费版与 WARP+ 授权），不引入任何额外镜像
+* 自动开启 BBR 拥塞控制（加载 `tcp_bbr` + `fq` 队列，写入 `/etc/sysctl.d`），
+  并附带内核 socket / backlog 调优
 * 通过 certbot 申请与自动续期 Letsencrypt 证书
 * 可选「安全上网」模式（拦截广告 / 恶意域名，sing-box 还可拦截成人内容）
 * 文本管理界面（TUI）与 Telegram 机器人管理用户
@@ -46,6 +48,8 @@
 * root 权限
 * 公网 IP。**完全不需要自己有域名** —— 见[可以不买域名吗](#可以不买域名吗)；
   只有 `letsencrypt` 模式才需要一个域名。
+* 想要 BBR 加速需要 Linux 4.9 及以上；更低版本内核也能正常部署，只是会跳过 BBR 并给出
+  告警（见[内核调优与 BBR](#内核调优与-bbr)）
 
 ---
 
@@ -220,6 +224,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `-c, --core <xray\|sing-box>` | 引擎（默认 `sing-box`） |
 | `--security <reality\|letsencrypt\|selfsigned>` | TLS 模式（默认 `reality`） |
 | `--enable-safenet <true\|false>` | 拦截广告 / 恶意域名，sing-box 下还会拦截成人内容 |
+| `--enable-bbr <true\|false>` | 开启 BBR 拥塞控制与 `fq` 队列（默认 `true`；内核不支持时只告警并跳过） |
 | `--enable-warp <true\|false>` | 出口流量走 Cloudflare WARP |
 | `--warp-license <license>` | WARP+ 授权码 |
 | `--regenerate` | 重新生成 Reality 密钥与 short id |
@@ -280,6 +285,45 @@ bash /opt/reality-ezpz/reality-ezpz.sh --enable-warp true --warp-license XXXXXXX
 本机生成的私钥写入 `/opt/reality-ezpz/config`，并作为引擎出口使用。关闭 WARP 时会在
 Cloudflare 侧删除该设备。
 
+## 内核调优与 BBR
+
+每次运行都会写入并应用 `/etc/sysctl.d/99-reality-ezpz.conf`，因此调优以标准 sysctl drop-in 的
+形式在重启后依然有效。除 socket 缓冲、backlog、conntrack 等参数外，**BBR 默认开启**：
+
+```ini
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+```
+
+BBR 是内核自带能力，不需要从软件源安装任何东西 —— 脚本只做两件事：加载 `tcp_bbr` 与
+`sch_fq`，写入上面两个键。它不做的是「假装成功」：状态会从 `/proc` 读回来并如实汇报。
+
+```
+$ bash /opt/reality-ezpz/reality-ezpz.sh --show-server-config
+...
+BBR: ON (kernel: bbr, qdisc: fq)
+```
+
+| 情况 | 会发生什么 |
+| --- | --- |
+| 正常内核（4.9 及以上） | 加载模块、写入两个键，BBR 立即生效 |
+| 内核不支持 BBR（低于 4.9，或容器无法加载宿主机模块） | 打印告警，并且**不把这两个键写进配置文件**，避免之后每次重启都失败；其余调优项照常应用 |
+| 传 `--enable-bbr false` | 从文件中移除这两行；只有当当前值确实是 `bbr` / `fq` 时才回退，你自己设定的拥塞控制算法不会被覆盖 |
+| 内核拒绝其中某个键 | 在告警里点名该键，其余键仍然应用 |
+
+因为每个键是单独写入的，内核拒绝某一项时不会再出现「BBR 实际没生效、安装器却报告成功」
+的情况。
+
+注意这里说的是**内核**拥塞控制。`hysteria2` 传输另外会在 QUIC 配置里声明
+`congestion_control=bbr`，那是客户端传输层设置，与本项互相独立。
+
+```bash
+bash /opt/reality-ezpz/reality-ezpz.sh --enable-bbr false   # 关闭
+bash /opt/reality-ezpz/reality-ezpz.sh --enable-bbr true    # 重新开启
+```
+
+---
+
 ## 备份与恢复
 
 ```bash
@@ -338,6 +382,8 @@ bash /opt/reality-ezpz/reality-ezpz.sh --uninstall   # 不会卸载 Docker 本�
 | 容器反复重启 | `docker logs $(docker compose -p reality-ezpz ps -q engine)` |
 | 客户端连不上 | 主端口是否放行（防火墙 / 安全组），SNI 域名是否匹配 |
 | 提示 `WARP account creation has been failed!` | 能否访问 `api.cloudflareclient.com` |
+| 提示 `BBR was requested but is not active` | 当前内核没有 BBR（需 4.9+），或容器无法加载宿主机模块；`--enable-bbr false` 可消除该提示 |
+| 提示 `these kernel settings ... were skipped` | 列出的键在当前内核上不存在；其余键已应用，不影响 BBR |
 | 提示 `the SNI (...) differs from the camouflage site (...)` | 你同时传了 `--domain` 与 `--camouflage`；除确有需要外，两者应指向同一个站点 |
 | HTTP 端口上显示的是占位首页 | 把你的文件放进 `/opt/reality-ezpz/config/website` —— `index.html` 只在目录为空时生成 |
 | 伪装站点连接失败 | `--camouflage` 必须是本机能够访问的真实站点，本机不会为它提供任何内容 |
