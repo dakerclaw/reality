@@ -44,7 +44,8 @@
   Docker 也能运行
 * 架构 `x86_64` 或 `arm64`
 * root 权限
-* 公网 IP；若要用 `letsencrypt` 还需要一个域名
+* 公网 IP。**完全不需要自己有域名** —— 见[可以不买域名吗](#可以不买域名吗)；
+  只有 `letsencrypt` 模式才需要一个域名。
 
 ---
 
@@ -129,6 +130,40 @@ ls /opt/reality-ezpz/config/website
   站点放进去，升级时不会丢。
 * 在 `reality` / `shadowtls` 模式下，这个网站就是全部 HTTP 暴露面；不再通过明文 HTTP
   转发远端伪装站点的内容。
+
+---
+
+## 可以不买域名吗
+
+可以。默认模式根本不使用你自己的域名；而且本分支已经把自家网站交给 nginx 托管，连这一块
+也不需要域名。
+
+| 模式 | 需要自有域名？ | 握手里带的是什么 |
+| --- | --- | --- |
+| `reality`（默认） | 不需要 | SNI 用的是**远端**伪装大站（`--camouflage`，默认 `www.google.com`），探测者拿到的是那个站点的真实证书 |
+| `shadowtls` 传输 | 不需要 | 握手服务器同样是远端伪装大站 |
+| `selfsigned` | 严格说不必要 | 自签证书；客户端必须接受不受信任的证书（`allow_insecure` / `insecure=1`），主动探测能够察觉 |
+| `letsencrypt` | **需要** | 为你的自有域名签发公信证书 —— ACME HTTP-01 要求该域名解析到本机，并占用 `80` 端口 |
+
+所以纯粹只有公网 IP 的机器，**没有任何需要填写的东西**：
+
+```bash
+# reality + sing-box，伪装目标默认 www.google.com，无需任何额外参数
+bash <(curl -fsSL .../reality-ezpz.sh)
+
+# 同样不需要域名，只是换个探测者会看到的站点
+bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
+```
+
+* 不用配 DNS 记录，也不用在本地签证书：`reality` / `shadowtls` 模式下引擎只是把握手转发给
+  远端站点、不做 TLS 终结，因此既不会生成 `server.crt` / `server.key`，也不会往引擎容器里
+  挂载证书。
+* 只要不涉及 `letsencrypt`，`--server` 直接填公网 IP 即可；能自动探测时脚本会自己探测，
+  只有在探测失败且未手工指定时才会以提示信息中止安装。
+* `ws`、`tuic`、`hysteria2` 与 `reality` 组合会被拒绝（它们需要真正的 TLS 终结）。没有域名时
+  可用的组合是 `reality` + `tcp` / `http` / `grpc`，或者 `shadowtls` 传输。
+* 代价是你借用了别人的域名：请选一个**服务器与客户端都能访问**、且 TLS 指纹普通的站点。
+  详见[安全说明](#安全说明)。
 
 ---
 

@@ -50,7 +50,9 @@ with three design rules on top of the upstream feature set:
   with the Compose plugin are available
 * `x86_64` or `arm64`
 * Root access
-* A public IP; a domain name as well if you want `letsencrypt`
+* A public IP. **A domain of your own is not required** — see
+  [Do I need my own domain?](#do-i-need-my-own-domain). One is needed only for
+  `letsencrypt`.
 
 ---
 
@@ -138,6 +140,44 @@ Notes:
   overwritten** — put your own site there and it survives upgrades.
 * In the `reality`/`shadowtls` modes this website is the whole HTTP surface;
   nothing is relayed to the remote camouflage site over plain HTTP anymore.
+
+---
+
+## Do I need my own domain?
+
+No. The default mode never uses a domain you own, and since this fork serves your
+own website through nginx, you do not need one for that either.
+
+| Mode | Own domain needed? | What the handshake carries |
+| --- | --- | --- |
+| `reality` (default) | No | The SNI is the **remote** camouflage site (`--camouflage`, default `www.google.com`), and a probe gets that site's real certificate back |
+| `shadowtls` transport | No | The handshake server is the remote camouflage site as well |
+| `selfsigned` | Not strictly | A self-signed certificate; clients must accept an untrusted one (`allow_insecure`/`insecure=1`), which an active probe can notice |
+| `letsencrypt` | **Yes** | A publicly trusted certificate for your own domain — ACME HTTP-01 needs that domain to resolve to this machine and needs port `80` |
+
+So for a plain IP-only box there is nothing to name at all:
+
+```bash
+# reality + sing-box, camouflage defaults to www.google.com — nothing to supply
+bash <(curl -fsSL .../reality-ezpz.sh)
+
+# still no domain, but choose what a probe will see instead
+bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
+```
+
+* No DNS record to create and no certificate to issue locally: in the
+  `reality`/`shadowtls` modes the engine relays the handshake to the remote site
+  instead of terminating it, so no `server.crt`/`server.key` is generated and
+  nothing is mounted into the engine container.
+* `--server` accepts a bare public IP as long as `letsencrypt` is not in play; the
+  address is auto-detected when it can be, and only then does an empty value abort
+  the install with a hint.
+* `ws`, `tuic` and `hysteria2` are refused together with `reality` (they need real
+  TLS termination). Without a domain the useful combinations are `reality` with
+  `tcp`/`http`/`grpc`, or the `shadowtls` transport.
+* The trade-off is that you are borrowing someone else's domain: pick a site that
+  is reachable from **both** the server and the client, with an ordinary-looking
+  TLS stack. See [Security notes](#security-notes).
 
 ---
 
