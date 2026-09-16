@@ -852,7 +852,9 @@ function install_packages {
   # `which` itself is missing. Only missing packages are installed instead of
   # reinstalling the whole set on every invocation.
   # xxd is deliberately absent: warp_decode_reserved no longer depends on it.
-  for package in qrencode whiptail jq zip unzip; do
+  # openssl is required for the self-signed certificate and for the WARP key
+  # pair (X25519, so OpenSSL 1.1.0+).
+  for package in curl openssl qrencode whiptail jq zip unzip; do
     if ! command -v "${package}" >/dev/null 2>&1; then
       packages+=("${package}")
     fi
