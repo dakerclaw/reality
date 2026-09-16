@@ -1,234 +1,213 @@
 # reality
 
-**English** | [简体中文](README.zh-CN.md)
+**简体中文** | [English](README.EN.md)
 
-Install and configure VLESS (Reality / TLS), TUIC, hysteria2 and ShadowTLS on your
-Linux server with a single command.
+一条命令在 Linux 服务器上部署 VLESS（Reality / TLS）、TUIC、hysteria2 与 ShadowTLS。
 
-`reality` builds a Docker Compose stack (sing-box or xray engine) in front of a
-TLS-terminating proxy, generates the client configuration and QR codes, and gives
-you a TUI plus an optional Telegram bot to manage users.
+`reality` 会用 Docker Compose 拉起一套代理栈（引擎可选 sing-box 或 xray），生成客户端配置
+与二维码，并提供文本管理界面（TUI）和可选的 Telegram 机器人来管理用户。
 
-It is a hardened fork of [reality-ezpz](https://github.com/aleskxyz/reality-ezpz)
-with three design rules on top of the upstream feature set:
+本项目是 [reality-ezpz](https://github.com/aleskxyz/reality-ezpz) 的加固分支，在上游功能之上
+额外确立三条设计准则：
 
-1. **An installation never takes a well-known port.** The default setup binds
-   `8443` and `8080`. Port `80` is used by exactly one mode — `letsencrypt`, which
-   the ACME HTTP-01 challenge forces — and only when you ask for it.
-2. **Every component comes from its own upstream.** Container images are the
-   official ones (no third-party re-published images), and Cloudflare WARP is
-   registered directly against the Cloudflare client API instead of through a
-   community `wgcf` image.
-3. **Camouflage target and website are separate.** The proxy port falls back to a
-   real **remote** site you name at deployment time, while nginx serves **your
-   own** site on the HTTP port. See
-   [Website and camouflage](#website-and-camouflage).
+1. **安装过程绝不占用知名端口。** 默认只绑定 `8443` 和 `8080`。端口 `80` 只有
+   `letsencrypt` 模式会用（ACME HTTP-01 协议强制要求），且必须由你主动选择。
+2. **每个组件都来自它自己的上游。** 容器镜像全部使用官方镜像（不再使用任何第三方转载镜像），
+   Cloudflare WARP 直接调用 Cloudflare 官方接口注册，不再依赖社区的 `wgcf` 镜像。
+3. **伪装目标与自有网站彻底分离。** 代理端口把未通过校验的流量回落到部署时指定的
+   **远端真实大站**，nginx 则在 HTTP 端口上正常负载**你自己的网站**。详见
+   [网站与伪装](#网站与伪装)。
 
 ---
 
-## Features
+## 功能特性
 
-* Docker + Compose installed and configured automatically
-* `sing-box` or `xray` engine, `reality`, `letsencrypt` or `selfsigned` TLS
-* Transports: `tcp`, `http`, `grpc`, `ws`, `tuic`, `hysteria2`, `shadowtls`
-* Multi-user with per-user UUID/password, client links and QR codes
-* Cloudflare WARP outbound (free and WARP+ license), zero extra images
-* BBR congestion control switched on automatically (`tcp_bbr` + the `fq` qdisc,
-  written to `/etc/sysctl.d`), plus kernel socket/backlog tunables
-* Letsencrypt certificate issuance and renewal through certbot
-* Optional "safe internet" mode (blocks ads/malware, optionally adult content)
-* Text-based user interface and Telegram bot for user management
-* nginx serves your own site from `./website` on the HTTP port (`reality`/`shadowtls`
-  fall back to a remote site instead, never to your own site)
-* Password-protected backup / restore of users and configuration
-* Kernel tunables, IPv6 support, `tcp`/`http`/`grpc`/`ws` multiplexing behind haproxy
-
----
-
-## Requirements
-
-* Linux with `apt` (Debian/Ubuntu) or `yum` (RHEL family) — anything else works as
-  long as `curl`, `openssl`, `jq`, `qrencode`, `whiptail`, `zip`/`unzip` and Docker
-  with the Compose plugin are available
-* `x86_64` or `arm64`
-* Root access
-* A public IP. **A domain of your own is not required** — see
-  [Do I need my own domain?](#do-i-need-my-own-domain). One is needed only for
-  `letsencrypt`.
-* Linux 4.9 or newer if you want BBR — older kernels are still fine, BBR is
-  skipped with a warning there (see
-  [Kernel tuning and BBR](#kernel-tuning-and-bbr))
+* 自动安装并配置 Docker 与 Compose 插件
+* 引擎可选 `sing-box` / `xray`，TLS 可选 `reality` / `letsencrypt` / `selfsigned`
+* 传输协议：`tcp`、`http`、`grpc`、`ws`、`tuic`、`hysteria2`、`shadowtls`
+* 多用户，每用户独立 UUID / 密码，输出客户端链接与二维码
+* Cloudflare WARP 出口（支持免费版与 WARP+ 授权），不引入任何额外镜像
+* 自动开启 BBR 拥塞控制（加载 `tcp_bbr` + `fq` 队列，写入 `/etc/sysctl.d`），
+  并附带内核 socket / backlog 调优
+* 通过 certbot 申请与自动续期 Letsencrypt 证书
+* 可选「安全上网」模式（拦截广告 / 恶意域名，sing-box 还可拦截成人内容）
+* 文本管理界面（TUI）与 Telegram 机器人管理用户
+* nginx 在 HTTP 端口上正常负载 `./website` 里的自有网站（`reality` / `shadowtls` 的
+  回落目标是远端站点，不会落在你自己的站上）
+* 支持密码保护的备份与恢复（用户 + 配置）
+* 内核参数调优、IPv6 支持，`tcp` / `http` / `grpc` / `ws` 由 haproxy 复用端口
 
 ---
 
-## Quick start
+## 环境要求
+
+* Linux，包管理器为 `apt`（Debian / Ubuntu）或 `yum`（RHEL 系）；其他发行版只要具备
+  `curl`、`openssl`、`jq`、`qrencode`、`whiptail`、`zip`/`unzip` 以及带 Compose 插件的
+  Docker 也能运行
+* 架构 `x86_64` 或 `arm64`
+* root 权限
+* 公网 IP。**完全不需要自己有域名** —— 见[可以不买域名吗](#可以不买域名吗)；
+  只有 `letsencrypt` 模式才需要一个域名。
+* 想要 BBR 加速需要 Linux 4.9 及以上；更低版本内核也能正常部署，只是会跳过 BBR 并给出
+  告警（见[内核调优与 BBR](#内核调优与-bbr)）
+
+---
+
+## 快速开始
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh)
 ```
 
-The installer writes everything to `/opt/reality-ezpz`, starts the stack, prints
-the first client configuration and opens the TUI on demand.
+安装脚本会把全部内容写入 `/opt/reality-ezpz`，启动服务栈，输出第一个客户端配置，并在需要时
+打开 TUI。
 
-Common invocations:
+常见用法：
 
 ```bash
-# plain install with defaults (reality, sing-box, port 8443, website on 8080)
+# 使用默认配置安装（reality + sing-box，主端口 8443，网站端口 8080）
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh)
 
-# name the remote site the camouflage falls back to (also becomes the SNI)
+# 指定伪装回落的远端大站（同时会作为 SNI）
 bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
 
-# pick your own ports, no website at all
+# 自定义端口，并完全不挂网站
 bash <(curl -fsSL .../reality-ezpz.sh) --port 2087 --http-port off
 
-# letsencrypt certificate (this mode is the only one that binds port 80)
+# 使用 letsencrypt 证书（这是唯一会占用 80 端口的模式）
 bash <(curl -fsSL .../reality-ezpz.sh) --security letsencrypt --server vpn.example.com
 
-# open the management menu later
+# 之后随时打开管理菜单
 bash /opt/reality-ezpz/reality-ezpz.sh --menu
 ```
 
 ---
 
-## Port policy
+## 端口策略
 
-This is the part that differs most from the upstream project.
+这是与上游差异最大的部分。
 
-| Listener | Default host port | Controlled by | Notes |
+| 监听用途 | 默认宿主端口 | 由谁控制 | 说明 |
 | --- | --- | --- | --- |
-| Main proxy port | `8443/tcp` (and `/udp` for tuic/hysteria2) | `--port` | Any free port; `80` is refused, `443` is allowed but warns |
-| Local website | `8080/tcp` | `--http-port` | Served by nginx out of `./website`; `off` leaves it unpublished |
-| ACME challenge | `80/tcp` | forced | **Only** in `--security=letsencrypt` mode |
+| 主代理端口 | `8443/tcp`（tuic / hysteria2 另加 `/udp`） | `--port` | 可为任意空闲端口；`80` 会被拒绝，`443` 允许但会提示 |
+| 本机网站 | `8080/tcp` | `--http-port` | 由 nginx 从 `./website` 目录提供；设为 `off` 则完全不监听 |
+| ACME 校验 | `80/tcp` | 强制 | **仅** `--security=letsencrypt` 模式使用 |
 
-Behaviour worth knowing:
+需要了解的行为：
 
-* A default installation publishes `8443/tcp` and `8080/tcp` and nothing else.
-  Running a web server on `80`/`443` next to it is fine.
-* `--http-port off` removes the HTTP listener and the nginx container completely
-  (minimal footprint).
-* Selecting `--security letsencrypt` switches the HTTP port to `80` and says so,
-  because the ACME HTTP-01 challenge has no other port. Switching back to
-  `reality`/`selfsigned` resets it to `8080` automatically.
-* Explicitly asking for `443` with `--port` is still honoured (the warning is only
-  a warning) — that is the user's call, not the installer's.
+* 默认安装只发布 `8443/tcp` 与 `8080/tcp`，此外不占用任何端口。本机继续在 `80`/`443`
+  上运行 Nginx 等 Web 服务不受影响。
+* `--http-port off` 会彻底去掉 HTTP 监听与 nginx 容器（最小暴露面）。
+* 选择 `--security letsencrypt` 时脚本会把 HTTP 端口切到 `80` 并明确提示，因为 ACME
+  HTTP-01 校验只能走 80 端口；切回 `reality` / `selfsigned` 后会自动恢复为 `8080`。
+* 如果显式指定 `--port 443`，脚本仍会尊重你的选择（只提示、不阻止）——这是使用者的决定，
+  不由安装器替你决定。
 
 ---
 
-## Website and camouflage
+## 网站与伪装
 
-Two different jobs, deliberately kept apart:
+两件事，刻意分开处理：
 
-| | What it is | Where it lives |
+| | 是什么 | 在哪里配置 |
 | --- | --- | --- |
-| **Camouflage** | What an unauthenticated probe sees on the proxy port. In `reality` the engine forwards the TLS handshake to a real remote site instead of answering it itself; in `shadowtls` the handshake server is that site. | `--camouflage <domain[:port]>`, a real remote site, entered at deployment time |
-| **Website** | A normal site of your own, served by nginx from `./website`. | `--http-port <port>` |
+| **伪装** | 未通过校验的探测者在代理端口上看到的内容。`reality` 模式下引擎不自己应答 TLS 握手，而是把握手转发给远端真实站点；`shadowtls` 模式下该站点就是握手目标。 | `--camouflage <domain[:port]>`，一个远端真实站点，部署时输入 |
+| **网站** | 你自己的正常网站，由 nginx 从 `./website` 目录提供。 | `--http-port <port>` |
 
 ```bash
-# camouflage = www.microsoft.com, own site on 8080
+# 伪装目标 = www.microsoft.com，自有网站在 8080
 bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
 
-# serve your own site: drop files into the docroot, nothing else to do
+# 挂自己的网站：把文件丢进根目录即可，不需要其他操作
 ls /opt/reality-ezpz/config/website
 ```
 
-Notes:
+几点说明：
 
-* `--camouflage` defaults to `www.fastly.com` and also sets the SNI, because a
-  probe sends the SNI and compares the certificate it gets back against it. Set
-  `--domain` as well only if you deliberately want them to differ, and expect a
-  warning if you do: a mismatch is visible to an active probe.
-* REALITY's documented minimum for a target site is **TLS 1.3 + H2**, so qualify
-  a candidate before relying on it — `openssl s_client -connect <host>:443
-  -servername <host> -tls1_3 -alpn h2 </dev/null | grep ALPN` has to answer
-  `ALPN protocol: h2`, and the same command without `-alpn` has to negotiate
-  `TLSv1.3`. The shipped default clears both, and so do `www.microsoft.com`,
-  `www.apple.com` and `www.cloudflare.com`. A site that answers `http/1.1`
-  instead (Akamai's own front page, for one) sits below that minimum: the ALPN
-  it advertises does not match what the site it claims to be would offer.
-* Upgrading from a version without `--camouflage` carries the old `domain` value
-  over to it, so the fallback target does not change under your feet.
-* The first run writes a neutral placeholder page to
-  `/opt/reality-ezpz/config/website/index.html`. **An existing file is never
-  overwritten** — put your own site there and it survives upgrades.
-* In the `reality`/`shadowtls` modes this website is the whole HTTP surface;
-  nothing is relayed to the remote camouflage site over plain HTTP anymore.
+* `--camouflage` 默认值为 `www.fastly.com`，并且会同时设置 SNI —— 因为探测者发出的就是
+  SNI，并会拿回来的证书与之比对。只有在你明确想让两者不同时才额外传 `--domain`，此时
+  脚本会给出告警：SNI 与证书不匹配正是主动探测要抓的特征。
+* REALITY 官方对目标网站的**最低标准是 TLS 1.3 + H2**，所以选站前先验一下：
+  `openssl s_client -connect <host>:443 -servername <host> -tls1_3 -alpn h2 </dev/null | grep ALPN`
+  必须返回 `ALPN protocol: h2`，去掉 `-alpn` 再跑一次则必须协商出 `TLSv1.3`。当前默认值
+  两项都满足（`www.microsoft.com`、`www.apple.com`、`www.cloudflare.com` 同样可以）。
+  反之只返回 `http/1.1` 的站点（例如 Akamai 官网首页）低于该标准：它对外公告的 ALPN
+  与它所冒充的站点并不一致。
+* 从没有 `--camouflage` 的旧版本升级时，脚本会把原 `domain` 的值沿用到新配置项上，
+  不会让你的回落目标在升级中悄悄换掉。
+* 首次运行会写入一个中性的占位首页
+  `/opt/reality-ezpz/config/website/index.html`。**已存在的文件绝不会被覆盖** —— 把你自己的
+  站点放进去，升级时不会丢。
+* 在 `reality` / `shadowtls` 模式下，这个网站就是全部 HTTP 暴露面；不再通过明文 HTTP
+  转发远端伪装站点的内容。
 
 ---
 
-## Do I need my own domain?
+## 可以不买域名吗
 
-No. The default mode never uses a domain you own, and since this fork serves your
-own website through nginx, you do not need one for that either.
+可以。默认模式根本不使用你自己的域名；而且本分支已经把自家网站交给 nginx 托管，连这一块
+也不需要域名。
 
-| Mode | Own domain needed? | What the handshake carries |
+| 模式 | 需要自有域名？ | 握手里带的是什么 |
 | --- | --- | --- |
-| `reality` (default) | No | The SNI is the **remote** camouflage site (`--camouflage`, default `www.fastly.com`), and a probe gets that site's real certificate back |
-| `shadowtls` transport | No | The handshake server is the remote camouflage site as well |
-| `selfsigned` | Not strictly | A self-signed certificate; clients must accept an untrusted one (`allow_insecure`/`insecure=1`), which an active probe can notice |
-| `letsencrypt` | **Yes** | A publicly trusted certificate for your own domain — ACME HTTP-01 needs that domain to resolve to this machine and needs port `80` |
+| `reality`（默认） | 不需要 | SNI 用的是**远端**伪装大站（`--camouflage`，默认 `www.fastly.com`），探测者拿到的是那个站点的真实证书 |
+| `shadowtls` 传输 | 不需要 | 握手服务器同样是远端伪装大站 |
+| `selfsigned` | 严格说不必要 | 自签证书；客户端必须接受不受信任的证书（`allow_insecure` / `insecure=1`），主动探测能够察觉 |
+| `letsencrypt` | **需要** | 为你的自有域名签发公信证书 —— ACME HTTP-01 要求该域名解析到本机，并占用 `80` 端口 |
 
-So for a plain IP-only box there is nothing to name at all:
+所以纯粹只有公网 IP 的机器，**没有任何需要填写的东西**：
 
 ```bash
-# reality + sing-box, camouflage defaults to www.fastly.com — nothing to supply
+# reality + sing-box，伪装目标默认 www.fastly.com，无需任何额外参数
 bash <(curl -fsSL .../reality-ezpz.sh)
 
-# still no domain, but choose what a probe will see instead
+# 同样不需要域名，只是换个探测者会看到的站点
 bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
 ```
 
-* No DNS record to create and no certificate to issue locally: in the
-  `reality`/`shadowtls` modes the engine relays the handshake to the remote site
-  instead of terminating it, so no `server.crt`/`server.key` is generated and
-  nothing is mounted into the engine container.
-* `--server` accepts a bare public IP as long as `letsencrypt` is not in play; the
-  address is auto-detected when it can be, and only then does an empty value abort
-  the install with a hint.
-* `ws`, `tuic` and `hysteria2` are refused together with `reality` (they need real
-  TLS termination). Without a domain the useful combinations are `reality` with
-  `tcp`/`http`/`grpc`, or the `shadowtls` transport.
-* The trade-off is that you are borrowing someone else's domain: pick a site that
-  is reachable from **both** the server and the client, with an ordinary-looking
-  TLS stack. See [Security notes](#security-notes).
+* 不用配 DNS 记录，也不用在本地签证书：`reality` / `shadowtls` 模式下引擎只是把握手转发给
+  远端站点、不做 TLS 终结，因此既不会生成 `server.crt` / `server.key`，也不会往引擎容器里
+  挂载证书。
+* 只要不涉及 `letsencrypt`，`--server` 直接填公网 IP 即可；能自动探测时脚本会自己探测，
+  只有在探测失败且未手工指定时才会以提示信息中止安装。
+* `ws`、`tuic`、`hysteria2` 与 `reality` 组合会被拒绝（它们需要真正的 TLS 终结）。没有域名时
+  可用的组合是 `reality` + `tcp` / `http` / `grpc`，或者 `shadowtls` 传输。
+* 代价是你借用了别人的域名：请选一个**服务器与客户端都能访问**、且 TLS 指纹普通的站点。
+  详见[安全说明](#安全说明)。
 
 ---
 
-## Official sources only
+## 只使用官方源
 
-| Component | Image | Registry |
+| 组件 | 镜像 | 来源 |
 | --- | --- | --- |
-| xray engine | `ghcr.io/xtls/xray-core:25.12.8` | GHCR, published by XTLS |
-| sing-box engine | `ghcr.io/sagernet/sing-box:v1.12.23` | GHCR, published by SagerNet |
-| nginx | `nginx:1.24.0` | Docker Hub official library |
-| haproxy | `haproxy:2.8.0` | Docker Hub official library |
-| certbot | `certbot/certbot:v2.6.0` | Docker Hub, official certbot image |
-| Telegram bot base | `python:3.11-alpine` | Docker Hub official library |
+| xray 引擎 | `ghcr.io/xtls/xray-core:25.12.8` | GHCR，XTLS 官方发布 |
+| sing-box 引擎 | `ghcr.io/sagernet/sing-box:v1.12.23` | GHCR，SagerNet 官方发布 |
+| nginx | `nginx:1.24.0` | Docker Hub 官方 library |
+| haproxy | `haproxy:2.8.0` | Docker Hub 官方 library |
+| certbot | `certbot/certbot:v2.6.0` | Docker Hub 官方 certbot 镜像 |
+| Telegram 机器人基础镜像 | `python:3.11-alpine` | Docker Hub 官方 library |
 
-The engine container always runs with an explicit `command`
-(`run -c /etc/<core>/config.json`), so the deployment does not depend on an
-image's default `CMD`.
+引擎容器始终显式声明 `command`（`run -c /etc/<core>/config.json`），因此不依赖镜像自带的
+默认 `CMD`，换镜像也不会跑错配置。
 
-Other sources:
+其他来源：
 
-* Docker is installed from `https://get.docker.com`, Compose from the official
-  `docker/compose` GitHub release.
-* `tgbot.py` and the copy of this script placed in `/opt/reality-ezpz` are pulled
-  from this repository; the bot prefers the local copy and only downloads when it
-  is missing.
-* Route rule sets come from SagerNet's official `sing-geosite` repository. The
-  private destination ranges are inlined in the generated configuration instead of
-  being downloaded.
-* Cloudflare WARP registration uses the official
-  `api.cloudflareclient.com/v0a1922` endpoint with a locally generated X25519 key
-  pair (OpenSSL). There is no `wgcf` image and no `.toml` file on disk.
+* Docker 由 `https://get.docker.com` 安装，Compose 取自官方 `docker/compose` 仓库的
+  release 产物。
+* `tgbot.py` 以及放在 `/opt/reality-ezpz` 下的本脚本副本都从本仓库拉取；机器人优先使用
+  本地副本，仅在缺失时才联网下载。
+* 路由规则集来自 SagerNet 官方 `sing-geosite` 仓库；私有地址段直接内联写进生成的配置，
+  不再下载第三方 geoip 文件。
+* Cloudflare WARP 直接调用官方 `api.cloudflareclient.com/v0a1922` 接口，密钥对由本机
+  OpenSSL 生成，磁盘上不再出现 `wgcf` 的 `.toml` 文件。
 
-Two network dependencies are not first-party and can be redirected:
+以下两个网络依赖不是本项目自有，可以自行重定向：
 
-| Variable | Default | Purpose |
+| 环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
-| `BACKUP_UPLOAD_URL` | `https://temp.sh/upload` | Where `--backup` uploads the encrypted archive |
-| `RULESET_BASE_URL` | community `sing-box-rules` mirror | The `bypass` rule set, which has no upstream equivalent |
+| `BACKUP_UPLOAD_URL` | `https://temp.sh/upload` | `--backup` 上传加密备份的目标地址 |
+| `RULESET_BASE_URL` | 社区 `sing-box-rules` 镜像 | `bypass` 规则集，上游没有对应官方文件 |
 
 ```bash
 BACKUP_UPLOAD_URL=https://files.example.com/upload \
@@ -238,54 +217,54 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 
 ---
 
-## Command line reference
+## 命令行参数
 
-| Option | Description |
+| 参数 | 说明 |
 | --- | --- |
-| `-t, --transport <tcp\|http\|grpc\|ws\|tuic\|hysteria2\|shadowtls>` | Transport protocol (default `tcp`) |
-| `-d, --domain <domain>` | SNI domain used for the Reality handshake (default follows `--camouflage`) |
-| `--camouflage <domain[:port]>` | Remote site unauthenticated probes are relayed to, in the `reality`/`shadowtls` modes (default `www.fastly.com`; port defaults to `443`) |
-| `--server <server>` | Public IP or domain of this machine; a domain is required for `letsencrypt` |
-| `--port <port>` | Main proxy port (default `8443`) |
-| `--http-port <port\|off>` | Host port of the local website served by nginx (default `8080`, `off` = unpublished) |
-| `-c, --core <xray\|sing-box>` | Engine (default `sing-box`) |
-| `--security <reality\|letsencrypt\|selfsigned>` | TLS mode (default `reality`) |
-| `--enable-safenet <true\|false>` | Block ads/malware, plus adult content on sing-box |
-| `--enable-bbr <true\|false>` | Enable the BBR congestion control and the `fq` qdisc (default `true`; skipped with a warning on kernels that lack BBR) |
-| `--enable-warp <true\|false>` | Route outbound traffic through Cloudflare WARP |
-| `--warp-license <license>` | WARP+ license key |
-| `--regenerate` | Regenerate Reality keys and short id |
-| `--restart` | Restart the stack |
-| `--default` | Reset to the default configuration |
-| `--show-server-config` | Print the server side configuration |
-| `--add-user <username>` | Add a user |
-| `--list-users` | List users |
-| `--show-user <username>` | Print the client link and QR code of a user |
-| `--delete-user <username>` | Delete a user |
-| `--enable-tgbot <true\|false>` | Enable the Telegram bot |
-| `--tgbot-token <token>` | Telegram bot token |
-| `--tgbot-admins <user1,user2>` | Telegram usernames allowed to use the bot (no `@`) |
-| `--backup` | Create and upload a backup archive |
-| `--restore <url\|file>` | Restore from a backup |
-| `--backup-password <password>` | Password-protect the backup |
-| `-m, --menu` | Open the TUI |
-| `-u, --uninstall` | Remove the stack and `/opt/reality-ezpz` |
-| `-h, --help` | Show help |
+| `-t, --transport <tcp\|http\|grpc\|ws\|tuic\|hysteria2\|shadowtls>` | 传输协议（默认 `tcp`） |
+| `-d, --domain <domain>` | Reality 握手使用的 SNI 域名（默认跟随 `--camouflage`） |
+| `--camouflage <domain[:port]>` | `reality` / `shadowtls` 模式下未通过校验的流量所回落的远端真实站点（默认 `www.fastly.com`，端口默认 `443`） |
+| `--server <server>` | 本机公网 IP 或域名；使用 `letsencrypt` 时必须是域名 |
+| `--port <port>` | 主代理端口（默认 `8443`） |
+| `--http-port <port\|off>` | nginx 承载本机网站的宿主端口（默认 `8080`，`off` 表示不监听） |
+| `-c, --core <xray\|sing-box>` | 引擎（默认 `sing-box`） |
+| `--security <reality\|letsencrypt\|selfsigned>` | TLS 模式（默认 `reality`） |
+| `--enable-safenet <true\|false>` | 拦截广告 / 恶意域名，sing-box 下还会拦截成人内容 |
+| `--enable-bbr <true\|false>` | 开启 BBR 拥塞控制与 `fq` 队列（默认 `true`；内核不支持时只告警并跳过） |
+| `--enable-warp <true\|false>` | 出口流量走 Cloudflare WARP |
+| `--warp-license <license>` | WARP+ 授权码 |
+| `--regenerate` | 重新生成 Reality 密钥与 short id |
+| `--restart` | 重启服务栈 |
+| `--default` | 恢复默认配置 |
+| `--show-server-config` | 打印服务端配置 |
+| `--add-user <username>` | 新增用户 |
+| `--list-users` | 列出全部用户 |
+| `--show-user <username>` | 打印某用户的客户端链接与二维码 |
+| `--delete-user <username>` | 删除用户 |
+| `--enable-tgbot <true\|false>` | 启用 Telegram 机器人 |
+| `--tgbot-token <token>` | Telegram 机器人 Token |
+| `--tgbot-admins <user1,user2>` | 允许使用机器人的 Telegram 用户名（不带 `@`） |
+| `--backup` | 创建并上传备份 |
+| `--restore <url\|file>` | 从备份恢复 |
+| `--backup-password <password>` | 为备份设置密码 |
+| `-m, --menu` | 打开 TUI |
+| `-u, --uninstall` | 卸载服务栈与 `/opt/reality-ezpz` |
+| `-h, --help` | 查看帮助 |
 
 ---
 
-## User management
+## 用户管理
 
 ```bash
 bash /opt/reality-ezpz/reality-ezpz.sh --add-user john
-bash /opt/reality-ezpz/reality-ezpz.sh --show-user john   # client link + QR code
+bash /opt/reality-ezpz/reality-ezpz.sh --show-user john   # 客户端链接 + 二维码
 bash /opt/reality-ezpz/reality-ezpz.sh --list-users
 bash /opt/reality-ezpz/reality-ezpz.sh --delete-user john
 ```
 
-Usernames must be alphanumeric (`A-Z`, `a-z`, `0-9`).
+用户名只允许字母与数字（`A-Z`、`a-z`、`0-9`）。
 
-## Telegram bot
+## Telegram 机器人
 
 ```bash
 bash /opt/reality-ezpz/reality-ezpz.sh \
@@ -294,13 +273,12 @@ bash /opt/reality-ezpz/reality-ezpz.sh \
   --tgbot-admins your_telegram_username
 ```
 
-The bot runs in its own container, mounts `/opt/reality-ezpz` and executes the
-locally mounted copy of this script with an argv list — a username coming from a
-button can never be interpreted as a shell command. Bot commands: `/start`,
-`/add`, `/delete`, `/list`, `/show`.
+机器人运行在独立容器中，挂载 `/opt/reality-ezpz`，并以 argv 列表方式调用本地脚本副本——
+来自按钮的用户名不可能被当作 shell 命令执行。支持的命令：`/start`、`/add`、`/delete`、
+`/list`、`/show`。
 
-Note that the bot container mounts the Docker socket and therefore effectively has
-root-equivalent permissions. Enable it only if you need it.
+请注意：该容器挂载了 Docker socket，实际权限等同于宿主机 root，不需要远程管理用户时建议
+不要开启。
 
 ## Cloudflare WARP
 
@@ -309,25 +287,22 @@ bash /opt/reality-ezpz/reality-ezpz.sh --enable-warp true
 bash /opt/reality-ezpz/reality-ezpz.sh --enable-warp true --warp-license XXXXXXXX-XXXXXXXX-XXXXXXXX
 ```
 
-Registration creates a free WARP device against Cloudflare, stores the device id,
-token, client id, interface addresses and the locally generated private key in
-`/opt/reality-ezpz/config`, and uses the device as the engine's outbound. Turning
-WARP off deletes the device on Cloudflare's side.
+注册过程会向 Cloudflare 申请一个免费 WARP 设备，把设备 id、token、client id、接口地址以及
+本机生成的私钥写入 `/opt/reality-ezpz/config`，并作为引擎出口使用。关闭 WARP 时会在
+Cloudflare 侧删除该设备。
 
-## Kernel tuning and BBR
+## 内核调优与 BBR
 
-Every run writes `/etc/sysctl.d/99-reality-ezpz.conf` and applies it, so the
-tuning survives reboots by being a normal sysctl drop-in. On top of the socket
-buffer, backlog and conntrack values, **BBR is enabled by default**:
+每次运行都会写入并应用 `/etc/sysctl.d/99-reality-ezpz.conf`，因此调优以标准 sysctl drop-in 的
+形式在重启后依然有效。除 socket 缓冲、backlog、conntrack 等参数外，**BBR 默认开启**：
 
 ```ini
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 ```
 
-BBR lives in the kernel, so there is nothing to install from a repository — the
-installer loads `tcp_bbr` and `sch_fq` and writes the two keys. What it does *not*
-do is pretend: the state is read back from `/proc` and reported.
+BBR 是内核自带能力，不需要从软件源安装任何东西 —— 脚本只做两件事：加载 `tcp_bbr` 与
+`sch_fq`，写入上面两个键。它不做的是「假装成功」：状态会从 `/proc` 读回来并如实汇报。
 
 ```
 $ bash /opt/reality-ezpz/reality-ezpz.sh --show-server-config
@@ -335,113 +310,103 @@ $ bash /opt/reality-ezpz/reality-ezpz.sh --show-server-config
 BBR: ON (kernel: bbr, qdisc: fq)
 ```
 
-| Situation | What happens |
+| 情况 | 会发生什么 |
 | --- | --- |
-| Normal kernel (4.9+) | The module is loaded, both keys are written and BBR is active immediately |
-| Kernel without BBR (older than 4.9, or a container that cannot load its host's modules) | A warning is printed and **the two keys are left out of the file**, so nothing fails on every reboot afterwards. Every other tunable is still applied |
-| You pass `--enable-bbr false` | The two lines are dropped from the file, and the live kernel is only reset if it was `bbr`/`fq` — a congestion control you picked yourself is never overwritten |
-| The kernel rejects one key | That key is named in a warning and the remaining keys are still applied |
+| 正常内核（4.9 及以上） | 加载模块、写入两个键，BBR 立即生效 |
+| 内核不支持 BBR（低于 4.9，或容器无法加载宿主机模块） | 打印告警，并且**不把这两个键写进配置文件**，避免之后每次重启都失败；其余调优项照常应用 |
+| 传 `--enable-bbr false` | 从文件中移除这两行；只有当当前值确实是 `bbr` / `fq` 时才回退，你自己设定的拥塞控制算法不会被覆盖 |
+| 内核拒绝其中某个键 | 在告警里点名该键，其余键仍然应用 |
 
-Because each key is written on its own, a kernel that refuses one setting can no
-longer leave BBR quietly unapplied while the installer reports success.
+因为每个键是单独写入的，内核拒绝某一项时不会再出现「BBR 实际没生效、安装器却报告成功」
+的情况。
 
-Note that this is the **kernel** congestion control. The `hysteria2` transport
-additionally advertises `congestion_control=bbr` in its QUIC configuration, which
-is a client-side transport setting and is independent of this.
+注意这里说的是**内核**拥塞控制。`hysteria2` 传输另外会在 QUIC 配置里声明
+`congestion_control=bbr`，那是客户端传输层设置，与本项互相独立。
 
 ```bash
-bash /opt/reality-ezpz/reality-ezpz.sh --enable-bbr false   # turn it off
-bash /opt/reality-ezpz/reality-ezpz.sh --enable-bbr true    # turn it back on
+bash /opt/reality-ezpz/reality-ezpz.sh --enable-bbr false   # 关闭
+bash /opt/reality-ezpz/reality-ezpz.sh --enable-bbr true    # 重新开启
 ```
 
 ---
 
-## Backup and restore
+## 备份与恢复
 
 ```bash
-# upload an encrypted archive, prints a URL
-bash /opt/reality-ezpz/reality-ezpz.sh --backup --backup-password 'a strong password'
+# 上传加密备份，输出下载地址
+bash /opt/reality-ezpz/reality-ezpz.sh --backup --backup-password '一个强密码'
 
-# restore on this or another machine
-bash /opt/reality-ezpz/reality-ezpz.sh --restore <url-or-path> --backup-password 'a strong password'
+# 在本机或其他机器上恢复
+bash /opt/reality-ezpz/reality-ezpz.sh --restore <url 或路径> --backup-password '一个强密码'
 ```
 
-The archive contains the user list and `/opt/reality-ezpz/config`. Always use a
-password: without one the archive is a plain zip of your keys.
+备份包内含用户列表与 `/opt/reality-ezpz/config`。请务必设置密码：不设密码时压缩包就是
+明文的密钥集合。
 
-## Upgrade
+## 升级
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh)
 ```
 
-Re-running the installer keeps the existing configuration; missing keys (for
-example `http_port` or the new `camouflage`) are added automatically. If you
-deployed an earlier version that pinned the main port to `443`, note that the
-default is now `8443` and the plain HTTP side moved from `80` to `8080` — set
-`--port 443` explicitly if you want to keep the old layout.
+重复执行安装脚本会保留原有配置，缺失的配置项（例如新引入的 `http_port`、`camouflage`）
+会自动补上。如果你之前部署的版本把主端口固定在 `443`，请注意当前默认值已改为 `8443`，
+明文 HTTP 侧也从 `80` 变为 `8080`；如需保持旧布局，请显式传入 `--port 443`。
 
-Two behaviour changes when upgrading from a pre-`camouflage` version:
+从还没有 `camouflage` 的版本升级时，有两处行为变化：
 
-* The remote camouflage site is carried over from the old `domain` value, so the
-  fallback target stays what it was.
-* The HTTP port used to relay the remote site over plain HTTP; it now serves
-  **your own** website. To keep the old look, put a copy of that site's content
-  into `/opt/reality-ezpz/config/website`.
+* 远端伪装目标会沿用旧的 `domain` 值，回落目标不会在升级中改变。
+* HTTP 端口过去是把远端站点的内容以明文 HTTP 转发出来，现在改为提供**你自己的**网站。
+  想保持原来的观感，可把那个站点的页面复制到 `/opt/reality-ezpz/config/website`。
 
-## Uninstall
+## 卸载
 
 ```bash
-bash /opt/reality-ezpz/reality-ezpz.sh --uninstall   # keeps the Docker packages
+bash /opt/reality-ezpz/reality-ezpz.sh --uninstall   # 不会卸载 Docker 本身
 ```
 
 ---
 
-## Security notes
+## 安全说明
 
-* Reality is designed to be indistinguishable from a real TLS site; keep the SNI
-  domain and the port realistic for your threat model. The camouflage site should
-  be a real, popular HTTPS site the machine can reach, and the SNI should be that
-  same domain — a probe compares the certificate it gets back against the SNI it
-  sent.
-* The generated client configurations contain the server address, UUID and Reality
-  public key — treat `--show-user` output as a secret.
-* `--enable-tgbot` gives the bot container Docker socket access. If you do not need
-  remote user management, leave it off.
-* Backups are uploaded to a public paste service by default. Use
-  `--backup-password` and/or point `BACKUP_UPLOAD_URL` at your own endpoint.
-* Only run the installer as root on a machine you control; it installs packages,
-  writes to `/opt` and tunes kernel parameters.
+* Reality 的设计目标是让人无法把它与真实 TLS 站点区分开；SNI 域名与端口要符合你的威胁模型。
+  伪装站点应选本机可访问的真实热门 HTTPS 站点，并让 SNI 与它是同一个域名 —— 探测者会拿
+  回来的证书与自己发出的 SNI 做比对。
+* 生成的客户端配置包含服务器地址、UUID 与 Reality 公钥，请把 `--show-user` 的输出当作机密。
+* `--enable-tgbot` 会赋予机器人容器 Docker socket 权限，不需要远程管理时请保持关闭。
+* 备份默认上传到公共粘贴服务，请配合 `--backup-password` 使用，或把 `BACKUP_UPLOAD_URL`
+  指向你自己的服务器。
+* 请只在你掌控的机器上以 root 运行安装脚本：它会安装软件包、写入 `/opt` 并调整内核参数。
 
 ---
 
-## Troubleshooting
+## 常见问题
 
-| Symptom | Check |
+| 现象 | 排查方向 |
 | --- | --- |
-| `Port 80 must be free ...` | You selected `letsencrypt` while another service owns port 80 |
-| Container restarts in a loop | `docker logs $(docker compose -p reality-ezpz ps -q engine)` |
-| Client cannot connect | The main port is reachable (firewall/security group), and the SNI domain matches |
-| `WARP account creation has been failed!` | Outbound access to `api.cloudflareclient.com` |
-| `BBR was requested but is not active` | The running kernel has no BBR (needs 4.9+) or is a container that cannot load its host's modules; `--enable-bbr false` silences it |
-| `these kernel settings ... were skipped` | The listed keys do not exist on this kernel; the rest were applied and BBR is unaffected |
-| `the SNI (...) differs from the camouflage site (...)` | You passed both `--domain` and `--camouflage`; point them at the same site unless you have a reason not to |
-| The HTTP port shows the placeholder page | Put your files into `/opt/reality-ezpz/config/website` — `index.html` is only created when nothing is there |
-| The camouflage site is unreachable from the server | `--camouflage` must be a real site the machine can reach; nothing is served locally for it |
-| Telegram bot silent | Token/admins correct, and `/opt/reality-ezpz/tgbot/tgbot.py` exists |
-| `xray` exits immediately | The official image drops privileges; certificate files must be readable (the installer chmods them to `644`) |
+| 提示 `Port 80 must be free ...` | 你选择了 `letsencrypt`，但 80 端口已被其他服务占用 |
+| 容器反复重启 | `docker logs $(docker compose -p reality-ezpz ps -q engine)` |
+| 客户端连不上 | 主端口是否放行（防火墙 / 安全组），SNI 域名是否匹配 |
+| 提示 `WARP account creation has been failed!` | 能否访问 `api.cloudflareclient.com` |
+| 提示 `BBR was requested but is not active` | 当前内核没有 BBR（需 4.9+），或容器无法加载宿主机模块；`--enable-bbr false` 可消除该提示 |
+| 提示 `these kernel settings ... were skipped` | 列出的键在当前内核上不存在；其余键已应用，不影响 BBR |
+| 提示 `the SNI (...) differs from the camouflage site (...)` | 你同时传了 `--domain` 与 `--camouflage`；除确有需要外，两者应指向同一个站点 |
+| HTTP 端口上显示的是占位首页 | 把你的文件放进 `/opt/reality-ezpz/config/website` —— `index.html` 只在目录为空时生成 |
+| 伪装站点连接失败 | `--camouflage` 必须是本机能够访问的真实站点，本机不会为它提供任何内容 |
+| Telegram 机器人无响应 | Token / 管理员名单是否正确，`/opt/reality-ezpz/tgbot/tgbot.py` 是否存在 |
+| xray 容器启动即退出 | 官方镜像会降权运行，证书文件必须可读（安装脚本已 chmod 到 `644`） |
 
 ---
 
-## Credits and license
+## 致谢与许可
 
-Based on [reality-ezpz](https://github.com/aleskxyz/reality-ezpz) by
-[aleskxyz](https://github.com/aleskxyz), Apache License 2.0. This fork keeps the
-same license; see [LICENSE](LICENSE).
+本项目基于 [aleskxyz](https://github.com/aleskxyz) 的
+[reality-ezpz](https://github.com/aleskxyz/reality-ezpz)，遵循 Apache License 2.0；
+本分支沿用同一许可，详见 [LICENSE](LICENSE)。
 
-Upstream projects used at runtime:
-[XTLS/Xray-core](https://github.com/XTLS/Xray-core),
-[SagerNet/sing-box](https://github.com/SagerNet/sing-box),
-[SagerNet/sing-geosite](https://github.com/SagerNet/sing-geosite),
-[haproxy](https://www.haproxy.org/), [nginx](https://nginx.org/),
-[certbot](https://github.com/certbot/certbot).
+运行时使用的上游项目：
+[XTLS/Xray-core](https://github.com/XTLS/Xray-core)、
+[SagerNet/sing-box](https://github.com/SagerNet/sing-box)、
+[SagerNet/sing-geosite](https://github.com/SagerNet/sing-geosite)、
+[haproxy](https://www.haproxy.org/)、[nginx](https://nginx.org/)、
+[certbot](https://github.com/certbot/certbot)。
