@@ -134,7 +134,7 @@ ls /opt/reality-ezpz/config/website
 
 Notes:
 
-* `--camouflage` defaults to `www.akamai.com` and also sets the SNI, because a
+* `--camouflage` defaults to `www.fastly.com` and also sets the SNI, because a
   probe sends the SNI and compares the certificate it gets back against it. Set
   `--domain` as well only if you deliberately want them to differ, and expect a
   warning if you do: a mismatch is visible to an active probe.
@@ -142,9 +142,10 @@ Notes:
   a candidate before relying on it — `openssl s_client -connect <host>:443
   -servername <host> -tls1_3 -alpn h2 </dev/null | grep ALPN` has to answer
   `ALPN protocol: h2`, and the same command without `-alpn` has to negotiate
-  `TLSv1.3`. The shipped default `www.akamai.com` answers TLSv1.3 but negotiates
-  `http/1.1`, i.e. it sits below that minimum; pass `--camouflage
-  www.microsoft.com` (or any other site that returns `h2`) to stay inside it.
+  `TLSv1.3`. The shipped default clears both, and so do `www.microsoft.com`,
+  `www.apple.com` and `www.cloudflare.com`. A site that answers `http/1.1`
+  instead (Akamai's own front page, for one) sits below that minimum: the ALPN
+  it advertises does not match what the site it claims to be would offer.
 * Upgrading from a version without `--camouflage` carries the old `domain` value
   over to it, so the fallback target does not change under your feet.
 * The first run writes a neutral placeholder page to
@@ -162,7 +163,7 @@ own website through nginx, you do not need one for that either.
 
 | Mode | Own domain needed? | What the handshake carries |
 | --- | --- | --- |
-| `reality` (default) | No | The SNI is the **remote** camouflage site (`--camouflage`, default `www.akamai.com`), and a probe gets that site's real certificate back |
+| `reality` (default) | No | The SNI is the **remote** camouflage site (`--camouflage`, default `www.fastly.com`), and a probe gets that site's real certificate back |
 | `shadowtls` transport | No | The handshake server is the remote camouflage site as well |
 | `selfsigned` | Not strictly | A self-signed certificate; clients must accept an untrusted one (`allow_insecure`/`insecure=1`), which an active probe can notice |
 | `letsencrypt` | **Yes** | A publicly trusted certificate for your own domain — ACME HTTP-01 needs that domain to resolve to this machine and needs port `80` |
@@ -170,7 +171,7 @@ own website through nginx, you do not need one for that either.
 So for a plain IP-only box there is nothing to name at all:
 
 ```bash
-# reality + sing-box, camouflage defaults to www.akamai.com — nothing to supply
+# reality + sing-box, camouflage defaults to www.fastly.com — nothing to supply
 bash <(curl -fsSL .../reality-ezpz.sh)
 
 # still no domain, but choose what a probe will see instead
@@ -243,7 +244,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | --- | --- |
 | `-t, --transport <tcp\|http\|grpc\|ws\|tuic\|hysteria2\|shadowtls>` | Transport protocol (default `tcp`) |
 | `-d, --domain <domain>` | SNI domain used for the Reality handshake (default follows `--camouflage`) |
-| `--camouflage <domain[:port]>` | Remote site unauthenticated probes are relayed to, in the `reality`/`shadowtls` modes (default `www.akamai.com`; port defaults to `443`) |
+| `--camouflage <domain[:port]>` | Remote site unauthenticated probes are relayed to, in the `reality`/`shadowtls` modes (default `www.fastly.com`; port defaults to `443`) |
 | `--server <server>` | Public IP or domain of this machine; a domain is required for `letsencrypt` |
 | `--port <port>` | Main proxy port (default `8443`) |
 | `--http-port <port\|off>` | Host port of the local website served by nginx (default `8080`, `off` = unpublished) |

@@ -73,7 +73,7 @@ ruleset_base_url="${RULESET_BASE_URL:-https://raw.githubusercontent.com/aleskxyz
 defaults[transport]=tcp
 # The SNI the client sends and the server accepts. In the reality and shadowtls
 # modes it must be a real, reachable site - see defaults[camouflage] below.
-defaults[domain]=www.akamai.com
+defaults[domain]=www.fastly.com
 # The remote site the camouflage falls back to: probes that do not authenticate
 # are relayed to it (Reality dest / shadowtls handshake target), so it is what an
 # active probe sees on the proxy port. Supplied at deployment time, optional
@@ -84,7 +84,10 @@ defaults[domain]=www.akamai.com
 # candidate before relying on it (both should answer, the second with h2):
 #   openssl s_client -connect <host>:443 -servername <host> -tls1_3 </dev/null | grep Protocol
 #   openssl s_client -connect <host>:443 -servername <host> -alpn h2 </dev/null | grep ALPN
-defaults[camouflage]=www.akamai.com
+# The shipped default meets both: TLS 1.3 with X25519, ALPN h2, a leaf whose CN
+# is the SNI itself, and a chain that roots in Certainly Root R1, which Mozilla,
+# Chrome, Apple and Oracle all carry.
+defaults[camouflage]=www.fastly.com
 # 8443 is deliberately not a well-known port: the default installation must not
 # take 80 or 443 away from whatever else runs on the machine.
 defaults[port]=8443
