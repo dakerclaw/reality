@@ -8,12 +8,15 @@
 与二维码，并提供文本管理界面（TUI）和可选的 Telegram 机器人来管理用户。
 
 本项目是 [reality-ezpz](https://github.com/aleskxyz/reality-ezpz) 的加固分支，在上游功能之上
-额外确立两条设计准则：
+额外确立三条设计准则：
 
 1. **安装过程绝不占用知名端口。** 默认只绑定 `8443` 和 `8080`。端口 `80` 只有
    `letsencrypt` 模式会用（ACME HTTP-01 协议强制要求），且必须由你主动选择。
 2. **每个组件都来自它自己的上游。** 容器镜像全部使用官方镜像（不再使用任何第三方转载镜像），
    Cloudflare WARP 直接调用 Cloudflare 官方接口注册，不再依赖社区的 `wgcf` 镜像。
+3. **伪装目标与自有网站彻底分离。** 代理端口把未通过校验的流量回落到部署时指定的
+   **远端真实大站**，nginx 则在 HTTP 端口上正常负载**你自己的网站**。详见
+   [网站与伪装](#网站与伪装)。
 
 ---
 
@@ -27,6 +30,8 @@
 * 通过 certbot 申请与自动续期 Letsencrypt 证书
 * 可选「安全上网」模式（拦截广告 / 恶意域名，sing-box 还可拦截成人内容）
 * 文本管理界面（TUI）与 Telegram 机器人管理用户
+* nginx 在 HTTP 端口上正常负载 `./website` 里的自有网站（`reality` / `shadowtls` 的
+  回落目标是远端站点，不会落在你自己的站上）
 * 支持密码保护的备份与恢复（用户 + 配置）
 * 内核参数调优、IPv6 支持，`tcp` / `http` / `grpc` / `ws` 由 haproxy 复用端口
 
@@ -55,10 +60,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 常见用法：
 
 ```bash
-# 使用默认配置安装（reality + sing-box，主端口 8443，HTTP 端口 8080）
+# 使用默认配置安装（reality + sing-box，主端口 8443，网站端口 8080）
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh)
 
-# 自定义端口
+# 指定伪装回落的远端大站（同时会作为 SNI）
+bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
+
+# 自定义端口，并完全不挂网站
 bash <(curl -fsSL .../reality-ezpz.sh) --port 2087 --http-port off
 
 # 使用 letsencrypt 证书（这是唯一会占用 80 端口的模式）
@@ -77,18 +85,50 @@ bash /opt/reality-ezpz/reality-ezpz.sh --menu
 | 监听用途 | 默认宿主端口 | 由谁控制 | 说明 |
 | --- | --- | --- | --- |
 | 主代理端口 | `8443/tcp`（tuic / hysteria2 另加 `/udp`） | `--port` | 可为任意空闲端口；`80` 会被拒绝，`443` 允许但会提示 |
-| 明文 HTTP 侧 | `8080/tcp` | `--http-port` | reality / shadowtls 的伪装回退；设为 `off` 则完全不监听 |
+| 本机网站 | `8080/tcp` | `--http-port` | 由 nginx 从 `./website` 目录提供；设为 `off` 则完全不监听 |
 | ACME 校验 | `80/tcp` | 强制 | **仅** `--security=letsencrypt` 模式使用 |
 
 需要了解的行为：
 
 * 默认安装只发布 `8443/tcp` 与 `8080/tcp`，此外不占用任何端口。本机继续在 `80`/`443`
   上运行 Nginx 等 Web 服务不受影响。
-* `--http-port off` 会彻底去掉明文 HTTP 监听（最小暴露面）。
+* `--http-port off` 会彻底去掉 HTTP 监听与 nginx 容器（最小暴露面）。
 * 选择 `--security letsencrypt` 时脚本会把 HTTP 端口切到 `80` 并明确提示，因为 ACME
   HTTP-01 校验只能走 80 端口；切回 `reality` / `selfsigned` 后会自动恢复为 `8080`。
 * 如果显式指定 `--port 443`，脚本仍会尊重你的选择（只提示、不阻止）——这是使用者的决定，
   不由安装器替你决定。
+
+---
+
+## 网站与伪装
+
+两件事，刻意分开处理：
+
+| | 是什么 | 在哪里配置 |
+| --- | --- | --- |
+| **伪装** | 未通过校验的探测者在代理端口上看到的内容。`reality` 模式下引擎不自己应答 TLS 握手，而是把握手转发给远端真实站点；`shadowtls` 模式下该站点就是握手目标。 | `--camouflage <domain[:port]>`，一个远端真实站点，部署时输入 |
+| **网站** | 你自己的正常网站，由 nginx 从 `./website` 目录提供。 | `--http-port <port>` |
+
+```bash
+# 伪装目标 = www.microsoft.com，自有网站在 8080
+bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
+
+# 挂自己的网站：把文件丢进根目录即可，不需要其他操作
+ls /opt/reality-ezpz/config/website
+```
+
+几点说明：
+
+* `--camouflage` 默认值为 `www.google.com`，并且会同时设置 SNI —— 因为探测者发出的就是
+  SNI，并会拿回来的证书与之比对。只有在你明确想让两者不同时才额外传 `--domain`，此时
+  脚本会给出告警：SNI 与证书不匹配正是主动探测要抓的特征。
+* 从没有 `--camouflage` 的旧版本升级时，脚本会把原 `domain` 的值沿用到新配置项上，
+  不会让你的回落目标在升级中悄悄换掉。
+* 首次运行会写入一个中性的占位首页
+  `/opt/reality-ezpz/config/website/index.html`。**已存在的文件绝不会被覆盖** —— 把你自己的
+  站点放进去，升级时不会丢。
+* 在 `reality` / `shadowtls` 模式下，这个网站就是全部 HTTP 暴露面；不再通过明文 HTTP
+  转发远端伪装站点的内容。
 
 ---
 
@@ -137,10 +177,11 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | 参数 | 说明 |
 | --- | --- |
 | `-t, --transport <tcp\|http\|grpc\|ws\|tuic\|hysteria2\|shadowtls>` | 传输协议（默认 `tcp`） |
-| `-d, --domain <domain>` | Reality 握手使用的 SNI 域名（默认 `www.google.com`） |
+| `-d, --domain <domain>` | Reality 握手使用的 SNI 域名（默认跟随 `--camouflage`） |
+| `--camouflage <domain[:port]>` | `reality` / `shadowtls` 模式下未通过校验的流量所回落的远端真实站点（默认 `www.google.com`，端口默认 `443`） |
 | `--server <server>` | 本机公网 IP 或域名；使用 `letsencrypt` 时必须是域名 |
 | `--port <port>` | 主代理端口（默认 `8443`） |
-| `--http-port <port\|off>` | 明文 HTTP 侧端口（默认 `8080`，`off` 表示不监听） |
+| `--http-port <port\|off>` | nginx 承载本机网站的宿主端口（默认 `8080`，`off` 表示不监听） |
 | `-c, --core <xray\|sing-box>` | 引擎（默认 `sing-box`） |
 | `--security <reality\|letsencrypt\|selfsigned>` | TLS 模式（默认 `reality`） |
 | `--enable-safenet <true\|false>` | 拦截广告 / 恶意域名，sing-box 下还会拦截成人内容 |
@@ -223,9 +264,15 @@ bash /opt/reality-ezpz/reality-ezpz.sh --restore <url 或路径> --backup-passwo
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh)
 ```
 
-重复执行安装脚本会保留原有配置，缺失的配置项（例如新引入的 `http_port`）会自动补上。
-如果你之前部署的版本把主端口固定在 `443`，请注意当前默认值已改为 `8443`，明文 HTTP 侧也从
-`80` 变为 `8080`；如需保持旧布局，请显式传入 `--port 443`。
+重复执行安装脚本会保留原有配置，缺失的配置项（例如新引入的 `http_port`、`camouflage`）
+会自动补上。如果你之前部署的版本把主端口固定在 `443`，请注意当前默认值已改为 `8443`，
+明文 HTTP 侧也从 `80` 变为 `8080`；如需保持旧布局，请显式传入 `--port 443`。
+
+从还没有 `camouflage` 的版本升级时，有两处行为变化：
+
+* 远端伪装目标会沿用旧的 `domain` 值，回落目标不会在升级中改变。
+* HTTP 端口过去是把远端站点的内容以明文 HTTP 转发出来，现在改为提供**你自己的**网站。
+  想保持原来的观感，可把那个站点的页面复制到 `/opt/reality-ezpz/config/website`。
 
 ## 卸载
 
@@ -238,6 +285,8 @@ bash /opt/reality-ezpz/reality-ezpz.sh --uninstall   # 不会卸载 Docker 本�
 ## 安全说明
 
 * Reality 的设计目标是让人无法把它与真实 TLS 站点区分开；SNI 域名与端口要符合你的威胁模型。
+  伪装站点应选本机可访问的真实热门 HTTPS 站点，并让 SNI 与它是同一个域名 —— 探测者会拿
+  回来的证书与自己发出的 SNI 做比对。
 * 生成的客户端配置包含服务器地址、UUID 与 Reality 公钥，请把 `--show-user` 的输出当作机密。
 * `--enable-tgbot` 会赋予机器人容器 Docker socket 权限，不需要远程管理时请保持关闭。
 * 备份默认上传到公共粘贴服务，请配合 `--backup-password` 使用，或把 `BACKUP_UPLOAD_URL`
@@ -254,6 +303,9 @@ bash /opt/reality-ezpz/reality-ezpz.sh --uninstall   # 不会卸载 Docker 本�
 | 容器反复重启 | `docker logs $(docker compose -p reality-ezpz ps -q engine)` |
 | 客户端连不上 | 主端口是否放行（防火墙 / 安全组），SNI 域名是否匹配 |
 | 提示 `WARP account creation has been failed!` | 能否访问 `api.cloudflareclient.com` |
+| 提示 `the SNI (...) differs from the camouflage site (...)` | 你同时传了 `--domain` 与 `--camouflage`；除确有需要外，两者应指向同一个站点 |
+| HTTP 端口上显示的是占位首页 | 把你的文件放进 `/opt/reality-ezpz/config/website` —— `index.html` 只在目录为空时生成 |
+| 伪装站点连接失败 | `--camouflage` 必须是本机能够访问的真实站点，本机不会为它提供任何内容 |
 | Telegram 机器人无响应 | Token / 管理员名单是否正确，`/opt/reality-ezpz/tgbot/tgbot.py` 是否存在 |
 | xray 容器启动即退出 | 官方镜像会降权运行，证书文件必须可读（安装脚本已 chmod 到 `644`） |
 

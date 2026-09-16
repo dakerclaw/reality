@@ -10,7 +10,7 @@ TLS-terminating proxy, generates the client configuration and QR codes, and give
 you a TUI plus an optional Telegram bot to manage users.
 
 It is a hardened fork of [reality-ezpz](https://github.com/aleskxyz/reality-ezpz)
-with two design rules on top of the upstream feature set:
+with three design rules on top of the upstream feature set:
 
 1. **An installation never takes a well-known port.** The default setup binds
    `8443` and `8080`. Port `80` is used by exactly one mode — `letsencrypt`, which
@@ -19,6 +19,10 @@ with two design rules on top of the upstream feature set:
    official ones (no third-party re-published images), and Cloudflare WARP is
    registered directly against the Cloudflare client API instead of through a
    community `wgcf` image.
+3. **Camouflage target and website are separate.** The proxy port falls back to a
+   real **remote** site you name at deployment time, while nginx serves **your
+   own** site on the HTTP port. See
+   [Website and camouflage](#website-and-camouflage).
 
 ---
 
@@ -32,6 +36,8 @@ with two design rules on top of the upstream feature set:
 * Letsencrypt certificate issuance and renewal through certbot
 * Optional "safe internet" mode (blocks ads/malware, optionally adult content)
 * Text-based user interface and Telegram bot for user management
+* nginx serves your own site from `./website` on the HTTP port (`reality`/`shadowtls`
+  fall back to a remote site instead, never to your own site)
 * Password-protected backup / restore of users and configuration
 * Kernel tunables, IPv6 support, `tcp`/`http`/`grpc`/`ws` multiplexing behind haproxy
 
@@ -60,10 +66,13 @@ the first client configuration and opens the TUI on demand.
 Common invocations:
 
 ```bash
-# plain install with defaults (reality, sing-box, port 8443, http port 8080)
+# plain install with defaults (reality, sing-box, port 8443, website on 8080)
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh)
 
-# pick your own ports
+# name the remote site the camouflage falls back to (also becomes the SNI)
+bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
+
+# pick your own ports, no website at all
 bash <(curl -fsSL .../reality-ezpz.sh) --port 2087 --http-port off
 
 # letsencrypt certificate (this mode is the only one that binds port 80)
@@ -82,19 +91,53 @@ This is the part that differs most from the upstream project.
 | Listener | Default host port | Controlled by | Notes |
 | --- | --- | --- | --- |
 | Main proxy port | `8443/tcp` (and `/udp` for tuic/hysteria2) | `--port` | Any free port; `80` is refused, `443` is allowed but warns |
-| Plain HTTP side | `8080/tcp` | `--http-port` | Reality/ShadowTLS camouflage fallback; `off` leaves it unpublished |
+| Local website | `8080/tcp` | `--http-port` | Served by nginx out of `./website`; `off` leaves it unpublished |
 | ACME challenge | `80/tcp` | forced | **Only** in `--security=letsencrypt` mode |
 
 Behaviour worth knowing:
 
 * A default installation publishes `8443/tcp` and `8080/tcp` and nothing else.
   Running a web server on `80`/`443` next to it is fine.
-* `--http-port off` removes the HTTP listener completely (minimal footprint).
+* `--http-port off` removes the HTTP listener and the nginx container completely
+  (minimal footprint).
 * Selecting `--security letsencrypt` switches the HTTP port to `80` and says so,
   because the ACME HTTP-01 challenge has no other port. Switching back to
   `reality`/`selfsigned` resets it to `8080` automatically.
 * Explicitly asking for `443` with `--port` is still honoured (the warning is only
   a warning) — that is the user's call, not the installer's.
+
+---
+
+## Website and camouflage
+
+Two different jobs, deliberately kept apart:
+
+| | What it is | Where it lives |
+| --- | --- | --- |
+| **Camouflage** | What an unauthenticated probe sees on the proxy port. In `reality` the engine forwards the TLS handshake to a real remote site instead of answering it itself; in `shadowtls` the handshake server is that site. | `--camouflage <domain[:port]>`, a real remote site, entered at deployment time |
+| **Website** | A normal site of your own, served by nginx from `./website`. | `--http-port <port>` |
+
+```bash
+# camouflage = www.microsoft.com, own site on 8080
+bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
+
+# serve your own site: drop files into the docroot, nothing else to do
+ls /opt/reality-ezpz/config/website
+```
+
+Notes:
+
+* `--camouflage` defaults to `www.google.com` and also sets the SNI, because a
+  probe sends the SNI and compares the certificate it gets back against it. Set
+  `--domain` as well only if you deliberately want them to differ, and expect a
+  warning if you do: a mismatch is visible to an active probe.
+* Upgrading from a version without `--camouflage` carries the old `domain` value
+  over to it, so the fallback target does not change under your feet.
+* The first run writes a neutral placeholder page to
+  `/opt/reality-ezpz/config/website/index.html`. **An existing file is never
+  overwritten** — put your own site there and it survives upgrades.
+* In the `reality`/`shadowtls` modes this website is the whole HTTP surface;
+  nothing is relayed to the remote camouflage site over plain HTTP anymore.
 
 ---
 
@@ -147,10 +190,11 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | Option | Description |
 | --- | --- |
 | `-t, --transport <tcp\|http\|grpc\|ws\|tuic\|hysteria2\|shadowtls>` | Transport protocol (default `tcp`) |
-| `-d, --domain <domain>` | SNI domain used for the Reality handshake (default `www.google.com`) |
+| `-d, --domain <domain>` | SNI domain used for the Reality handshake (default follows `--camouflage`) |
+| `--camouflage <domain[:port]>` | Remote site unauthenticated probes are relayed to, in the `reality`/`shadowtls` modes (default `www.google.com`; port defaults to `443`) |
 | `--server <server>` | Public IP or domain of this machine; a domain is required for `letsencrypt` |
 | `--port <port>` | Main proxy port (default `8443`) |
-| `--http-port <port\|off>` | Plain HTTP side (default `8080`, `off` = unpublished) |
+| `--http-port <port\|off>` | Host port of the local website served by nginx (default `8080`, `off` = unpublished) |
 | `-c, --core <xray\|sing-box>` | Engine (default `sing-box`) |
 | `--security <reality\|letsencrypt\|selfsigned>` | TLS mode (default `reality`) |
 | `--enable-safenet <true\|false>` | Block ads/malware, plus adult content on sing-box |
@@ -236,10 +280,18 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 ```
 
 Re-running the installer keeps the existing configuration; missing keys (for
-example the new `http_port`) are added automatically. If you deployed an earlier
-version that pinned the main port to `443`, note that the default is now `8443`
-and the plain HTTP side moved from `80` to `8080` — set `--port 443` explicitly if
-you want to keep the old layout.
+example `http_port` or the new `camouflage`) are added automatically. If you
+deployed an earlier version that pinned the main port to `443`, note that the
+default is now `8443` and the plain HTTP side moved from `80` to `8080` — set
+`--port 443` explicitly if you want to keep the old layout.
+
+Two behaviour changes when upgrading from a pre-`camouflage` version:
+
+* The remote camouflage site is carried over from the old `domain` value, so the
+  fallback target stays what it was.
+* The HTTP port used to relay the remote site over plain HTTP; it now serves
+  **your own** website. To keep the old look, put a copy of that site's content
+  into `/opt/reality-ezpz/config/website`.
 
 ## Uninstall
 
@@ -252,7 +304,10 @@ bash /opt/reality-ezpz/reality-ezpz.sh --uninstall   # keeps the Docker packages
 ## Security notes
 
 * Reality is designed to be indistinguishable from a real TLS site; keep the SNI
-  domain and the port realistic for your threat model.
+  domain and the port realistic for your threat model. The camouflage site should
+  be a real, popular HTTPS site the machine can reach, and the SNI should be that
+  same domain — a probe compares the certificate it gets back against the SNI it
+  sent.
 * The generated client configurations contain the server address, UUID and Reality
   public key — treat `--show-user` output as a secret.
 * `--enable-tgbot` gives the bot container Docker socket access. If you do not need
@@ -272,6 +327,9 @@ bash /opt/reality-ezpz/reality-ezpz.sh --uninstall   # keeps the Docker packages
 | Container restarts in a loop | `docker logs $(docker compose -p reality-ezpz ps -q engine)` |
 | Client cannot connect | The main port is reachable (firewall/security group), and the SNI domain matches |
 | `WARP account creation has been failed!` | Outbound access to `api.cloudflareclient.com` |
+| `the SNI (...) differs from the camouflage site (...)` | You passed both `--domain` and `--camouflage`; point them at the same site unless you have a reason not to |
+| The HTTP port shows the placeholder page | Put your files into `/opt/reality-ezpz/config/website` — `index.html` is only created when nothing is there |
+| The camouflage site is unreachable from the server | `--camouflage` must be a real site the machine can reach; nothing is served locally for it |
 | Telegram bot silent | Token/admins correct, and `/opt/reality-ezpz/tgbot/tgbot.py` exists |
 | `xray` exits immediately | The official image drops privileges; certificate files must be readable (the installer chmods them to `644`) |
 

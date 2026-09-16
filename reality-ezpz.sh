@@ -71,13 +71,21 @@ private_ip_cidr='["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.25
 ruleset_base_url="${RULESET_BASE_URL:-https://raw.githubusercontent.com/aleskxyz/sing-box-rules/refs/heads/rule-set}"
 
 defaults[transport]=tcp
+# The SNI the client sends and the server accepts. In the reality and shadowtls
+# modes it must be a real, reachable site - see defaults[camouflage] below.
 defaults[domain]=www.google.com
+# The remote site the camouflage falls back to: probes that do not authenticate
+# are relayed to it (Reality dest / shadowtls handshake target), so it is what an
+# active probe sees on the proxy port. Supplied at deployment time, optional
+# ":port" suffix, port 443 by default. It is kept in sync with the SNI because
+# the certificate this site returns has to match the SNI the probe sent.
+defaults[camouflage]=www.google.com
 # 8443 is deliberately not a well-known port: the default installation must not
 # take 80 or 443 away from whatever else runs on the machine.
 defaults[port]=8443
-# Host port for the plain-HTTP side of the setup (camouflage fallback for
-# reality/shadowtls and the ACME HTTP-01 challenge for letsencrypt).
-# "OFF" keeps it unpublished entirely.
+# Host port of the plain-HTTP side. It serves the local website out of
+# ./website (nginx), and in the letsencrypt mode it also carries the ACME
+# HTTP-01 challenge. "OFF" keeps it unpublished entirely.
 defaults[http_port]=8080
 defaults[safenet]=OFF
 defaults[warp]=OFF
@@ -104,6 +112,7 @@ config_items=(
   "short_id"
   "transport"
   "domain"
+  "camouflage"
   "server"
   "port"
   "http_port"
@@ -146,13 +155,17 @@ regex[url]="^(http|https)://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[0-9]{1,3}(\.[0-9]{1,3
 
 function show_help {
   echo ""
-  echo "Usage: reality-ezpz.sh [-t|--transport=tcp|http|grpc|ws|tuic|hysteria2|shadowtls] [-d|--domain=<domain>] [--server=<server>] [--regenerate] [--default]
-  [-r|--restart] [--enable-safenet=true|false] [--port=<port>] [--http-port=<port|off>] [-c|--core=xray|sing-box] [--enable-warp=true|false]
-  [--warp-license=<license>] [--security=reality|letsencrypt|selfsigned] [-m|--menu] [--show-server-config] [--add-user=<username>] [--lists-users]
-  [--show-user=<username>] [--delete-user=<username>] [--backup] [--restore=<url|file>] [--backup-password=<password>] [-u|--uninstall]"
+  echo "Usage: reality-ezpz.sh [-t|--transport=tcp|http|grpc|ws|tuic|hysteria2|shadowtls] [-d|--domain=<domain>] [--camouflage=<domain[:port]>] [--server=<server>]
+  [--regenerate] [--default] [-r|--restart] [--enable-safenet=true|false] [--port=<port>] [--http-port=<port|off>] [-c|--core=xray|sing-box]
+  [--enable-warp=true|false] [--warp-license=<license>] [--security=reality|letsencrypt|selfsigned] [-m|--menu] [--show-server-config]
+  [--add-user=<username>] [--lists-users] [--show-user=<username>] [--delete-user=<username>] [--backup] [--restore=<url|file>]
+  [--backup-password=<password>] [-u|--uninstall]"
   echo ""
   echo "  -t, --transport <tcp|http|grpc|ws|tuic|hysteria2|shadowtls> Transport protocol (tcp, http, grpc, ws, tuic, hysteria2, shadowtls, default: ${defaults[transport]})"
   echo "  -d, --domain <domain>     Domain to use as SNI (default: ${defaults[domain]})"
+  echo "      --camouflage <domain[:port]> Remote site the camouflage falls back to in the reality and shadowtls modes."
+  echo "                            Unauthenticated probes are relayed to it, so it must be a real site whose certificate"
+  echo "                            matches the SNI; the SNI follows it unless --domain is given explicitly (default: ${defaults[camouflage]})"
   echo "      --server <server>     IP address or domain name of server (Must be a valid domain if using letsencrypt security)"
   echo "      --regenerate          Regenerate public and private keys"
   echo "      --default             Restore default configuration"
@@ -160,8 +173,8 @@ function show_help {
   echo "  -u, --uninstall           Uninstall reality"
   echo "      --enable-safenet <true|false> Enable or disable safenet (blocking malware and adult content)"
   echo "      --port <port>         Server port (default: ${defaults[port]}; 80 and 443 are never used unless asked for)"
-  echo "      --http-port <port|off> Host port for the plain HTTP side: reality/shadowtls camouflage and the letsencrypt ACME challenge"
-  echo "                            (default: ${defaults[http_port]}, \"off\" leaves it unpublished, forced to 80 by --security=letsencrypt)"
+  echo "      --http-port <port|off> Host port of the local website served by nginx out of ./website, and the ACME challenge"
+  echo "                            in the letsencrypt mode (default: ${defaults[http_port]}, \"off\" leaves it unpublished)"
   echo "      --enable-warp <true|false> Enable or disable Cloudflare warp"
   echo "      --warp-license <warp-license> Add Cloudflare warp+ license"
   echo "  -c  --core <sing-box|xray> Select core (xray, sing-box, default: ${defaults[core]})"
@@ -184,7 +197,7 @@ function show_help {
 
 function parse_args {
   local opts
-  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,server:,regenerate,default,restart,uninstall,enable-safenet:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,help -- "$@")
+  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,help -- "$@")
   if [[ $? -ne 0 ]]; then
     return 1
   fi
@@ -207,6 +220,18 @@ function parse_args {
         args[domain]="$2"
         if ! [[ ${args[domain]} =~ ${regex[domain_port]} ]]; then
           echo "Invalid domain: ${args[domain]}"
+          return 1
+        fi
+        shift 2
+        ;;
+      --camouflage)
+        args[camouflage]="$2"
+        if ! [[ ${args[camouflage]} =~ ${regex[domain_port]} ]]; then
+          echo "Invalid camouflage site: ${args[camouflage]}"
+          return 1
+        fi
+        if [[ ${args[camouflage]} =~ : ]] && (( ${args[camouflage]#*:} > 65535 )); then
+          echo "Camouflage port out of range: ${args[camouflage]#*:}"
           return 1
         fi
         shift 2
@@ -654,15 +679,15 @@ function build_config {
     exit 1
   fi
   if [[ ! ${config[server]} =~ ${regex[domain]} && ${config[security]} == 'letsencrypt' ]]; then
-    echo 'You have to assign a domain to server with "--server <domain>" option if you want to use "letsencrypt" as TLS certifcate.'
+    echo 'You have to assign a domain to server with "--server <domain>" option if you want to use "letsencrypt" as TLS certificate.'
     exit 1
   fi
   if [[ ${config[transport]} == 'ws' && ${config[security]} == 'reality' ]]; then
-    echo 'You cannot use "ws" transport with "reality" TLS certificate. Use other transports or change TLS certifcate to letsencrypt or selfsigned'
+    echo 'You cannot use "ws" transport with "reality" TLS certificate. Use other transports or change TLS certificate to letsencrypt or selfsigned'
     exit 1
   fi
   if [[ ${config[transport]} == 'tuic' && ${config[security]} == 'reality' ]]; then
-    echo 'You cannot use "tuic" transport with "reality" TLS certificate. Use other transports or change TLS certifcate to letsencrypt or selfsigned'
+    echo 'You cannot use "tuic" transport with "reality" TLS certificate. Use other transports or change TLS certificate to letsencrypt or selfsigned'
     exit 1
   fi
   if [[ ${config[transport]} == 'tuic' && ${config[core]} == 'xray' ]]; then
@@ -670,7 +695,7 @@ function build_config {
     exit 1
   fi
   if [[ ${config[transport]} == 'hysteria2' && ${config[security]} == 'reality' ]]; then
-    echo 'You cannot use "hysteria2" transport with "reality" TLS certificate. Use other transports or change TLS certifcate to letsencrypt or selfsigned'
+    echo 'You cannot use "hysteria2" transport with "reality" TLS certificate. Use other transports or change TLS certificate to letsencrypt or selfsigned'
     exit 1
   fi
   if [[ ${config[transport]} == 'hysteria2' && ${config[core]} == 'xray' ]]; then
@@ -710,15 +735,15 @@ function build_config {
     config[http_port]="${defaults[http_port]}"
   fi
 
-  if [[ -n "${args[security]}" && "${args[security]}" == 'reality' && "${config_file[security]}" != 'reality' && "${config_file[transport]}" != 'shadowtls' ]]; then
-    config[domain]="${defaults[domain]}"
+  if [[ -n "${args[security]}" && "${args[security]}" == 'reality' && "${config_file[security]}" != 'reality' && "${config_file[transport]}" != 'shadowtls' && -z "${args[domain]}" ]]; then
+    config[domain]="${config[camouflage]}"
   fi
   if [[ -n "${args[security]}" && "${args[security]}" != 'reality' && "${config_file[security]}" == 'reality' && "${config_file[transport]}" != 'shadowtls' ]]; then
     config[domain]="${config[server]}"
   fi
   
-  if [[ -n "${args[transport]}" && "${args[transport]}" == 'shadowtls' && "${config_file[transport]}" != 'shadowtls' && "${config_file[security]}" != 'reality' ]]; then
-    config[domain]="${defaults[domain]}"
+  if [[ -n "${args[transport]}" && "${args[transport]}" == 'shadowtls' && "${config_file[transport]}" != 'shadowtls' && "${config_file[security]}" != 'reality' && -z "${args[domain]}" ]]; then
+    config[domain]="${config[camouflage]}"
   fi
   if [[ -n "${args[transport]}" && "${args[transport]}" != 'shadowtls' && "${config_file[transport]}" == 'shadowtls' && "${config_file[security]}" != 'reality' ]]; then
     config[domain]="${config[server]}"
@@ -726,6 +751,29 @@ function build_config {
 
   if [[ -n "${args[server]}" && "${config[security]}" != 'reality' && "${config[transport]}" != 'shadowtls' ]]; then
     config[domain]="${config[server]}"
+  fi
+
+  # The camouflage target only exists in the reality and shadowtls modes, where
+  # anything that does not authenticate gets relayed to it. Supplying just one of
+  # --camouflage / --domain keeps the two in sync, because the certificate the
+  # camouflage site returns has to match the SNI a probe sends - a mismatch is
+  # exactly what an active probe looks for.
+  if [[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]]; then
+    # Upgrading from a version where "domain" served as the camouflage target as
+    # well: carry the configured value over instead of silently switching the
+    # fallback to the default site (which would break the SNI/certificate match).
+    if [[ -z ${config_file[camouflage]} && -z ${args[camouflage]} && -n ${config_file[domain]} ]]; then
+      config[camouflage]="${config[domain]}"
+    fi
+    if [[ -n "${args[camouflage]}" && -z "${args[domain]}" ]]; then
+      config[domain]="${config[camouflage]%%:*}"
+    elif [[ -n "${args[domain]}" && -z "${args[camouflage]}" ]]; then
+      config[camouflage]="${config[domain]}"
+    fi
+    if [[ ${config[camouflage]%%:*} != ${config[domain]%%:*} ]]; then
+      echo "Warning: the SNI (${config[domain]%%:*}) differs from the camouflage site (${config[camouflage]%%:*})."
+      echo 'A probe sends the SNI and compares the certificate it gets back against it, so those are expected to be the same domain.'
+    fi
   fi
 
   if [[ -n "${args[warp]}" && "${args[warp]}" == 'OFF' && "${config_file[warp]}" == 'ON' ]]; then
@@ -938,7 +986,6 @@ services:
     image: ${image[${config[core]}]}
     command: ${engine_command}
     $([[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]] && echo "ports:" || true)
-    $([[ (${config[security]} == 'reality' || ${config[transport]} == 'shadowtls') && ${config[http_port]} != 'OFF' ]] && echo "- ${config[http_port]}:8080" || true)
     $([[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]] && echo "- ${config[port]}:8443" || true)
     $([[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]] && echo "ports:" || true)
     $([[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]] && echo "- ${config[port]}:8443/udp" || true)
@@ -953,17 +1000,23 @@ services:
     $([[ ${config[security]} != 'reality' ]] && { [[ ${config[transport]} == 'http' ]] || [[ ${config[transport]} == 'tcp' ]] || [[ ${config[transport]} == 'tuic' ]] || [[ ${config[transport]} == 'hysteria2' ]]; } && echo "- ./${path[server_key]#${config_path}/}:/etc/${config[core]}/server.key" || true)
     networks:
     - reality
-$(if [[ ${config[security]} != 'reality' && ${config[transport]} != 'shadowtls' ]]; then
+$(if [[ (${config[security]} != 'reality' && ${config[transport]} != 'shadowtls') || ${config[http_port]} != 'OFF' ]]; then
 echo "
   nginx:
     image: ${image[nginx]}
+$(if [[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]]; then echo "
+    ports:
+    - ${config[http_port]}:80"; else echo "
     expose:
-    - 80
+    - 80"; fi)
     restart: always
     volumes:
     - ./website:/usr/share/nginx/html
     networks:
-    - reality
+    - reality"
+fi)
+$(if [[ ${config[security]} != 'reality' && ${config[transport]} != 'shadowtls' ]]; then
+echo "
   haproxy:
     image: ${image[haproxy]}
     ports:
@@ -1022,6 +1075,39 @@ services:
     - /etc/docker/:/etc/docker/
     networks:
     - tgbot
+EOF
+}
+
+# nginx serves the local website out of ./website. The placeholder page is only
+# written when nothing is there yet, so a site put in place by the operator is
+# never overwritten by an upgrade.
+function generate_website {
+  mkdir -p "${config_path}/website"
+  if [[ -e "${path[website]}" ]]; then
+    return 0
+  fi
+  cat >"${path[website]}" <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Welcome</title>
+<style>
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f5f6f8; color: #23272f; }
+  main { max-width: 640px; margin: 0 auto; padding: 14vh 24px; }
+  h1 { margin: 0 0 12px; font-size: 22px; font-weight: 600; }
+  p { margin: 0 0 10px; line-height: 1.7; color: #4a515c; }
+</style>
+</head>
+<body>
+<main>
+<h1>Welcome</h1>
+<p>This site is up and running.</p>
+<p>Content will appear here shortly.</p>
+</main>
+</body>
+</html>
 EOF
 }
 
@@ -1231,6 +1317,9 @@ function generate_engine_config {
   local reality_object=""
   local tls_object=""
   local warp_object=""
+  # The camouflage site is what unauthenticated probes reach; it is a separate
+  # deployment input from the SNI, and its optional ":port" suffix defaults to 443.
+  local camouflage_host="${config[camouflage]%%:*}"
   local reality_port=443
   local temp_file
   if [[ ${config[transport]} == 'tuic' ]]; then
@@ -1242,8 +1331,8 @@ function generate_engine_config {
   else
     type='vless'
   fi
-  if [[ (${config[security]} == 'reality' || ${config[transport]} == 'shadowtls') && ${config[domain]} =~ ":" ]]; then
-    reality_port="${config[domain]#*:}"
+  if [[ (${config[security]} == 'reality' || ${config[transport]} == 'shadowtls') && ${config[camouflage]} =~ ":" ]]; then
+    reality_port="${config[camouflage]#*:}"
   fi
   if [[ ${config[core]} == 'sing-box' ]]; then
     reality_object='"tls": {
@@ -1253,7 +1342,7 @@ function generate_engine_config {
       "reality": {
         "enabled": true,
         "handshake": {
-          "server": "'"${config[domain]%%:*}"'",
+          "server": "'"${camouflage_host}"'",
           "server_port": '"${reality_port}"'
         },
         "private_key": "'"${config[private_key]}"'",
@@ -1322,14 +1411,6 @@ function generate_engine_config {
   },
   "inbounds": [
     {
-      "type": "direct",
-      "listen": "::",
-      "listen_port": 8080,
-      "network": "tcp",
-      "override_address": "${config[domain]%%:*}",
-      "override_port": 80
-    },
-    {
       "type": "${type}",
       "tag": "in",	
       "listen": "::",
@@ -1360,7 +1441,7 @@ function generate_engine_config {
       echo ',"obfs": {"type": "salamander", "password": "'"${config[service_path]}"'"}, "ignore_client_bandwidth": true, "masquerade": "https://'"${config[server]}:${config[port]}"'"'
       fi
       if [[ ${config[transport]} == shadowtls ]]; then
-      echo '"version": 3, "strict_mode": false, "detour": "shadowsocks", "handshake": {"server": "'"${config[domain]%%:*}"'", "server_port": '"${reality_port}"'}'
+      echo '"version": 3, "strict_mode": false, "detour": "shadowsocks", "handshake": {"server": "'"${camouflage_host}"'", "server_port": '"${reality_port}"'}'
       fi
       )
     }
@@ -1479,7 +1560,7 @@ EOF
     reality_object='"security":"reality",
     "realitySettings":{
       "show": false,
-      "dest": "'"${config[domain]%%:*}"':'"${reality_port}"'",
+      "dest": "'"${camouflage_host}"':'"${reality_port}"'",
       "xver": 0,
       "serverNames": ["'"${config[domain]%%:*}"'"],
       "privateKey": "'"${config[private_key]}"'",
@@ -1529,16 +1610,6 @@ EOF
     "servers": [$([[ ${config[safenet]} == ON ]] && echo '"tcp+local://1.1.1.3","tcp+local://1.0.0.3"' || echo '"tcp+local://1.1.1.1","tcp+local://1.0.0.1"')]
   },
   "inbounds": [
-    {
-      "listen": "0.0.0.0",
-      "port": 8080,
-      "protocol": "dokodemo-door",
-      "settings": {
-        "address": "${config[domain]%%:*}",
-        "port": 80,
-        "network": "tcp"
-      }
-    },
     {
       "listen": "0.0.0.0",
       "port": 8443,
@@ -1662,6 +1733,7 @@ EOF
 function generate_config {
   generate_docker_compose
   generate_engine_config
+  generate_website
   if [[ ${config[security]} != "reality" && ${config[transport]} != 'shadowtls' ]]; then
     mkdir -p "${config_path}/certificate"
     generate_haproxy_config
@@ -2033,7 +2105,9 @@ function show_server_config {
   server_config="Core: ${config[core]}"
   server_config=$server_config$'\n'"Server Address: ${config[server]}"
   server_config=$server_config$'\n'"Domain SNI: ${config[domain]}"
+  server_config=$server_config$'\n'"Camouflage Site: ${config[camouflage]}"
   server_config=$server_config$'\n'"Port: ${config[port]}"
+  server_config=$server_config$'\n'"HTTP Port (website): ${config[http_port]}"
   server_config=$server_config$'\n'"Transport: ${config[transport]}"
   server_config=$server_config$'\n'"Security: ${config[security]}"
   server_config=$server_config$'\n'"Safenet: ${config[safenet]}"
@@ -2114,15 +2188,16 @@ function configuration_menu {
       "4" "SNI Domain" \
       "5" "Security" \
       "6" "Port" \
-      "7" "HTTP Port (fallback / ACME)" \
-      "8" "Safe Internet" \
-      "9" "WARP" \
-      "10" "Telegram Bot" \
-      "11" "Restart Services" \
-      "12" "Regenerate Keys" \
-      "13" "Restore Defaults" \
-      "14" "Create Backup" \
-      "15" "Restore Backup" \
+      "7" "HTTP Port (website / ACME)" \
+      "8" "Camouflage Site" \
+      "9" "Safe Internet" \
+      "10" "WARP" \
+      "11" "Telegram Bot" \
+      "12" "Restart Services" \
+      "13" "Regenerate Keys" \
+      "14" "Restore Defaults" \
+      "15" "Create Backup" \
+      "16" "Restore Backup" \
       3>&1 1>&2 2>&3)
     if [[ $? -ne 0 ]]; then
       break
@@ -2150,27 +2225,30 @@ function configuration_menu {
         config_http_port_menu
         ;;
       8 )
-        config_safenet_menu
+        config_camouflage_menu
         ;;
       9 )
-        config_warp_menu
+        config_safenet_menu
         ;;
       10 )
-        config_tgbot_menu
+        config_warp_menu
         ;;
       11 )
-        restart_menu
+        config_tgbot_menu
         ;;
       12 )
-        regenerate_menu
+        restart_menu
         ;;
       13 )
-        restore_defaults_menu
+        regenerate_menu
         ;;
       14 )
-        backup_menu
+        restore_defaults_menu
         ;;
       15 )
+        backup_menu
+        ;;
+      16 )
         restore_backup_menu
         ;;
     esac
@@ -2248,11 +2326,11 @@ function config_transport_menu {
       break
     fi
     if [[ ${transport} == 'ws' && ${config[security]} == 'reality' ]]; then
-      message_box 'Invalid Configuration' 'You cannot use "ws" transport with "reality" TLS certificate. Use other transports or change TLS certifcate to "letsencrypt" or "selfsigned"'
+      message_box 'Invalid Configuration' 'You cannot use "ws" transport with "reality" TLS certificate. Use other transports or change TLS certificate to "letsencrypt" or "selfsigned"'
       continue
     fi
     if [[ ${transport} == 'tuic' && ${config[security]} == 'reality' ]]; then
-      message_box 'Invalid Configuration' 'You cannot use "tuic" transport with "reality" TLS certificate. Use other transports or change TLS certifcate to "letsencrypt" or "selfsigned"'
+      message_box 'Invalid Configuration' 'You cannot use "tuic" transport with "reality" TLS certificate. Use other transports or change TLS certificate to "letsencrypt" or "selfsigned"'
       continue
     fi
     if [[ ${transport} == 'tuic' && ${config[core]} == 'xray' ]]; then
@@ -2260,7 +2338,7 @@ function config_transport_menu {
       continue
     fi
     if [[ ${transport} == 'hysteria2' && ${config[security]} == 'reality' ]]; then
-      message_box 'Invalid Configuration' 'You cannot use "hysteria2" transport with "reality" TLS certificate. Use other transports or change TLS certifcate to "letsencrypt" or "selfsigned"'
+      message_box 'Invalid Configuration' 'You cannot use "hysteria2" transport with "reality" TLS certificate. Use other transports or change TLS certificate to "letsencrypt" or "selfsigned"'
       continue
     fi
     if [[ ${transport} == 'hysteria2' && ${config[core]} == 'xray' ]]; then
@@ -2275,6 +2353,33 @@ function config_transport_menu {
       config[domain]="${defaults[domain]}"
     fi
     config[transport]=$transport
+    update_config_file
+    break
+  done
+}
+
+function config_camouflage_menu {
+  local camouflage
+  while true; do
+    camouflage=$(whiptail --clear --backtitle "$BACKTITLE" --title "Camouflage Site" \
+      --inputbox "Remote site that unauthenticated probes are relayed to (reality / shadowtls).\nIt must be a real site whose certificate matches the SNI, so the SNI follows it unless it is set separately.\nOptional \":port\" suffix, port 443 by default.\n\nDefault: ${defaults[camouflage]}" \
+      $HEIGHT $WIDTH "${config[camouflage]}" \
+      3>&1 1>&2 2>&3)
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    if [[ ! $camouflage =~ ${regex[domain_port]} ]]; then
+      message_box "Invalid Domain" '"'"${camouflage}"'" is not a valid domain.'
+      continue
+    fi
+    if [[ $camouflage =~ : ]] && (( ${camouflage#*:} > 65535 )); then
+      message_box "Invalid Port" 'The camouflage port must be between 1 and 65535.'
+      continue
+    fi
+    config[camouflage]=$camouflage
+    if [[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]]; then
+      config[domain]="${camouflage%%:*}"
+    fi
     update_config_file
     break
   done
@@ -2317,15 +2422,15 @@ function config_security_menu {
       continue
     fi
     if [[ ${config[transport]} == 'ws' && ${security} == 'reality' ]]; then
-      message_box 'Invalid Configuration' 'You cannot use "reality" TLS certificate with "ws" transport protocol. Change TLS certifcate to "letsencrypt" or "selfsigned" or use other transport protocols'
+      message_box 'Invalid Configuration' 'You cannot use "reality" TLS certificate with "ws" transport protocol. Change TLS certificate to "letsencrypt" or "selfsigned" or use other transport protocols'
       continue
     fi
     if [[ ${config[transport]} == 'tuic' && ${security} == 'reality' ]]; then
-      message_box 'Invalid Configuration' 'You cannot use "reality" TLS certificate with "tuic" transport. Change TLS certifcate to "letsencrypt" or "selfsigned" or use other transports'
+      message_box 'Invalid Configuration' 'You cannot use "reality" TLS certificate with "tuic" transport. Change TLS certificate to "letsencrypt" or "selfsigned" or use other transports'
       continue
     fi
     if [[ ${config[transport]} == 'hysteria2' && ${security} == 'reality' ]]; then
-      message_box 'Invalid Configuration' 'You cannot use "reality" TLS certificate with "hysteria2" transport. Change TLS certifcate to "letsencrypt" or "selfsigned" or use other transports'
+      message_box 'Invalid Configuration' 'You cannot use "reality" TLS certificate with "hysteria2" transport. Change TLS certificate to "letsencrypt" or "selfsigned" or use other transports'
       continue
     fi
     if [[ ${security} == 'letsencrypt' ]]; then
@@ -2392,7 +2497,7 @@ function config_http_port_menu {
   local http_port
   while true; do
     http_port=$(whiptail --clear --backtitle "$BACKTITLE" --title "HTTP Port" \
-      --inputbox "Host port for the plain HTTP side:\n- camouflage fallback for the reality/shadowtls transports\n- ACME HTTP-01 challenge for letsencrypt (always port 80)\n\nEnter \"off\" to leave it unpublished. Default: ${defaults[http_port]}" \
+      --inputbox "Host port of the local website served by nginx out of ./website.\nIn the letsencrypt mode it also carries the ACME HTTP-01 challenge (always port 80).\n\nEnter \"off\" to leave it unpublished. Default: ${defaults[http_port]}" \
       $HEIGHT $WIDTH "${config[http_port]}" \
       3>&1 1>&2 2>&3)
     if [[ $? -ne 0 ]]; then
@@ -2887,6 +2992,7 @@ function generate_file_list {
   path[compose]="${config_path}/docker-compose.yml"
   path[engine]="${config_path}/engine.conf"
   path[haproxy]="${config_path}/haproxy.cfg"
+  path[website]="${config_path}/website/index.html"
   path[certbot_deployhook]="${config_path}/certbot/deployhook.sh"
   path[certbot_dockerfile]="${config_path}/certbot/Dockerfile"
   path[certbot_startup]="${config_path}/certbot/startup.sh"
@@ -2902,6 +3008,7 @@ function generate_file_list {
   service[compose]='compose'
   service[engine]='engine'
   service[haproxy]='haproxy'
+  service[website]='nginx'
   service[certbot_deployhook]='certbot'
   service[certbot_dockerfile]='compose'
   service[certbot_startup]='certbot'
