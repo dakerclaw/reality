@@ -124,9 +124,14 @@ ls /opt/reality-ezpz/config/website
 
 几点说明：
 
-* `--camouflage` 默认值为 `www.google.com`，并且会同时设置 SNI —— 因为探测者发出的就是
+* `--camouflage` 默认值为 `www.akamai.com`，并且会同时设置 SNI —— 因为探测者发出的就是
   SNI，并会拿回来的证书与之比对。只有在你明确想让两者不同时才额外传 `--domain`，此时
   脚本会给出告警：SNI 与证书不匹配正是主动探测要抓的特征。
+* REALITY 官方对目标网站的**最低标准是 TLS 1.3 + H2**，所以选站前先验一下：
+  `openssl s_client -connect <host>:443 -servername <host> -tls1_3 -alpn h2 </dev/null | grep ALPN`
+  必须返回 `ALPN protocol: h2`，去掉 `-alpn` 再跑一次则必须协商出 `TLSv1.3`。当前默认值
+  `www.akamai.com` 能满足 TLS 1.3，但协商结果是 `http/1.1`，即低于该最低标准；想严格
+  落在标准内，请传 `--camouflage www.microsoft.com` 或任何会返回 `h2` 的站点。
 * 从没有 `--camouflage` 的旧版本升级时，脚本会把原 `domain` 的值沿用到新配置项上，
   不会让你的回落目标在升级中悄悄换掉。
 * 首次运行会写入一个中性的占位首页
@@ -144,7 +149,7 @@ ls /opt/reality-ezpz/config/website
 
 | 模式 | 需要自有域名？ | 握手里带的是什么 |
 | --- | --- | --- |
-| `reality`（默认） | 不需要 | SNI 用的是**远端**伪装大站（`--camouflage`，默认 `www.google.com`），探测者拿到的是那个站点的真实证书 |
+| `reality`（默认） | 不需要 | SNI 用的是**远端**伪装大站（`--camouflage`，默认 `www.akamai.com`），探测者拿到的是那个站点的真实证书 |
 | `shadowtls` 传输 | 不需要 | 握手服务器同样是远端伪装大站 |
 | `selfsigned` | 严格说不必要 | 自签证书；客户端必须接受不受信任的证书（`allow_insecure` / `insecure=1`），主动探测能够察觉 |
 | `letsencrypt` | **需要** | 为你的自有域名签发公信证书 —— ACME HTTP-01 要求该域名解析到本机，并占用 `80` 端口 |
@@ -152,7 +157,7 @@ ls /opt/reality-ezpz/config/website
 所以纯粹只有公网 IP 的机器，**没有任何需要填写的东西**：
 
 ```bash
-# reality + sing-box，伪装目标默认 www.google.com，无需任何额外参数
+# reality + sing-box，伪装目标默认 www.akamai.com，无需任何额外参数
 bash <(curl -fsSL .../reality-ezpz.sh)
 
 # 同样不需要域名，只是换个探测者会看到的站点
@@ -217,7 +222,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | --- | --- |
 | `-t, --transport <tcp\|http\|grpc\|ws\|tuic\|hysteria2\|shadowtls>` | 传输协议（默认 `tcp`） |
 | `-d, --domain <domain>` | Reality 握手使用的 SNI 域名（默认跟随 `--camouflage`） |
-| `--camouflage <domain[:port]>` | `reality` / `shadowtls` 模式下未通过校验的流量所回落的远端真实站点（默认 `www.google.com`，端口默认 `443`） |
+| `--camouflage <domain[:port]>` | `reality` / `shadowtls` 模式下未通过校验的流量所回落的远端真实站点（默认 `www.akamai.com`，端口默认 `443`） |
 | `--server <server>` | 本机公网 IP 或域名；使用 `letsencrypt` 时必须是域名 |
 | `--port <port>` | 主代理端口（默认 `8443`） |
 | `--http-port <port\|off>` | nginx 承载本机网站的宿主端口（默认 `8080`，`off` 表示不监听） |

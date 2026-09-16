@@ -73,13 +73,18 @@ ruleset_base_url="${RULESET_BASE_URL:-https://raw.githubusercontent.com/aleskxyz
 defaults[transport]=tcp
 # The SNI the client sends and the server accepts. In the reality and shadowtls
 # modes it must be a real, reachable site - see defaults[camouflage] below.
-defaults[domain]=www.google.com
+defaults[domain]=www.akamai.com
 # The remote site the camouflage falls back to: probes that do not authenticate
 # are relayed to it (Reality dest / shadowtls handshake target), so it is what an
 # active probe sees on the proxy port. Supplied at deployment time, optional
 # ":port" suffix, port 443 by default. It is kept in sync with the SNI because
 # the certificate this site returns has to match the SNI the probe sent.
-defaults[camouflage]=www.google.com
+#
+# REALITY's documented minimum for a target site is TLS 1.3 + H2, so qualify a
+# candidate before relying on it (both should answer, the second with h2):
+#   openssl s_client -connect <host>:443 -servername <host> -tls1_3 </dev/null | grep Protocol
+#   openssl s_client -connect <host>:443 -servername <host> -alpn h2 </dev/null | grep ALPN
+defaults[camouflage]=www.akamai.com
 # 8443 is deliberately not a well-known port: the default installation must not
 # take 80 or 443 away from whatever else runs on the machine.
 defaults[port]=8443
