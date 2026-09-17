@@ -21,9 +21,24 @@ import paramiko
 
 
 def parse_proxy(s):
+    """解析 host:port。容忍 "http://host:port" 这类带 scheme 的写法。
+
+    只取第一段冒号会踩坑："http://1.2.3.4:12345" 会被切成 host="http"、
+    port="//1.2.3.4:12345" 然后 int() 抛 ValueError。先把 scheme 与路径剥掉。
+    """
     if not s:
         return None
-    host, _, port = s.partition(":")
+    s = s.strip()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    s = s.split("/", 1)[0]
+    if s.startswith("[") and "]" in s:  # IPv6 字面量 [::1]:8080
+        host, _, rest = s[1:].partition("]")
+        port = rest.lstrip(":")
+    else:
+        host, _, port = s.rpartition(":")
+        if not host:  # 没有冒号，纯 host
+            host, port = port, ""
     return (host, int(port or 8080))
 
 
