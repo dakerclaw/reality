@@ -245,7 +245,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `--delete-user <username>` | 删除用户 |
 | `--enable-tgbot <true\|false>` | 启用 Telegram 机器人 |
 | `--tgbot-token <token>` | Telegram 机器人 Token |
-| `--tgbot-admins <user1,user2>` | 允许使用机器人的 Telegram 用户名（不带 `@`） |
+| `--tgbot-admins <user1,123456789>` | 机器人管理员：Telegram 用户名（不带 `@`）或数字 ID |
 | `--backup` | 创建并上传备份 |
 | `--restore <url\|file>` | 从备份恢复 |
 | `--backup-password <password>` | 为备份设置密码 |
@@ -272,15 +272,57 @@ bash /opt/reality/reality.sh --delete-user john
 bash /opt/reality/reality.sh \
   --enable-tgbot true \
   --tgbot-token 123456789:AA... \
-  --tgbot-admins your_telegram_username
+  --tgbot-admins your_telegram_username,123456789
 ```
 
 机器人运行在独立容器中，挂载 `/opt/reality`，并以 argv 列表方式调用本地脚本副本——
-来自按钮的用户名不可能被当作 shell 命令执行。支持的命令：`/start`、`/add`、`/delete`、
-`/list`、`/show`。
+来自按钮的用户名不可能被当作 shell 命令执行。命令只有 `/start`（列出下面三个按钮），
+查看配置、新增用户、删除用户都通过按钮菜单完成。
 
 请注意：该容器挂载了 Docker socket，实际权限等同于宿主机 root，不需要远程管理用户时建议
 不要开启。
+
+### 管理员名单：用户名或数字 ID
+
+`--tgbot-admins` 的每一项既可以是 Telegram 用户名，也可以是账号的数字 ID；逗号分隔、不加
+空格，两种写法可以混用。
+
+| 写法 | 例子 | 规则 |
+|---|---|---|
+| Telegram 用户名 | `dakerjie` | 不带 `@`；5–32 个字符，字母开头，只能用字母、数字、下划线，不能以 `_` 结尾 |
+| 数字 ID | `123456789` | 账号的永久编号，4–15 位数字 |
+
+**没有设置用户名的账号只能用数字 ID 授权。** 用户名在 Telegram 里是可选项，可以随时改名，
+释放后还可能被别人抢注；数字 ID 与账号终身绑定、不会被回收，所以用起来更省心。鉴权时两种
+写法都会比对，其中用户名**不区分大小写**。
+
+### 怎么拿到自己的数字 ID
+
+任选一种，30 秒内搞定：
+
+1. **@userinfobot**（推荐）：打开 https://t.me/userinfobot 点 Start（或随便发一句话），
+   回复中以 `Id:` 开头的那一行就是你的数字 ID。
+2. **@getidsbot**：打开 https://t.me/getidsbot 发任意一句话，回复中 `ID:` 后面的那串数字
+   即为数字 ID。
+3. **不借助第三方机器人**：自己刚建的机器人就是现成的查询工具。先在 Telegram 里给
+   `@你的机器人` 发一句 `/start`，然后执行：
+
+   ```bash
+   curl -s "https://api.telegram.org/bot<你的BOT_TOKEN>/getUpdates" \
+     | grep -o '"from":{"id":[0-9]*' | head -1
+   ```
+
+   输出里的 `"id":` 后面那串数字就是你的数字 ID（即 `message.from.id`）。
+   注意要赶在机器人容器启动前查，或者先停掉机器人容器——它一启动就会把积压的消息取走。
+
+三条要注意的规则：
+
+1. **只能与机器人私聊**。鉴权比对的是会话本身：私聊里才代表你的账号，群里拿到的是群，不会
+   被识别成管理员；而且客户端配置（含二维码）会直接发到群里。
+2. **改用户名就要同步改名单**。名单以容器环境变量 `BOT_ADMIN` 注入，改完必须重跑一次配置让
+   容器重建；换成数字 ID 就没有这个麻烦。
+3. **TUI 里一样能配**。`bash /opt/reality/reality.sh --menu` → 「Telegram Bot」项的输入框
+   同样接受两种写法。
 
 ## Cloudflare WARP
 

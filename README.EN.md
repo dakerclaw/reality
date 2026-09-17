@@ -268,7 +268,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `--delete-user <username>` | Delete a user |
 | `--enable-tgbot <true\|false>` | Enable the Telegram bot |
 | `--tgbot-token <token>` | Telegram bot token |
-| `--tgbot-admins <user1,user2>` | Telegram usernames allowed to use the bot (no `@`) |
+| `--tgbot-admins <user1,123456789>` | Bot admins: Telegram usernames (no `@`) or numeric user ids |
 | `--backup` | Create and upload a backup archive |
 | `--restore <url\|file>` | Restore from a backup |
 | `--backup-password <password>` | Password-protect the backup |
@@ -295,16 +295,66 @@ Usernames must be alphanumeric (`A-Z`, `a-z`, `0-9`).
 bash /opt/reality/reality.sh \
   --enable-tgbot true \
   --tgbot-token 123456789:AA... \
-  --tgbot-admins your_telegram_username
+  --tgbot-admins your_telegram_username,123456789
 ```
 
 The bot runs in its own container, mounts `/opt/reality` and executes the
 locally mounted copy of this script with an argv list — a username coming from a
-button can never be interpreted as a shell command. Bot commands: `/start`,
-`/add`, `/delete`, `/list`, `/show`.
+button can never be interpreted as a shell command. The only command is `/start`,
+which lists the three buttons; viewing, adding and deleting users go through that
+menu.
 
 Note that the bot container mounts the Docker socket and therefore effectively has
 root-equivalent permissions. Enable it only if you need it.
+
+### Admin list: username or numeric id
+
+Every entry of `--tgbot-admins` is either a Telegram username or the numeric id of
+the account. Separate them with `,` and no spaces; the two forms can be mixed.
+
+| Form | Example | Rule |
+|---|---|---|
+| Telegram username | `dakerjie` | No `@`; 5-32 characters, starts with a letter, letters/digits/underscores only, may not end with `_` |
+| Numeric id | `123456789` | The permanent account number, 4-15 digits |
+
+**An account that never picked a username can only be authorised by its numeric
+id.** A username is optional in Telegram, can be changed at any time and may be
+recycled by somebody else once released; the numeric id is bound to the account
+for good and is never reused, so it is the safer choice. Both forms are compared
+when a caller is checked, and usernames are matched **case-insensitively**.
+
+### How to find your numeric id
+
+Any of these takes about 30 seconds:
+
+1. **@userinfobot** (recommended): open https://t.me/userinfobot and press Start
+   (or send it anything). The line starting with `Id:` in its reply is your
+   numeric id.
+2. **@getidsbot**: open https://t.me/getidsbot and send it a message; the digits
+   after `ID:` in its reply are your numeric id.
+3. **Without a third-party bot**: the bot you just created is the lookup tool.
+   Send `/start` to `@your_bot` from Telegram first, then run:
+
+   ```bash
+   curl -s "https://api.telegram.org/bot<your BOT_TOKEN>/getUpdates" \
+     | grep -o '"from":{"id":[0-9]*' | head -1
+   ```
+
+   The digits after `"id":` are your numeric id (that is `message.from.id`).
+   Do it before the bot container starts, or stop that container first — once it
+   runs it consumes the queued updates itself.
+
+Three things worth knowing:
+
+1. **Private chats only.** The chat itself is what gets checked: in a private chat
+   it stands for your account, while in a group it is the group and you will not be
+   recognised as an admin — and the client configurations, QR codes included, would
+   be posted into that group.
+2. **Renaming means updating the list.** The list is injected into the container as
+   the `BOT_ADMIN` environment variable, so re-running the configuration is required
+   for it to take effect. With a numeric id there is nothing to update.
+3. **The TUI configures it too.** `bash /opt/reality/reality.sh --menu` →
+   "Telegram Bot" accepts both forms in its input box.
 
 ## Cloudflare WARP
 

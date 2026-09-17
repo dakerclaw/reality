@@ -163,7 +163,10 @@ regex[warp_license]="^[a-zA-Z0-9]{8}-[a-zA-Z0-9]{8}-[a-zA-Z0-9]{8}$"
 regex[username]="^[a-zA-Z0-9]+$"
 regex[ip]="^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$"
 regex[tgbot_token]="^[0-9]{8,10}:[a-zA-Z0-9_-]{35}$"
-regex[tgbot_admins]="^[a-zA-Z][a-zA-Z0-9_]{4,31}(,[a-zA-Z][a-zA-Z0-9_]{4,31})*$"
+# Each admin is either a Telegram username (5-32 chars, letter first) or the
+# numeric id of the account. Telegram usernames can not start with a digit, so
+# an all-digit entry is unambiguously an id.
+regex[tgbot_admins]="^([a-zA-Z][a-zA-Z0-9_]{4,31}|[0-9]{4,15})(,([a-zA-Z][a-zA-Z0-9_]{4,31}|[0-9]{4,15}))*$"
 regex[domain_port]="^[a-zA-Z0-9]+([-.][a-zA-Z0-9]+)*\.[a-zA-Z]{2,}(:[1-9][0-9]*)?$"
 regex[file_path]="^[a-zA-Z0-9_/.-]+$"
 regex[url]="^(http|https)://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[0-9]{1,3}(\.[0-9]{1,3}){3})(:[0-9]{1,5})?(/.*)?$"
@@ -200,7 +203,7 @@ function show_help {
   echo "  -m  --menu                Show menu"
   echo "      --enable-tgbot <true|false> Enable Telegram bot for user management"
   echo "      --tgbot-token <token> Token of Telegram bot"
-  echo "      --tgbot-admins <telegram-username> Usernames of telegram bot admins (Comma separated list of usernames without leading '@')"
+  echo "      --tgbot-admins <usernames|ids> Telegram bot admins: usernames without the leading '@' or numeric user ids (comma separated)"
   echo "      --show-server-config  Print server configuration"
   echo "      --add-user <username> Add new user"
   echo "      --list-users          List all users"
@@ -415,7 +418,7 @@ function parse_args {
       --tgbot-admins)
         args[tgbot_admins]="$2"
         if [[ ! ${args[tgbot_admins]} =~ ${regex[tgbot_admins]} || ${args[tgbot_admins]} =~ .+_$ || ${args[tgbot_admins]} =~ .+_,.+ ]]; then
-          echo -e "Invalid Telegram Bot Admins Username: ${args[tgbot_admins]}\nThe usernames must separated by ',' without leading '@' character or any extra space."
+          echo -e "Invalid Telegram Bot Admins: ${args[tgbot_admins]}\nEvery admin must be a Telegram username without the leading '@' character or a numeric user id, separated by ',' with no extra space."
           return 1
         fi
         shift 2
@@ -705,7 +708,7 @@ function build_config {
     exit 1
   fi
   if [[ ${config[tgbot]} == 'ON' && -z ${config[tgbot_admins]} ]]; then
-    echo 'To enable Telegram bot, you have to give the list of authorized Telegram admins username with --tgbot-admins option.'
+    echo 'To enable Telegram bot, you have to give the list of authorized Telegram admins (usernames without the leading "@", or numeric user ids) with --tgbot-admins option.'
     exit 1
   fi
   if [[ ! ${config[server]} =~ ${regex[domain]} && ${config[security]} == 'letsencrypt' ]]; then
@@ -2771,13 +2774,13 @@ function config_tgbot_menu {
       config[tgbot_token]=$tgbot_token
       while true; do
         tgbot_admins=$(whiptail --clear --backtitle "$BACKTITLE" --title "Telegram Bot Admins" \
-          --inputbox "Enter Telegram Bot Admins (Seperate multiple admins by comma ',' without leading '@'):" $HEIGHT $WIDTH "${config[tgbot_admins]}" \
+          --inputbox "Enter Telegram Bot Admins (Telegram usernames without leading '@' or numeric user ids, seperate multiple admins by comma ','):" $HEIGHT $WIDTH "${config[tgbot_admins]}" \
           3>&1 1>&2 2>&3)
         if [[ $? -ne 0 ]]; then
           break
         fi
         if [[ ! $tgbot_admins =~ ${regex[tgbot_admins]} || $tgbot_admins =~ .+_$ || $tgbot_admins =~ .+_,.+ ]]; then
-          message_box "Invalid Input" "Invalid Username\nThe usernames must separated by ',' without leading '@' character or any extra space."
+          message_box "Invalid Input" "Invalid Admin\nEvery admin must be a Telegram username without the leading '@' character or a numeric user id, separated by ',' with no extra space."
           continue
         fi
         config[tgbot_admins]=$tgbot_admins

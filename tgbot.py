@@ -8,6 +8,9 @@ which was also the reason the bot stopped working entirely while offline).
 
 The image pins python-telegram-bot 13.x, so the synchronous Updater/Dispatcher
 API is used on purpose.
+
+BOT_ADMIN lists the people allowed to drive the bot, as Telegram usernames or as
+numeric user ids; see parse_admins and is_admin.
 """
 
 import html
@@ -40,11 +43,38 @@ REMOTE_SCRIPT = os.environ.get(
 )
 
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '').strip()
-BOT_ADMINS = {
-    name.strip().lstrip('@')
-    for name in os.environ.get('BOT_ADMIN', '').split(',')
-    if name.strip()
-}
+
+# Every BOT_ADMIN entry is either a Telegram username (@name) or the numeric id
+# of the account (123456789). The numeric form is the only way to authorise an
+# account that never picked a username, and unlike a username it can neither be
+# renamed nor recycled by somebody else.
+# Same upper bound the installer's regex uses. The installer also demands four
+# digits there, but that is a typo guard for interactive input, so anything the
+# config file happens to hold is still honoured here.
+NATIVE_ID_RE = re.compile(r'^[0-9]{1,15}$')
+
+
+def parse_admins(raw):
+    """Split the BOT_ADMIN list into (usernames, numeric ids).
+
+    Usernames are lowercased on purpose: Telegram echoes a username back exactly
+    as its owner typed it, so a list holding `DakerJie` would otherwise never
+    match the configured `dakerjie`.
+    """
+    usernames = set()
+    ids = set()
+    for entry in raw.split(','):
+        entry = entry.strip().lstrip('@').strip()
+        if not entry:
+            continue
+        if NATIVE_ID_RE.match(entry):
+            ids.add(int(entry))
+        else:
+            usernames.add(entry.lower())
+    return usernames, ids
+
+
+BOT_ADMINS, BOT_ADMIN_IDS = parse_admins(os.environ.get('BOT_ADMIN', ''))
 
 USERNAME_RE = re.compile(r'^[a-zA-Z0-9]+$')
 # Same filter the previous shell pipeline used to pick configuration lines out
@@ -169,6 +199,22 @@ def send_config(context, chat_id, config, username, reply_markup):
     )
 
 
+def is_admin(chat):
+    """True when the chat belongs to an authorised admin.
+
+    Both forms are compared: the numeric id first, then the username. A private
+    chat is the only place where `chat.id` is the user id and `chat.username` is
+    the user's own name, which is what makes the id lookup -- and therefore an
+    admin without a username -- work at all.
+    """
+    if chat is None:
+        return False
+    if chat.id in BOT_ADMIN_IDS:
+        return True
+    username = (chat.username or '').lower()
+    return bool(username) and username in BOT_ADMINS
+
+
 def restricted(handler):
     """Reject non-admins and turn command failures into readable messages."""
 
@@ -178,7 +224,7 @@ def restricted(handler):
         message = update.effective_message
         if chat is None or message is None:
             return None
-        if message.chat.username not in BOT_ADMINS:
+        if not is_admin(chat):
             context.bot.send_message(
                 chat_id=chat.id, text='You are not authorized to use this bot.'
             )
@@ -347,7 +393,7 @@ def main():
     if not BOT_TOKEN:
         print('BOT_TOKEN environment variable is not set.', file=sys.stderr)
         return 1
-    if not BOT_ADMINS:
+    if not BOT_ADMINS and not BOT_ADMIN_IDS:
         print('BOT_ADMIN environment variable is not set.', file=sys.stderr)
         return 1
     updater = Updater(BOT_TOKEN, use_context=True)
