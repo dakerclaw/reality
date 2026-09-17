@@ -12,10 +12,10 @@
 
 1. **安装过程绝不占用知名端口。** 默认只绑定 `8443` 和 `8080`。端口 `80` 只有
    `letsencrypt` 模式会用（ACME HTTP-01 协议强制要求），且必须由你主动选择。
-2. **每个组件都来自它自己的上游。** 容器镜像全部使用官方镜像 ，
-   Cloudflare WARP 直接调用 Cloudflare 官方接口注册 。
+2. **每个组件都来自它自己的上游。** 容器镜像全部使用官方镜像，
+   Cloudflare WARP 直接调用 Cloudflare 官方接口注册。
 3. **伪装目标与自有网站彻底分离。** 代理端口把未通过校验的流量回落到部署时指定的
-   **远端真实大站**  ，nginx 则在 HTTP 端口上正常负载**你自己的网站**。详见
+   **远端真实大站**，nginx 则在 HTTP 端口上正常负载**你自己的网站**。详见
    [网站与伪装](#网站与伪装)。
 
 ---
@@ -23,8 +23,8 @@
 ## 功能特性
 
 * 自动安装并配置 Docker 与 Compose 插件
-* 引擎可选 `sing-box` / `xray`，默认为 `sing-box` ；TLS 可选 `reality` / `letsencrypt` / `selfsigned` ，默认为 `reality` 。
-* 传输协议：`tcp`、`http`、`grpc`、`ws`、`tuic`、`hysteria2`、`shadowtls` ，默认为 `tcp`。
+* 引擎可选 `sing-box` / `xray`，默认为 `sing-box`；TLS 可选 `reality` / `letsencrypt` / `selfsigned`，默认为 `reality`。
+* 传输协议：`tcp`、`http`、`grpc`、`ws`、`tuic`、`hysteria2`、`shadowtls`，默认为 `tcp`。
 * 多用户，每用户独立 UUID / 密码，输出客户端链接与二维码
 * Cloudflare WARP 出口（支持免费版与 WARP+ 授权），不引入任何额外镜像
 * 自动开启 BBR 拥塞控制（加载 `tcp_bbr` + `fq` 队列，写入 `/etc/sysctl.d`），
@@ -71,13 +71,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh)
 
 # 指定伪装回落的远端大站（同时会作为 SNI）
-bash <(curl -fsSL .../reality.sh) --camouflage www.microsoft.com
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --camouflage www.microsoft.com
 
 # 自定义端口，并完全不挂网站
-bash <(curl -fsSL .../reality.sh) --port 2087 --http-port off
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --port 2087 --http-port off
 
 # 使用 letsencrypt 证书（这是唯一会占用 80 端口的模式）
-bash <(curl -fsSL .../reality.sh) --security letsencrypt --server vpn.example.com
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --security letsencrypt --server vpn.example.com
 
 # 之后随时打开管理菜单
 bash /opt/reality/reality.sh --menu
@@ -86,7 +89,6 @@ bash /opt/reality/reality.sh --menu
 ---
 
 ## 端口策略
-
 
 | 监听用途 | 默认宿主端口 | 由谁控制 | 说明 |
 | --- | --- | --- | --- |
@@ -117,7 +119,8 @@ bash /opt/reality/reality.sh --menu
 
 ```bash
 # 伪装目标 = www.microsoft.com，自有网站在 8080
-bash <(curl -fsSL .../reality.sh) --camouflage www.microsoft.com
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --camouflage www.microsoft.com
 
 # 挂自己的网站：把文件丢进根目录即可，不需要其他操作
 ls /opt/reality/config/website
@@ -160,10 +163,11 @@ ls /opt/reality/config/website
 
 ```bash
 # reality + sing-box，伪装目标默认 www.fastly.com，无需任何额外参数
-bash <(curl -fsSL .../reality.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh)
 
 # 同样不需要域名，只是换个探测者会看到的站点
-bash <(curl -fsSL .../reality.sh) --camouflage www.microsoft.com
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --camouflage www.microsoft.com
 ```
 
 * 不用配 DNS 记录，也不用在本地签证书：`reality` / `shadowtls` 模式下引擎只是把握手转发给

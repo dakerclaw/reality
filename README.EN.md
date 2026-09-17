@@ -16,12 +16,11 @@ with three design rules on top of the upstream feature set:
    `8443` and `8080`. Port `80` is used by exactly one mode — `letsencrypt`, which
    the ACME HTTP-01 challenge forces — and only when you ask for it.
 2. **Every component comes from its own upstream.** Container images are the
-   official ones (no third-party re-published images), and Cloudflare WARP is
-   registered directly against the Cloudflare client API instead of through a
-   community `wgcf` image.
+   official ones, and Cloudflare WARP is registered directly against the
+   Cloudflare client API.
 3. **Camouflage target and website are separate.** The proxy port falls back to a
-   real **remote** site you name at deployment time, while nginx serves **your
-   own** site on the HTTP port. See
+   real **remote** site, which is set automatically at deployment, while nginx
+   serves **your own** site on the HTTP port. See
    [Website and camouflage](#website-and-camouflage).
 
 ---
@@ -29,8 +28,10 @@ with three design rules on top of the upstream feature set:
 ## Features
 
 * Docker + Compose installed and configured automatically
-* `sing-box` or `xray` engine, `reality`, `letsencrypt` or `selfsigned` TLS
+* `sing-box` or `xray` engine (default `sing-box`); `reality`, `letsencrypt` or
+  `selfsigned` TLS (default `reality`)
 * Transports: `tcp`, `http`, `grpc`, `ws`, `tuic`, `hysteria2`, `shadowtls`
+  (default `tcp`)
 * Multi-user with per-user UUID/password, client links and QR codes
 * Cloudflare WARP outbound (free and WARP+ license), zero extra images
 * BBR congestion control switched on automatically (`tcp_bbr` + the `fq` qdisc,
@@ -81,13 +82,16 @@ Common invocations:
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh)
 
 # name the remote site the camouflage falls back to (also becomes the SNI)
-bash <(curl -fsSL .../reality.sh) --camouflage www.microsoft.com
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --camouflage www.microsoft.com
 
 # pick your own ports, no website at all
-bash <(curl -fsSL .../reality.sh) --port 2087 --http-port off
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --port 2087 --http-port off
 
 # letsencrypt certificate (this mode is the only one that binds port 80)
-bash <(curl -fsSL .../reality.sh) --security letsencrypt --server vpn.example.com
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --security letsencrypt --server vpn.example.com
 
 # open the management menu later
 bash /opt/reality/reality.sh --menu
@@ -96,8 +100,6 @@ bash /opt/reality/reality.sh --menu
 ---
 
 ## Port policy
-
-This is the part that differs most from the upstream project.
 
 | Listener | Default host port | Controlled by | Notes |
 | --- | --- | --- | --- |
@@ -125,12 +127,13 @@ Two different jobs, deliberately kept apart:
 
 | | What it is | Where it lives |
 | --- | --- | --- |
-| **Camouflage** | What an unauthenticated probe sees on the proxy port. In `reality` the engine forwards the TLS handshake to a real remote site instead of answering it itself; in `shadowtls` the handshake server is that site. | `--camouflage <domain[:port]>`, a real remote site, entered at deployment time |
+| **Camouflage** | What an unauthenticated probe sees on the proxy port. In `reality` the engine forwards the TLS handshake to a real remote site instead of answering it itself; in `shadowtls` the handshake server is that site. | `--camouflage <domain[:port]>`, a real remote site, set automatically at deployment |
 | **Website** | A normal site of your own, served by nginx from `./website`. | `--http-port <port>` |
 
 ```bash
 # camouflage = www.microsoft.com, own site on 8080
-bash <(curl -fsSL .../reality.sh) --camouflage www.microsoft.com
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --camouflage www.microsoft.com
 
 # serve your own site: drop files into the docroot, nothing else to do
 ls /opt/reality/config/website
@@ -176,10 +179,11 @@ So for a plain IP-only box there is nothing to name at all:
 
 ```bash
 # reality + sing-box, camouflage defaults to www.fastly.com — nothing to supply
-bash <(curl -fsSL .../reality.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh)
 
 # still no domain, but choose what a probe will see instead
-bash <(curl -fsSL .../reality.sh) --camouflage www.microsoft.com
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --camouflage www.microsoft.com
 ```
 
 * No DNS record to create and no certificate to issue locally: in the
@@ -431,34 +435,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 
 Re-running the installer keeps the existing configuration; missing keys (for
 example `http_port` or the new `camouflage`) are added automatically, and the
-script copy inside the configuration directory is refreshed too. If you deployed
-an earlier version that pinned the main port to `443`, note that the default is
-now `8443` and the plain HTTP side moved from `80` to `8080` — set `--port 443`
-explicitly if you want to keep the old layout.
-
-Now that the project is called `reality` rather than `reality-ezpz`, the install
-directory moved from `/opt/reality-ezpz` to `/opt/reality`. A server deployed with
-an older release needs **no manual migration**: on every start the script looks for
-the old directory, stops the old compose project first (its containers
-`reality-ezpz-engine-1` / `reality-ezpz-nginx-1` keep holding `8443` and `8080`, so
-the new ones could not start), then moves the whole tree — keys, user list and
-website included — and recreates the containers under the new project name. It only
-moves data, never deletes it. If both directories exist, the script keeps the new
-one and warns, leaving the old one for you to deal with.
-
-One older fix is worth knowing about: `/opt/reality/reality.sh` used to
-be created only when the Telegram bot was enabled, so the documented
-`bash /opt/reality/reality.sh --menu` failed with "No such file or
-directory". The copy no longer depends on the bot; re-running the installer once
-adds it.
-
-Two behaviour changes when upgrading from a pre-`camouflage` version:
-
-* The remote camouflage site is carried over from the old `domain` value, so the
-  fallback target stays what it was.
-* The HTTP port used to relay the remote site over plain HTTP; it now serves
-  **your own** website. To keep the old look, put a copy of that site's content
-  into `/opt/reality/config/website`.
+script copy inside the configuration directory is refreshed too.
 
 ## Uninstall
 
@@ -490,9 +467,7 @@ bash /opt/reality/reality.sh --uninstall   # keeps the Docker packages
 
 | Symptom | Check |
 | --- | --- |
-| `bash: /opt/reality/reality.sh: No such file or directory` | The installer places that copy. Older versions only created it when the Telegram bot was enabled; re-run the installer to add it, or fetch it directly with `curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh -o /opt/reality/reality.sh` |
 | `Port 80 must be free ...` | You selected `letsencrypt` while another service owns port 80 |
-| `both /opt/reality-ezpz and /opt/reality exist` after an upgrade | Both directories are present, so the script kept `/opt/reality` and skipped the migration; check which one holds your data and remove the other by hand |
 | Container restarts in a loop | `docker logs $(docker compose -p reality ps -q engine)` |
 | Client cannot connect | The main port is reachable (firewall/security group), and the SNI domain matches |
 | `WARP account creation has been failed!` | Outbound access to `api.cloudflareclient.com` |
