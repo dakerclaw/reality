@@ -27,3 +27,5 @@ __pycache__/
 .workbuddy/tools/vps_matrix_check.sh
 .workbuddy/tools/vps_tgbot_check.sh
 .workbuddy/tools/vps_resync.sh
+.workbuddy/tools/vps_deploy_install.sh
+.workbuddy/tools/vps_sync_script.sh

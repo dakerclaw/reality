@@ -3342,7 +3342,7 @@ function bbr_supported {
 }
 
 # One place decides how the BBR state is described, so the installer output, the
-# TUI and --show-server-config can never disagree.
+# management menu and --show-server-config can never disagree.
 function bbr_summary {
   local kernel_cc
   local kernel_qdisc
