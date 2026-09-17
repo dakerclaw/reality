@@ -22,7 +22,7 @@ OUT = os.path.join(ROOT, ".workbuddy", "tools", "vps_tgbot_check.sh")
 
 DOCKERFILE = """FROM python:3.14-alpine
 WORKDIR /opt/reality/tgbot
-RUN apk add --no-cache docker-cli-compose curl bash newt libqrencode-tools sudo openssl jq zip unzip
+RUN apk add --no-cache docker-cli-compose curl bash libqrencode-tools sudo openssl jq zip unzip
 RUN pip install --no-cache-dir python-telegram-bot==22.8 "qrcode[pil]==8.2"
 CMD [ "python", "./tgbot.py" ]
 """

@@ -5,7 +5,7 @@
 一条命令在 Linux 服务器上部署 VLESS（Reality / TLS）、TUIC、hysteria2 与 ShadowTLS。
 
 `reality` 会用 Docker Compose 拉起一套代理栈（引擎可选 sing-box 或 xray），生成客户端配置
-与二维码，并提供文本管理界面（TUI）和可选的 Telegram 机器人来管理用户。
+与二维码，并提供对话式文本管理界面和可选的 Telegram 机器人来管理用户。
 
 本项目是 [reality-ezpz](https://github.com/aleskxyz/reality-ezpz) 的加固分支，在上游功能之上
 额外确立三条设计准则：
@@ -31,7 +31,7 @@
   并附带内核 socket / backlog 调优
 * 通过 certbot 申请与自动续期 Letsencrypt 证书
 * 可选「安全上网」模式（拦截广告 / 恶意域名，sing-box 还可拦截成人内容）
-* 文本管理界面（TUI）与 Telegram 机器人管理用户
+* 对话式文本管理界面（编号选择、无需方向键）与 Telegram 机器人管理用户
 * nginx 在 HTTP 端口上正常负载 `./website` 里的自有网站（`reality` / `shadowtls` 的
   回落目标是远端站点，不会落在你自己的站上）
 * 支持密码保护的备份与恢复（用户 + 配置）
@@ -42,7 +42,7 @@
 ## 环境要求
 
 * Linux，包管理器为 `apt`（Debian / Ubuntu）或 `yum`（RHEL 系）；其他发行版只要具备
-  `curl`、`openssl`、`jq`、`qrencode`、`whiptail`、`zip`/`unzip` 以及带 Compose 插件的
+  `curl`、`openssl`、`jq`、`qrencode`、`zip`/`unzip` 以及带 Compose 插件的
   Docker 也能运行
 * 架构 `x86_64` 或 `arm64`
 * root 权限
@@ -60,7 +60,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 ```
 
 安装脚本会把全部内容写入 `/opt/reality`，启动服务栈，输出第一个客户端配置，并在需要时
-打开 TUI。它同时会把**本脚本自身的一份副本放到 `/opt/reality/reality.sh`**，
+打开管理菜单。它同时会把**本脚本自身的一份副本放到 `/opt/reality/reality.sh`**，
 此后所有管理操作都通过这一份执行；因为副本就在配置目录里，每次运行都会被刷新为当前版本。
 这件事与是否启用 Telegram 机器人无关 —— 机器人只是恰好也挂载同一个目录。
 
@@ -256,11 +256,27 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `--backup` | 创建并上传备份 |
 | `--restore <url\|file>` | 从备份恢复 |
 | `--backup-password <password>` | 为备份设置密码 |
-| `-m, --menu` | 打开 TUI |
+| `-m, --menu` | 打开管理菜单 |
 | `-u, --uninstall` | 卸载服务栈并删除 `/opt/reality`；旧版遗留的 `/opt/reality-ezpz` 与内核调优文件也会一并清理 |
 | `-h, --help` | 查看帮助 |
 
 ---
+
+---
+
+## 管理菜单
+
+`bash /opt/reality/reality.sh --menu` 打开一个纯文本菜单：每一项都有编号，输入数字回车即可，
+不需要方向键，所以在手机 SSH 客户端上和桌面终端上一样好用。
+
+* 选项一律按编号选择，`q` 或直接回车返回上一层
+* 输入类提示会先显示**当前值**：直接回车保持原值；没有当前值时回车等于返回
+* 确认类提示只认 `y` / `n`，回车取提示里标出的默认项
+* 任意一步都可以用 `Ctrl-D` 退出
+* 屏幕不会被清空，之前打印的客户端配置与二维码仍可向上翻看
+
+> 早期版本用的是 whiptail 全屏对话框，它需要约 32 行终端和方向键，手机端基本无法操作，
+> 因此已整体改为文本问答，`whiptail` 也不再是依赖。
 
 ## 用户管理
 
@@ -328,7 +344,7 @@ bash /opt/reality/reality.sh \
    被识别成管理员；而且客户端配置（含二维码）会直接发到群里。
 2. **改用户名就要同步改名单**。名单以容器环境变量 `BOT_ADMIN` 注入，改完必须重跑一次配置让
    容器重建；换成数字 ID 就没有这个麻烦。
-3. **TUI 里一样能配**。`bash /opt/reality/reality.sh --menu` → 「Telegram Bot」项的输入框
+3. **管理菜单里一样能配**。`bash /opt/reality/reality.sh --menu` → 「Telegram Bot」项的输入框
    同样接受两种写法。
 
 ## Cloudflare WARP

@@ -7,7 +7,7 @@ Linux server with a single command.
 
 `reality` builds a Docker Compose stack (sing-box or xray engine) in front of a
 TLS-terminating proxy, generates the client configuration and QR codes, and gives
-you a TUI plus an optional Telegram bot to manage users.
+you a conversational text menu plus an optional Telegram bot to manage users.
 
 It is a hardened fork of [reality-ezpz](https://github.com/aleskxyz/reality-ezpz)
 with three design rules on top of the upstream feature set:
@@ -38,7 +38,7 @@ with three design rules on top of the upstream feature set:
   written to `/etc/sysctl.d`), plus kernel socket/backlog tunables
 * Letsencrypt certificate issuance and renewal through certbot
 * Optional "safe internet" mode (blocks ads/malware, optionally adult content)
-* Text-based user interface and Telegram bot for user management
+* Conversational text menu and Telegram bot for user management
 * nginx serves your own site from `./website` on the HTTP port (`reality`/`shadowtls`
   fall back to a remote site instead, never to your own site)
 * Password-protected backup / restore of users and configuration
@@ -49,7 +49,7 @@ with three design rules on top of the upstream feature set:
 ## Requirements
 
 * Linux with `apt` (Debian/Ubuntu) or `yum` (RHEL family) — anything else works as
-  long as `curl`, `openssl`, `jq`, `qrencode`, `whiptail`, `zip`/`unzip` and Docker
+  long as `curl`, `openssl`, `jq`, `qrencode`, `zip`/`unzip` and Docker
   with the Compose plugin are available
 * `x86_64` or `arm64`
 * Root access
@@ -69,8 +69,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 ```
 
 The installer writes everything to `/opt/reality`, starts the stack, prints
-the first client configuration and opens the TUI on demand. It also places **a
-copy of this script itself at `/opt/reality/reality.sh`**, which is what
+the first client configuration and opens the management menu on demand. It also
+places **a copy of this script itself at `/opt/reality/reality.sh`**, which is what
 every later management command runs; because that copy lives in the configuration
 directory, each run refreshes it to the current version. This has nothing to do
 with the Telegram bot being enabled — the bot merely mounts the same directory.
@@ -282,11 +282,31 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `--backup` | Create and upload a backup archive |
 | `--restore <url\|file>` | Restore from a backup |
 | `--backup-password <password>` | Password-protect the backup |
-| `-m, --menu` | Open the TUI |
+| `-m, --menu` | Open the management menu |
 | `-u, --uninstall` | Remove the stack and delete `/opt/reality`; an install left by an older release under `/opt/reality-ezpz` and the kernel tuning drop-in go too |
 | `-h, --help` | Show help |
 
 ---
+
+---
+
+## Management menu
+
+`bash /opt/reality/reality.sh --menu` opens a plain-text menu: every entry is
+numbered and you pick one by typing its number, so it needs no cursor keys and
+works the same on a mobile SSH client as on a desktop terminal.
+
+* Choices are made by number; `q`, or an empty line, steps back
+* A prompt shows the **current value**: press Enter to keep it, and with no
+  current value Enter steps back
+* A confirmation accepts `y` / `n`; Enter takes the default shown in the prompt
+* `Ctrl-D` steps back from anything
+* The screen is never cleared, so the client configuration and QR code printed
+  earlier stay in the scrollback
+
+> Earlier releases used full-screen whiptail dialogs, which need roughly 32
+> terminal rows and a cursor and were therefore unusable on a phone. They have
+> been replaced entirely, and `whiptail` is no longer a dependency.
 
 ## User management
 
@@ -363,7 +383,7 @@ Three things worth knowing:
 2. **Renaming means updating the list.** The list is injected into the container as
    the `BOT_ADMIN` environment variable, so re-running the configuration is required
    for it to take effect. With a numeric id there is nothing to update.
-3. **The TUI configures it too.** `bash /opt/reality/reality.sh --menu` →
+3. **The management menu configures it too.** `bash /opt/reality/reality.sh --menu` →
    "Telegram Bot" accepts both forms in its input box.
 
 ## Cloudflare WARP

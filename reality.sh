@@ -34,9 +34,6 @@ compose_project='reality'
 tgbot_project='tgbot'
 BACKTITLE=Reality
 MENU="Select an option:"
-HEIGHT=30
-WIDTH=60
-CHOICE_HEIGHT=20
 
 # Every image below comes from the project's own registry or from the official
 # Docker Hub library. No third-party re-published images are used anymore.
@@ -218,7 +215,7 @@ function show_help {
   echo "      --warp-license <warp-license> Add Cloudflare warp+ license"
   echo "  -c  --core <sing-box|xray> Select core (xray, sing-box, default: ${defaults[core]})"
   echo "      --security <reality|letsencrypt|selfsigned> Select type of TLS encryption (reality, letsencrypt, selfsigned, default: ${defaults[security]})" 
-  echo "  -m  --menu                Show menu"
+  echo "  -m  --menu                Open the management menu"
   echo "      --enable-tgbot <true|false> Enable Telegram bot for user management"
   echo "      --tgbot-token <token> Token of Telegram bot"
   echo "      --tgbot-admins <usernames|ids> Telegram bot admins: usernames without the leading '@' or numeric user ids (comma separated)"
@@ -601,13 +598,6 @@ function restore {
   return
 }
 
-function dict_expander {
-  local -n dict=$1
-  for key in "${!dict[@]}"; do
-    echo "${key} ${dict[$key]}"
-  done
-}
-
 function parse_config_file {
   if [[ ! -r "${path[config]}" ]]; then
     generate_keys
@@ -973,7 +963,6 @@ function uninstall {
 function install_packages {
   local package
   local packages=()
-  local -a yum_packages=()
   # The tgbot container ships every tool the script needs, so nothing has to be
   # installed there.
   if [[ -n $BOT_TOKEN ]]; then
@@ -985,7 +974,7 @@ function install_packages {
   # xxd is deliberately absent: warp_decode_reserved no longer depends on it.
   # openssl is required for the self-signed certificate and for the WARP key
   # pair (X25519, so OpenSSL 1.1.0+).
-  for package in curl openssl qrencode whiptail jq zip unzip; do
+  for package in curl openssl qrencode jq zip unzip; do
     if ! command -v "${package}" >/dev/null 2>&1; then
       packages+=("${package}")
     fi
@@ -999,15 +988,9 @@ function install_packages {
     return 0
   fi
   if command -v yum >/dev/null 2>&1; then
-    for package in "${packages[@]}"; do
-      case ${package} in
-        whiptail) yum_packages+=(newt) ;;
-        *) yum_packages+=("${package}") ;;
-      esac
-    done
     yum makecache
     yum install epel-release -y || true
-    yum install "${yum_packages[@]}" -y
+    yum install "${packages[@]}" -y
     return 0
   fi
   echo "OS is not supported!"
@@ -1345,7 +1328,7 @@ function generate_tgbot_dockerfile {
   cat >"${path[tgbot_dockerfile]}" << EOF
 FROM ${image[python]}
 WORKDIR ${config_path}/tgbot
-RUN apk add --no-cache docker-cli-compose curl bash newt libqrencode-tools sudo openssl jq zip unzip
+RUN apk add --no-cache docker-cli-compose curl bash libqrencode-tools sudo openssl jq zip unzip
 RUN pip install --no-cache-dir python-telegram-bot==22.8 "qrcode[pil]==8.2"
 CMD [ "python", "./tgbot.py" ]
 EOF
@@ -2069,16 +2052,12 @@ function upgrade {
 function main_menu {
   local selection
   while true; do
-    selection=$(whiptail --clear --backtitle "$BACKTITLE" --title "Server Management" \
-      --menu "$MENU" $HEIGHT $WIDTH $CHOICE_HEIGHT \
-      --ok-button "Select" \
-      --cancel-button "Exit" \
+    selection=$(ui_menu "Server Management" "$MENU" \
       "1" "Add New User" \
       "2" "Delete User" \
       "3" "View User" \
       "4" "View Server Config" \
-      "5" "Configuration" \
-      3>&1 1>&2 2>&3)
+      "5" "Configuration")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2106,13 +2085,7 @@ function add_user_menu {
   local username
   local message
   while true; do
-    username=$(whiptail \
-      --clear \
-      --backtitle "$BACKTITLE" \
-      --title "Add New User" \
-      --inputbox "Enter username:" \
-      $HEIGHT $WIDTH \
-      3>&1 1>&2 2>&3)
+    username=$(ui_input "Add New User" "Enter the username (A-Z, a-z and 0-9 only):")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2126,16 +2099,7 @@ function add_user_menu {
     fi
     users[$username]=$(cat /proc/sys/kernel/random/uuid)
     update_users_file
-    whiptail \
-      --clear \
-      --backtitle "$BACKTITLE" \
-      --title "Add New User" \
-      --yes-button "View User" \
-      --no-button "Return" \
-      --yesno 'User "'"${username}"'" has been created.' \
-      $HEIGHT $WIDTH \
-      3>&1 1>&2 2>&3
-    if [[ $? -ne 0 ]]; then
+    if ! ui_yesno "Add New User" 'User "'"${username}"'" has been created.\n\nShow the client configuration now?' y; then
       break
     fi
     view_user_menu "${username}"
@@ -2153,14 +2117,7 @@ function delete_user_menu {
       message_box "Delete User" "You cannot delete the only user.\nAt least one user is needed.\nCreate a new user, then delete this one."
       continue
     fi
-    whiptail \
-      --clear \
-      --backtitle "$BACKTITLE" \
-      --title "Delete User" \
-      --yesno "Are you sure you want to delete $username?" \
-      $HEIGHT $WIDTH \
-      3>&1 1>&2 2>&3
-    if [[ $? -ne 0 ]]; then
+    if ! ui_yesno "Delete User" "Delete the user ${username}?\n\nIts client configuration stops working immediately."; then
       continue
     fi
     unset users["${username}"]
@@ -2244,22 +2201,9 @@ $([[ ${config[security]} == 'reality' ]] && echo "PublicKey: ${config[public_key
 $([[ ${config[security]} == 'reality' ]] && echo "ShortId: ${config[short_id]}" || true)
       " | tr -s '\n')
     fi
-    whiptail \
-      --clear \
-      --backtitle "$BACKTITLE" \
-      --title "${username} details" \
-      --yes-button "View QR" \
-      --no-button "Return" \
-      --yesno "${user_config}" \
-      $HEIGHT $WIDTH \
-      3>&1 1>&2 2>&3
-    if [[ $? -eq 0 ]]; then
-      clear
+    if ui_yesno "${username} details" "${user_config}\n\nShow the QR code and the client link?"; then
       print_client_configuration "${username}"
-      echo
-      echo "Press Enter to return ..."
-      read
-      clear
+      ui_pause
     fi
     if [[ $# -gt 0 ]]; then
       return 0
@@ -2269,16 +2213,14 @@ $([[ ${config[security]} == 'reality' ]] && echo "ShortId: ${config[short_id]}" 
 
 function list_users_menu {
   local title=$1
-  local options
-  local selection
-  options=$(dict_expander users)
-  selection=$(whiptail --clear --noitem --backtitle "$BACKTITLE" --title "$title" \
-    --menu "Select the user" $HEIGHT $WIDTH $CHOICE_HEIGHT $options \
-    3>&1 1>&2 2>&3)
-  if [[ $? -ne 0 ]]; then
-    return 1
-  fi
-  echo "${selection}"
+  local items=()
+  local name
+  # Sorted, because the associative array itself has no defined order and the
+  # numbers in the list have to stay put between prompts.
+  while IFS= read -r name; do
+    items+=("${name}" "${name}")
+  done < <(printf '%s\n' "${!users[@]}" | sort)
+  ui_menu "${title}" "Select the user:" "${items[@]}"
 }
 
 function show_server_config {
@@ -2308,14 +2250,7 @@ function view_config_menu {
 }
 
 function restart_menu {
-  whiptail \
-    --clear \
-    --backtitle "$BACKTITLE" \
-    --title "Restart Services" \
-    --yesno "Are you sure to restart services?" \
-    $HEIGHT $WIDTH \
-    3>&1 1>&2 2>&3
-  if [[ $? -ne 0 ]]; then
+  if ! ui_yesno "Restart Services" "Restart the containers now?"; then
     return
   fi
   restart_docker_compose
@@ -2325,14 +2260,7 @@ function restart_menu {
 }
 
 function regenerate_menu {
-  whiptail \
-    --clear \
-    --backtitle "$BACKTITLE" \
-    --title "Regenrate keys" \
-    --yesno "Are you sure to regenerate keys?" \
-    $HEIGHT $WIDTH \
-    3>&1 1>&2 2>&3
-  if [[ $? -ne 0 ]]; then
+  if ! ui_yesno "Regenerate Keys" "Regenerate the keys now?\n\nEvery client has to be given the new configuration afterwards, because the current one stops working."; then
     return
   fi
   generate_keys
@@ -2344,14 +2272,7 @@ function regenerate_menu {
 }
 
 function restore_defaults_menu {
-  whiptail \
-    --clear \
-    --backtitle "$BACKTITLE" \
-    --title "Restore Default Config" \
-    --yesno "Are you sure to restore default configuration?" \
-    $HEIGHT $WIDTH \
-    3>&1 1>&2 2>&3
-  if [[ $? -ne 0 ]]; then
+  if ! ui_yesno "Restore Default Config" "Restore the default configuration?"; then
     return
   fi
   restore_defaults
@@ -2362,8 +2283,7 @@ function restore_defaults_menu {
 function configuration_menu {
   local selection
   while true; do
-    selection=$(whiptail --clear --backtitle "$BACKTITLE" --title "Configuration" \
-      --menu "Select an option:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+    selection=$(ui_menu "Configuration" "$MENU" \
       "1" "Core" \
       "2" "Server Address" \
       "3" "Transport" \
@@ -2380,8 +2300,7 @@ function configuration_menu {
       "14" "Regenerate Keys" \
       "15" "Restore Defaults" \
       "16" "Create Backup" \
-      "17" "Restore Backup" \
-      3>&1 1>&2 2>&3)
+      "17" "Restore Backup")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2444,11 +2363,9 @@ function configuration_menu {
 function config_core_menu {
   local core
   while true; do
-    core=$(whiptail --clear --backtitle "$BACKTITLE" --title "Core" \
-      --radiolist --noitem "Select a core engine:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
-      "xray" "$([[ "${config[core]}" == 'xray' ]] && echo 'on' || echo 'off')" \
-      "sing-box" "$([[ "${config[core]}" == 'sing-box' ]] && echo 'on' || echo 'off')" \
-      3>&1 1>&2 2>&3)
+    core=$(ui_radiolist "Core" "Select the core engine:" "${config[core]}" \
+      "xray" "xray" \
+      "sing-box" "sing-box")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2473,9 +2390,7 @@ function config_core_menu {
 function config_server_menu {
   local server
   while true; do
-    server=$(whiptail --clear --backtitle "$BACKTITLE" --title "Server Address" \
-      --inputbox "Enter Server IP or Domain:" $HEIGHT $WIDTH "${config["server"]}" \
-      3>&1 1>&2 2>&3)
+    server=$(ui_input "Server Address" "Enter the IP address or domain name clients connect to:" "${config[server]}")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2498,16 +2413,14 @@ function config_server_menu {
 function config_transport_menu {
   local transport
   while true; do
-    transport=$(whiptail --clear --backtitle "$BACKTITLE" --title "Transport" \
-      --radiolist --noitem "Select a transport protocol:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
-      "tcp" "$([[ "${config[transport]}" == 'tcp' ]] && echo 'on' || echo 'off')" \
-      "http" "$([[ "${config[transport]}" == 'http' ]] && echo 'on' || echo 'off')" \
-      "grpc" "$([[ "${config[transport]}" == 'grpc' ]] && echo 'on' || echo 'off')" \
-      "ws" "$([[ "${config[transport]}" == 'ws' ]] && echo 'on' || echo 'off')" \
-      "tuic" "$([[ "${config[transport]}" == 'tuic' ]] && echo 'on' || echo 'off')" \
-      "hysteria2" "$([[ "${config[transport]}" == 'hysteria2' ]] && echo 'on' || echo 'off')" \
-      "shadowtls" "$([[ "${config[transport]}" == 'shadowtls' ]] && echo 'on' || echo 'off')" \
-      3>&1 1>&2 2>&3)
+    transport=$(ui_radiolist "Transport" "Select the transport protocol:" "${config[transport]}" \
+      "tcp" "tcp" \
+      "http" "http" \
+      "grpc" "grpc" \
+      "ws" "ws" \
+      "tuic" "tuic" \
+      "hysteria2" "hysteria2" \
+      "shadowtls" "shadowtls")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2547,10 +2460,8 @@ function config_transport_menu {
 function config_camouflage_menu {
   local camouflage
   while true; do
-    camouflage=$(whiptail --clear --backtitle "$BACKTITLE" --title "Camouflage Site" \
-      --inputbox "Remote site that unauthenticated probes are relayed to (reality / shadowtls).\nIt must be a real site whose certificate matches the SNI, so the SNI follows it unless it is set separately.\nOptional \":port\" suffix, port 443 by default.\n\nDefault: ${defaults[camouflage]}" \
-      $HEIGHT $WIDTH "${config[camouflage]}" \
-      3>&1 1>&2 2>&3)
+    camouflage=$(ui_input "Camouflage Site" "Remote site that unauthenticated probes are relayed to (reality / shadowtls).\nIt must be a real site whose certificate matches the SNI, so the SNI follows it unless it is set separately.\nOptional \":port\" suffix, port 443 by default.\n\nDefault: ${defaults[camouflage]}" \
+      "${config[camouflage]}")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2574,9 +2485,7 @@ function config_camouflage_menu {
 function config_sni_domain_menu {
   local sni_domain
   while true; do
-    sni_domain=$(whiptail --clear --backtitle "$BACKTITLE" --title "SNI Domain" \
-      --inputbox "Enter SNI domain:" $HEIGHT $WIDTH "${config[domain]}" \
-      3>&1 1>&2 2>&3)
+    sni_domain=$(ui_input "SNI Domain" "Enter the SNI domain clients use:" "${config[domain]}")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2594,12 +2503,10 @@ function config_security_menu {
   local security
   local free_80=true
   while true; do
-    security=$(whiptail --clear --backtitle "$BACKTITLE" --title "Security Type" \
-      --radiolist --noitem "Select a security type:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
-      "reality" "$([[ "${config[security]}" == 'reality' ]] && echo 'on' || echo 'off')" \
-      "letsencrypt" "$([[ "${config[security]}" == 'letsencrypt' ]] && echo 'on' || echo 'off')" \
-      "selfsigned" "$([[ "${config[security]}" == 'selfsigned' ]] && echo 'on' || echo 'off')" \
-      3>&1 1>&2 2>&3)
+    security=$(ui_radiolist "Security Type" "Select the security type:" "${config[security]}" \
+      "reality" "reality" \
+      "letsencrypt" "letsencrypt" \
+      "selfsigned" "selfsigned")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2649,9 +2556,7 @@ function config_security_menu {
 function config_port_menu {
   local port
   while true; do
-    port=$(whiptail --clear --backtitle "$BACKTITLE" --title "Port" \
-      --inputbox "Enter port number:" $HEIGHT $WIDTH "${config[port]}" \
-      3>&1 1>&2 2>&3)
+    port=$(ui_input "Port" "Enter the server port number:" "${config[port]}")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2668,8 +2573,7 @@ function config_port_menu {
       continue
     fi
     if [[ ${port} -eq 443 ]]; then
-      if ! whiptail --clear --backtitle "$BACKTITLE" --title "Well-known Port" \
-        --yesno "Port 443 is a well-known port. The default (${defaults[port]}) is used so that the installation does not take 443 away from another service.\n\nUse 443 anyway?" 12 62; then
+      if ! ui_yesno "Well-known Port" "Port 443 is a well-known port. The default (${defaults[port]}) is used so that the installation does not take 443 away from another service.\n\nUse 443 anyway?"; then
         continue
       fi
     fi
@@ -2682,10 +2586,8 @@ function config_port_menu {
 function config_http_port_menu {
   local http_port
   while true; do
-    http_port=$(whiptail --clear --backtitle "$BACKTITLE" --title "HTTP Port" \
-      --inputbox "Host port of the local website served by nginx out of ./website.\nIn the letsencrypt mode it also carries the ACME HTTP-01 challenge (always port 80).\n\nEnter \"off\" to leave it unpublished. Default: ${defaults[http_port]}" \
-      $HEIGHT $WIDTH "${config[http_port]}" \
-      3>&1 1>&2 2>&3)
+    http_port=$(ui_input "HTTP Port" "Host port of the local website served by nginx out of ./website.\nIn the letsencrypt mode it also carries the ACME HTTP-01 challenge (always port 80).\n\nEnter \"off\" to leave it unpublished. Default: ${defaults[http_port]}" \
+      "${config[http_port]}")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2710,11 +2612,10 @@ function config_http_port_menu {
 
 function config_safenet_menu {
   local safenet
-  safenet=$(whiptail --clear --backtitle "$BACKTITLE" --title "Safe Internet" \
-    --radiolist --noitem "Enable blocking malware and adult content" $HEIGHT $WIDTH $CHOICE_HEIGHT \
-    "Enable" "$([[ "${config[safenet]}" == 'ON' ]] && echo 'on' || echo 'off')" \
-    "Disable" "$([[ "${config[safenet]}" == 'OFF' ]] && echo 'on' || echo 'off')" \
-    3>&1 1>&2 2>&3)
+  safenet=$(ui_radiolist "Safe Internet" "Block malware and adult content?" \
+    "$([[ "${config[safenet]}" == 'ON' ]] && echo 'Enable' || echo 'Disable')" \
+    "Enable" "Enable" \
+    "Disable" "Disable")
   if [[ $? -ne 0 ]]; then
     return
   fi
@@ -2724,11 +2625,10 @@ function config_safenet_menu {
 
 function config_bbr_menu {
   local bbr
-  bbr=$(whiptail --clear --backtitle "$BACKTITLE" --title "BBR" \
-    --radiolist --noitem "Enable the BBR congestion control algorithm" $HEIGHT $WIDTH $CHOICE_HEIGHT \
-    "Enable" "$([[ "${config[bbr]}" == 'ON' ]] && echo 'on' || echo 'off')" \
-    "Disable" "$([[ "${config[bbr]}" == 'OFF' ]] && echo 'on' || echo 'off')" \
-    3>&1 1>&2 2>&3)
+  bbr=$(ui_radiolist "BBR" "Enable the BBR congestion control algorithm?" \
+    "$([[ "${config[bbr]}" == 'ON' ]] && echo 'Enable' || echo 'Disable')" \
+    "Enable" "Enable" \
+    "Disable" "Disable")
   if [[ $? -ne 0 ]]; then
     return
   fi
@@ -2749,11 +2649,10 @@ function config_warp_menu {
   local old_warp=${config[warp]}
   local old_warp_license=${config[warp_license]}
   while true; do
-    warp=$(whiptail --clear --backtitle "$BACKTITLE" --title "WARP" \
-      --radiolist --noitem "Enable WARP:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
-      "Enable" "$([[ "${config[warp]}" == 'ON' ]] && echo 'on' || echo 'off')" \
-      "Disable" "$([[ "${config[warp]}" == 'OFF' ]] && echo 'on' || echo 'off')" \
-      3>&1 1>&2 2>&3)
+    warp=$(ui_radiolist "WARP" "Enable Cloudflare WARP?" \
+      "$([[ "${config[warp]}" == 'ON' ]] && echo 'Enable' || echo 'Disable')" \
+      "Enable" "Enable" \
+      "Disable" "Disable")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2782,11 +2681,12 @@ function config_warp_menu {
     fi
     config[warp]=ON
     while true; do
-      warp_license=$(whiptail --clear --backtitle "$BACKTITLE" --title "WARP+ License" \
-        --inputbox "Enter WARP+ License:\nLeave blank if you only want to use free WARP account" $HEIGHT $WIDTH "${config[warp_license]}" \
-        3>&1 1>&2 2>&3)
+      warp_license=$(ui_input "WARP+ License" "Enter the WARP+ license.\nType \"none\" to drop the license and go back to the free WARP account." "${config[warp_license]}")
       if [[ $? -ne 0 ]]; then
         break
+      fi
+      if [[ ${warp_license} == 'none' ]]; then
+        warp_license=''
       fi
       if [[ -n "${warp_license}" && ! $warp_license =~ ${regex[warp_license]} ]]; then
         message_box "Invalid Input" "Invalid WARP+ License"
@@ -2819,11 +2719,10 @@ function config_tgbot_menu {
   local old_tgbot_token=${config[tgbot_token]}
   local old_tgbot_admins=${config[tgbot_admins]}
   while true; do
-    tgbot=$(whiptail --clear --backtitle "$BACKTITLE" --title "Enable Telegram Bot" \
-      --radiolist --noitem "Enable Telegram Bot:" $HEIGHT $WIDTH $CHOICE_HEIGHT \
-      "Enable" "$([[ "${config[tgbot]}" == 'ON' ]] && echo 'on' || echo 'off')" \
-      "Disable" "$([[ "${config[tgbot]}" == 'OFF' ]] && echo 'on' || echo 'off')" \
-      3>&1 1>&2 2>&3)
+    tgbot=$(ui_radiolist "Telegram Bot" "Enable the Telegram bot?" \
+      "$([[ "${config[tgbot]}" == 'ON' ]] && echo 'Enable' || echo 'Disable')" \
+      "Enable" "Enable" \
+      "Disable" "Disable")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2834,9 +2733,7 @@ function config_tgbot_menu {
     fi
     config[tgbot]=ON
     while true; do
-      tgbot_token=$(whiptail --clear --backtitle "$BACKTITLE" --title "Telegram Bot Token" \
-        --inputbox "Enter Telegram Bot Token:" $HEIGHT $WIDTH "${config[tgbot_token]}" \
-        3>&1 1>&2 2>&3)
+      tgbot_token=$(ui_input "Telegram Bot Token" "Enter the Telegram Bot Token:" "${config[tgbot_token]}")
       if [[ $? -ne 0 ]]; then
         break
       fi
@@ -2850,9 +2747,7 @@ function config_tgbot_menu {
       fi
       config[tgbot_token]=$tgbot_token
       while true; do
-        tgbot_admins=$(whiptail --clear --backtitle "$BACKTITLE" --title "Telegram Bot Admins" \
-          --inputbox "Enter Telegram Bot Admins (Telegram usernames without leading '@' or numeric user ids, seperate multiple admins by comma ','):" $HEIGHT $WIDTH "${config[tgbot_admins]}" \
-          3>&1 1>&2 2>&3)
+        tgbot_admins=$(ui_input "Telegram Bot Admins" "Enter the Telegram Bot admins: usernames without the leading '@', or numeric user ids, separated by a comma." "${config[tgbot_admins]}")
         if [[ $? -ne 0 ]]; then
           break
         fi
@@ -2873,29 +2768,32 @@ function config_tgbot_menu {
 
 function backup_menu {
   local backup_password
+  local backup_choice
   local result
-  backup_password=$(whiptail \
-    --clear \
-    --backtitle "$BACKTITLE" \
-    --title "Backup" \
-    --inputbox "Choose a password for the backup file.\nLeave blank if you do not wish to set a password for the backup file." \
-    $HEIGHT $WIDTH \
-    3>&1 1>&2 2>&3)
+  backup_choice=$(ui_menu "Backup" "Protect the backup file with a password?" \
+    "1" "No password" \
+    "2" "Set a password")
   if [[ $? -ne 0 ]]; then
     return
   fi
+  if [[ ${backup_choice} == '2' ]]; then
+    backup_password=$(ui_input "Backup" "Enter the password for the backup file:")
+    if [[ $? -ne 0 ]]; then
+      return
+    fi
+  else
+    backup_password=''
+  fi
   if result=$(backup "${backup_password}" 2>&1); then
-    clear
-    echo "Backup has been create and uploaded successfully."
-    echo "You can download the backup file from here:"
-    echo ""
-    echo "${result}"
-    echo ""
-    echo "The URL is valid for 3 days."
-    echo
-    echo "Press Enter to return ..."
-    read
-    clear
+    ui_title "Backup"
+    ui_out ""
+    ui_out "The backup has been created and uploaded."
+    ui_out "Download it here:"
+    ui_out ""
+    ui_out "${result}"
+    ui_out ""
+    ui_out "The link is valid for 3 days."
+    ui_pause
   else
     message_box "Backup Failed" "${result}"
   fi
@@ -2904,15 +2802,10 @@ function backup_menu {
 function restore_backup_menu {
   local backup_file
   local backup_password
+  local password_choice
   local result
   while true; do
-    backup_file=$(whiptail \
-      --clear \
-      --backtitle "$BACKTITLE" \
-      --title "Restore Backup" \
-      --inputbox "Enter backup file path or URL" \
-      $HEIGHT $WIDTH \
-      3>&1 1>&2 2>&3)
+    backup_file=$(ui_input "Restore Backup" "Enter the backup file path or URL:")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2920,15 +2813,19 @@ function restore_backup_menu {
       message_box "Invalid Backup path of URL" "Backup file path or URL is not valid."
       continue
     fi
-    backup_password=$(whiptail \
-      --clear \
-      --backtitle "$BACKTITLE" \
-      --title "Restore Backup" \
-      --inputbox "Enter backup file password.\nLeave blank if there is no password." \
-      $HEIGHT $WIDTH \
-      3>&1 1>&2 2>&3)
+    password_choice=$(ui_menu "Restore Backup" "Is the backup file protected by a password?" \
+      "1" "No password" \
+      "2" "It has a password")
     if [[ $? -ne 0 ]]; then
       continue
+    fi
+    if [[ ${password_choice} == '2' ]]; then
+      backup_password=$(ui_input "Restore Backup" "Enter the password of the backup file:")
+      if [[ $? -ne 0 ]]; then
+        continue
+      fi
+    else
+      backup_password=''
     fi
     if result=$(restore "${backup_file}" "${backup_password}" 2>&1); then
       parse_config_file
@@ -3172,16 +3069,216 @@ function check_reload {
   done
 }
 
-function message_box {
+# ---------------------------------------------------------------------------
+# Operator interface
+# ---------------------------------------------------------------------------
+# Every screen is plain text: a numbered list and one line-based prompt. The
+# full-screen whiptail dialogs this replaces needed roughly 32 terminal rows
+# and a cursor, and mobile SSH clients offer neither, which made the menus
+# unusable there. Nothing clears the screen either, so the scrollback survives
+# and the earlier answers stay readable.
+#
+# Only the helpers below talk to the operator; every menu goes through them, so
+# the wording and the accepted keys are the same everywhere.
+#
+# Conventions:
+#   * choices are made by number, never with a cursor
+#   * q, or an empty line, steps back out of a list
+#   * an empty answer to a prompt keeps the current value, and steps back when
+#     there is no current value to keep
+#   * Ctrl-D always steps back
+#   * an answer that is not understood is explained and the prompt repeats
+#
+# Only the answer is written to stdout, so a caller can capture it with $()
+# while the screen itself stays visible on stderr.
+
+function ui_out {
+  printf '%b\n' "${1:-}" >&2
+}
+
+function ui_title {
+  ui_out ""
+  ui_out "===== ${BACKTITLE} :: $1 ====="
+}
+
+function ui_error {
+  ui_out ""
+  ui_out "  Not understood: $1"
+  ui_out ""
+}
+
+function ui_pause {
+  if [[ -t 0 ]]; then
+    printf '\nPress Enter to continue ... ' >&2
+    read -r || true
+  fi
+  ui_out ""
+}
+
+# Reads one answer, tolerating the carriage return that some mobile terminals
+# and pasted text append. Returns 1 on Ctrl-D, which every caller reads as
+# "go back".
+function ui_read {
+  ui_answer=''
+  IFS= read -r ui_answer || return 1
+  ui_answer=${ui_answer%$'\r'}
+  return 0
+}
+
+# Draws the numbered list the two selection helpers share. <current> is marked
+# when it is not empty.
+function ui_draw_list {
   local title=$1
-  local message=$2
-  whiptail \
-    --clear \
-    --backtitle "$BACKTITLE" \
-    --title "$title" \
-    --msgbox "$message" \
-    $HEIGHT $WIDTH \
-    3>&1 1>&2 2>&3
+  local prompt=$2
+  local current=$3
+  shift 3
+  local index=1
+  ui_title "${title}"
+  ui_out ""
+  ui_out "${prompt}"
+  ui_out ""
+  while [[ $# -gt 1 ]]; do
+    if [[ -n ${current} && $1 == "${current}" ]]; then
+      ui_out "  ${index}) $2  (current)"
+    else
+      ui_out "  ${index}) $2"
+    fi
+    index=$((index + 1))
+    shift 2
+  done
+  ui_out ""
+  ui_out "  q) Back"
+  ui_out ""
+  if ((index == 2)); then
+    printf 'Choose [1]: ' >&2
+  else
+    printf 'Choose [1-%s]: ' "$((index - 1))" >&2
+  fi
+}
+
+# Chooses from a numbered list. Everything the operator reads goes to stderr;
+# only the chosen key goes to stdout, so the caller can capture it with $()
+# without the list leaking into the value.
+function ui_choice {
+  local title=$1
+  local prompt=$2
+  local current=$3
+  local kind=$4
+  shift 4
+  local count=$(( $# / 2 ))
+  local index
+  while true; do
+    if [[ ${kind} == 'current' ]]; then
+      ui_draw_list "${title}" "${prompt}" "${current}" "$@"
+    else
+      ui_draw_list "${title}" "${prompt}" "" "$@"
+    fi
+    if ! ui_read; then
+      ui_out ""
+      return 1
+    fi
+    case ${ui_answer} in
+      ''|q|Q)
+        return 1
+        ;;
+    esac
+    if [[ ${ui_answer} =~ ^[0-9]+$ ]] && ((ui_answer >= 1 && ui_answer <= count)); then
+      index=$(( (ui_answer - 1) * 2 + 1 ))
+      printf '%s\n' "${@:index:1}"
+      return 0
+    fi
+    ui_error "enter a number between 1 and ${count}, or q to go back."
+  done
+}
+
+# ui_menu <title> <prompt> <key> <label> [<key> <label> ...]
+# Echoes the key that was picked. Returns 1 when stepping back.
+function ui_menu {
+  ui_choice "$1" "$2" "" list "${@:3}"
+}
+
+# ui_radiolist <title> <prompt> <current> <key> <label> [<key> <label> ...]
+# Echoes the key that was picked, marking <current> in the list. Returns 1 when
+# stepping back.
+function ui_radiolist {
+  ui_choice "$1" "$2" "$3" current "${@:4}"
+}
+
+# ui_input <title> <prompt> [current]
+# Echoes the answer. An empty answer keeps <current>, and returns 1 when there
+# is no current value to keep.
+function ui_input {
+  local title=$1
+  local prompt=$2
+  local current=${3:-}
+  ui_title "${title}"
+  ui_out ""
+  ui_out "${prompt}"
+  ui_out ""
+  if [[ -n ${current} ]]; then
+    ui_out "Current value: ${current}"
+    printf 'New value [Enter keeps it]: ' >&2
+  else
+    printf 'Enter a value [Enter goes back]: ' >&2
+  fi
+  if ! ui_read; then
+    ui_out ""
+    return 1
+  fi
+  ui_out ""
+  if [[ -z ${ui_answer} ]]; then
+    if [[ -n ${current} ]]; then
+      printf '%s\n' "${current}"
+      return 0
+    fi
+    return 1
+  fi
+  printf '%s\n' "${ui_answer}"
+  return 0
+}
+
+# ui_yesno <title> <prompt> [y|n]
+# Returns 0 for yes and 1 for no, which is also what stepping back returns, so
+# every caller treats 1 as "change nothing".
+function ui_yesno {
+  local title=$1
+  local prompt=$2
+  local default=${3:-n}
+  local hint='[y/N]'
+  if [[ ${default} == 'y' ]]; then
+    hint='[Y/n]'
+  fi
+  ui_title "${title}"
+  ui_out ""
+  ui_out "${prompt}"
+  ui_out ""
+  printf 'Confirm %s: ' "${hint}" >&2
+  if ! ui_read; then
+    ui_out ""
+    return 1
+  fi
+  ui_out ""
+  case ${ui_answer} in
+    y|Y|yes|YES|Yes)
+      return 0
+      ;;
+    '')
+      if [[ ${default} == 'y' ]]; then
+        return 0
+      fi
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+function message_box {
+  ui_title "$1"
+  ui_out ""
+  ui_out "$2"
+  ui_pause
 }
 
 function get_md5 {
