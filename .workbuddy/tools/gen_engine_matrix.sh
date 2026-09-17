@@ -26,6 +26,20 @@ head -n $((CUT - 1)) "${ROOT}/reality.sh" > "${LIB}"
 source "${LIB}"
 set +e; set +u
 
+# 真 X25519 密钥对。**不能用占位字符串**：xray 会在解析期直接拒绝
+# （Failed to build REALITY config. > invalid "privateKey"），sing-box 同理
+# （initialize inbound[0]: invalid private key），会让全部 reality 组合假失败。
+# PKCS#8 DER 的末 32 字节 = 原始私钥标量；SPKI DER 的末 32 字节 = 原始公钥。
+# 两者都要做 URL-safe base64 且**去掉填充**（43 字符），这才是 xray/sing-box 的格式。
+MATRIX_KEYDIR=$(mktemp -d)
+openssl genpkey -algorithm X25519 -out "${MATRIX_KEYDIR}/k.pem" 2>/dev/null
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+MATRIX_PRIV=$(openssl pkey -in "${MATRIX_KEYDIR}/k.pem" -outform DER 2>/dev/null | tail -c 32 | b64url)
+MATRIX_PUB=$(openssl pkey -in "${MATRIX_KEYDIR}/k.pem" -pubout -outform DER 2>/dev/null | tail -c 32 | b64url)
+if [[ ${#MATRIX_PRIV} -ne 43 || ${#MATRIX_PUB} -ne 43 ]]; then
+  echo "!! X25519 密钥生成异常（priv=${#MATRIX_PRIV} pub=${#MATRIX_PUB}），reality 组合将假失败" >&2
+fi
+
 rm -rf "${OUT}"; mkdir -p "${OUT}"
 path[engine]="${OUT}/engine.conf"
 : > "${OUT}/manifest.txt"
@@ -56,8 +70,8 @@ engine_probe() { # core transport security
   config[service_path]=rand0mpath
   config[safenet]=OFF
   config[warp]=OFF
-  config[private_key]=PRIVATEKEY
-  config[public_key]=PUBLICKEY
+  config[private_key]=${MATRIX_PRIV}
+  config[public_key]=${MATRIX_PUB}
   config[short_id]=deadbeef
   declare -gA users=()
   users[alice]=11111111-2222-3333-4444-555555555555
@@ -125,6 +139,7 @@ for b in bad:
 PYEOF
 
 rm -f "${OUT}/engine.conf"
+rm -rf "${MATRIX_KEYDIR}"
 echo "生成组合: ${ok}   跳过: ${skipped}   输出目录: ${OUT}"
 echo "---- 生成清单 ----"
 cat "${OUT}/manifest.txt"

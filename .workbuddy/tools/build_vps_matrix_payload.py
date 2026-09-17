@@ -5,6 +5,10 @@
 产物：.workbuddy/tools/vps_matrix_check.sh
 用法：python .workbuddy/tools/build_vps_matrix_payload.py
 然后：SSH_TEST_PW=... python .workbuddy/tools/vps_ssh_run.py --host <ip> --file .workbuddy/tools/vps_matrix_check.sh --timeout 1800
+
+注意：selfsigned 的引擎配置会引用 /etc/<core>/server.crt|key，haproxy 配置会引用
+/usr/local/etc/haproxy/server.pem。校验容器里没有这些文件会**假失败**，所以脚本先
+生成一对哑证书再按只读方式挂进去。
 """
 import base64
 import glob
@@ -74,6 +78,30 @@ echo "-- certbot:";  docker run --rm --entrypoint certbot @@CERTBOT@@ --version 
 echo "-- python:";   docker run --rm @@PYIMG@@ python -V 2>&1 | tr -d '\r'
 echo
 
+echo "########## 3.5 生成哑证书（selfsigned 配置与 haproxy 会引用） ##########"
+CRT="${M}/certs"; rm -rf "${CRT}"; mkdir -p "${CRT}"
+if command -v openssl >/dev/null 2>&1; then
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "${CRT}/server.key" -out "${CRT}/server.crt" \
+      -days 2 -subj "/CN=localhost" >/dev/null 2>&1 && echo "哑证书：host openssl 生成"
+else
+  docker run --rm -v "${CRT}":/c --entrypoint sh @@PYIMG@@ -c \
+      "apk add --no-cache openssl >/dev/null 2>&1; openssl req -x509 -newkey rsa:2048 -nodes -keyout /c/server.key -out /c/server.crt -days 2 -subj /CN=localhost" \
+      >/dev/null 2>&1 && echo "哑证书：容器内 openssl 生成"
+fi
+cat "${CRT}/server.crt" "${CRT}/server.key" > "${CRT}/server.pem" 2>/dev/null
+# xray 官方镜像以 uid 65532 运行；证书必须 world-readable，否则 check 报
+# "open /etc/xray/server.key: permission denied" 而假失败（sing-box/haproxy 以 root
+# 运行看不出这个问题，所以只有 xray 那几份会挂）。
+chmod 755 "${CRT}"
+chmod 644 "${CRT}/server.crt" "${CRT}/server.key" "${CRT}/server.pem" 2>/dev/null
+ls -l "${CRT}"
+if [ -s "${CRT}/server.crt" ] && [ -s "${CRT}/server.key" ] && [ -s "${CRT}/server.pem" ]; then
+  echo "哑证书就位"
+else
+  echo "!! 哑证书生成失败 —— selfsigned 与 haproxy 的校验结果不可信"
+fi
+echo
+
 echo "########## 4. 探测各引擎的校验子命令 ##########"
 printf '{}' > /tmp/probe.json
 pick_mode() { # image  candidate...
@@ -98,7 +126,7 @@ echo "########## 5. xray 引擎配置校验 ##########"
 xp=0; xf=0
 for f in xray__*.json; do
   if [ -z "${XMODE}" ]; then echo "SKIP ${f} (无可用校验子命令)"; continue; fi
-  out=$(timeout 60 docker run --rm -v "${M}/${f}":/tmp/c.json @@XRAY@@ ${XMODE} /tmp/c.json 2>&1); rc=$?
+  out=$(timeout 60 docker run --rm -v "${M}/${f}":/tmp/c.json -v "${CRT}":/etc/xray:ro @@XRAY@@ ${XMODE} /tmp/c.json 2>&1); rc=$?
   if [ ${rc} -eq 0 ]; then
     xp=$((xp + 1))
     printf 'PASS %-46s %s\n' "${f}" "$(printf '%s' "${out}" | tr -d '\r' | grep -iE 'warn|deprecat' | head -1)"
@@ -113,7 +141,7 @@ echo "########## 6. sing-box 引擎配置校验 ##########"
 sp=0; sf=0
 for f in sing-box__*.json; do
   if [ -z "${SMODE}" ]; then echo "SKIP ${f} (无可用校验子命令)"; continue; fi
-  out=$(timeout 60 docker run --rm -v "${M}/${f}":/tmp/c.json @@SB@@ ${SMODE} /tmp/c.json 2>&1); rc=$?
+  out=$(timeout 60 docker run --rm -v "${M}/${f}":/tmp/c.json -v "${CRT}":/etc/sing-box:ro @@SB@@ ${SMODE} /tmp/c.json 2>&1); rc=$?
   if [ ${rc} -eq 0 ]; then
     sp=$((sp + 1))
     printf 'PASS %-46s %s\n' "${f}" "$(printf '%s' "${out}" | tr -d '\r' | grep -iE 'warn|deprecat' | head -1)"
@@ -127,7 +155,13 @@ echo
 echo "########## 7. haproxy 配置校验 ##########"
 hp=0; hf=0
 for f in *.haproxy; do
-  out=$(timeout 40 docker run --rm -v "${M}/${f}":/etc/haproxy/haproxy.cfg @@HAPROXY@@ haproxy -c -f /etc/haproxy/haproxy.cfg 2>&1); rc=$?
+  # 配置里的 server 指向 compose 服务名（engine/nginx/certbot）。一次性容器不在 compose
+  # 网络里、没有 Docker 内嵌 DNS，haproxy 会在解析阶段直接报
+  # "could not resolve address 'engine'" 而假失败 —— 所以显式给三个名字加 hosts。
+  out=$(timeout 40 docker run --rm -v "${M}/${f}":/etc/haproxy/haproxy.cfg \
+        -v "${CRT}/server.pem":/usr/local/etc/haproxy/server.pem:ro \
+        --add-host engine:127.0.0.1 --add-host nginx:127.0.0.1 --add-host certbot:127.0.0.1 \
+        @@HAPROXY@@ haproxy -c -f /etc/haproxy/haproxy.cfg 2>&1); rc=$?
   if [ ${rc} -eq 0 ]; then
     hp=$((hp + 1))
     printf 'PASS %-46s %s\n' "${f}" "$(printf '%s' "${out}" | tr -d '\r' | grep -iE 'warn|deprecat' | head -1)"

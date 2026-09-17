@@ -1546,36 +1546,43 @@ function generate_engine_config {
       "tag": "block"
     }
   ],
+  "http_clients": [
+    {
+      "tag": "internet",
+      "detour": "internet"
+    }
+  ],
   "route": {
     "final": "$([[ ${config[warp]} == ON ]] && echo "warp" || echo "internet")",
+    "default_http_client": "internet",
     "rule_set": [
       {
         "tag": "block",
         "type": "remote",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
-        "download_detour": "internet"
+        "http_client": "internet"
       },
       {
         "tag": "nsfw",
         "type": "remote",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-porn.srs",
-        "download_detour": "internet"
+        "http_client": "internet"
       },
       {
         "tag": "geosite-private",
         "type": "remote",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-private.srs",
-        "download_detour": "internet"
+        "http_client": "internet"
       },
       {
         "tag": "bypass",
         "type": "remote",
         "format": "binary",
         "url": "${ruleset_base_url}/bypass.srs",
-        "download_detour": "internet"
+        "http_client": "internet"
       }
     ],
     "rules": [
