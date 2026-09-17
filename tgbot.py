@@ -6,29 +6,32 @@ The local copy of the installer script is therefore used directly instead of
 re-downloading it from GitHub for every single command (the previous behaviour,
 which was also the reason the bot stopped working entirely while offline).
 
-The image pins python-telegram-bot 13.x, so the synchronous Updater/Dispatcher
-API is used on purpose.
+The image pins python-telegram-bot 22.x, so the asyncio API is used throughout:
+`Application` plus `async def` handlers. Nothing may block the event loop,
+because reality.sh legitimately runs for minutes (compose restarts, certificate
+work ...), so every call into it goes through asyncio.create_subprocess_exec
+rather than subprocess.run.
 
 BOT_ADMIN lists the people allowed to drive the bot, as Telegram usernames or as
 numeric user ids; see parse_admins and is_admin.
 """
 
+import asyncio
 import html
 import io
 import os
 import re
-import subprocess
 import sys
 from functools import wraps
 
 import qrcode
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
+    Application,
     CallbackQueryHandler,
     CommandHandler,
-    Filters,
     MessageHandler,
-    Updater,
+    filters,
 )
 
 REALITY_PATH = os.environ.get('REALITY_PATH', '/opt/reality')
@@ -90,19 +93,34 @@ class RealityError(RuntimeError):
     """reality.sh exited with a non-zero status."""
 
 
-def resolve_script():
+def decode_output(raw):
+    """Decode a byte stream produced by a child process.
+
+    Decoding never raises: reality.sh is allowed to print anything, including
+    bytes that are not valid UTF-8, and a mangled log line must not take the
+    bot down.
+    """
+    return (raw or b'').decode('utf-8', errors='replace')
+
+
+async def resolve_script():
     """Return the script to execute, downloading it once if it is not mounted."""
     if os.path.isfile(LOCAL_SCRIPT):
         return LOCAL_SCRIPT
     if not os.path.isfile(SCRIPT_CACHE):
         try:
-            subprocess.run(
-                ['curl', '-fsSL', '-m', '30', REMOTE_SCRIPT, '-o', SCRIPT_CACHE],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+            process = await asyncio.create_subprocess_exec(
+                'curl', '-fsSL', '-m', '30', REMOTE_SCRIPT, '-o', SCRIPT_CACHE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-        except (OSError, subprocess.CalledProcessError):
+        except OSError:  # curl itself is missing from the image
+            raise RealityError(
+                'reality.sh is neither mounted nor downloadable, '
+                'check the container volumes and network'
+            )
+        await process.communicate()
+        if process.returncode != 0:
             raise RealityError(
                 'reality.sh is neither mounted nor downloadable, '
                 'check the container volumes and network'
@@ -110,78 +128,91 @@ def resolve_script():
     return SCRIPT_CACHE
 
 
-def run_reality(*arguments):
+async def run_reality(*arguments, timeout=COMMAND_TIMEOUT):
     """Run reality.sh and return its stdout.
 
     The arguments are passed as an argv list and never interpolated into a shell
     string, so a username coming from a callback button can not inject commands.
+    The call is awaited, never blocking the event loop: a single slow
+    `--delete-user` must not freeze the bot for every other admin.
     """
+    script = await resolve_script()
+    process = await asyncio.create_subprocess_exec(
+        '/bin/bash', script, *arguments,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
     try:
-        result = subprocess.run(
-            ['/bin/bash', resolve_script(), *arguments],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors='replace',
-            timeout=COMMAND_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        raise RealityError(f'reality.sh timed out after {COMMAND_TIMEOUT}s')
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or '').strip().splitlines()
-        raise RealityError(detail[-1] if detail else f'exit status {result.returncode}')
-    return result.stdout
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise RealityError(f'reality.sh timed out after {timeout}s')
+    if process.returncode != 0:
+        detail = decode_output(stderr or stdout).strip().splitlines()
+        raise RealityError(detail[-1] if detail else f'exit status {process.returncode}')
+    return decode_output(stdout)
 
 
-def get_users():
+async def get_users():
     """Return the existing usernames, ignoring unrelated banner output."""
     users = []
-    for line in run_reality('--list-users').splitlines():
+    for line in (await run_reality('--list-users')).splitlines():
         line = line.strip()
         if USERNAME_RE.match(line):
             users.append(line)
     return users
 
 
-def get_configs(username):
+async def get_configs(username):
     """Return the client configuration strings printed by `--show-user`."""
     configs = []
-    for line in run_reality('--show-user', username).splitlines():
+    for line in (await run_reality('--show-user', username)).splitlines():
         line = line.strip()
         if CONFIG_LINE_RE.search(line):
             configs.append(line)
     return configs
 
 
-def add_user_via_script(username):
-    run_reality('--add-user', username)
+async def add_user_via_script(username):
+    await run_reality('--add-user', username)
 
 
-def delete_user_via_script(username):
-    run_reality('--delete-user', username)
+async def delete_user_via_script(username):
+    await run_reality('--delete-user', username)
 
 
 def is_ipv6_config(config):
     return config.endswith('-ipv6') or bool(IPV6_RE.search(config))
 
 
-def send_menu(context, chat_id, text, keyboard):
-    context.bot.send_message(
+def render_qr(config):
+    """Render `config` as a PNG QR code and rewind the buffer.
+
+    Pure CPU work, so it is pushed onto a worker thread by send_config instead
+    of stalling the event loop.
+    """
+    image = io.BytesIO()
+    qrcode.make(config).save(image, 'PNG')
+    image.seek(0)
+    return image
+
+
+async def send_menu(context, chat_id, text, keyboard):
+    await context.bot.send_message(
         chat_id=chat_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
-def send_config(context, chat_id, config, username, reply_markup):
+async def send_config(context, chat_id, config, username, reply_markup):
     """Send one client configuration as a QR code plus its textual form."""
     label = f'IPv6 config for "{username}"' if is_ipv6_config(config) else f'Config for "{username}"'
-    image = io.BytesIO()
-    qrcode.make(config).save(image, 'PNG')
-    image.seek(0)
+    image = await asyncio.to_thread(render_qr, config)
     # <pre> keeps the string copyable and html.escape stops the '&' and '<'
     # characters inside the URI from breaking Telegram's HTML parser.
     caption = f'{label}:\n<pre>{html.escape(config)}</pre>'
     if len(caption) <= TELEGRAM_CAPTION_LIMIT:
-        context.bot.send_photo(
+        await context.bot.send_photo(
             chat_id=chat_id,
             photo=image,
             caption=caption,
@@ -191,10 +222,10 @@ def send_config(context, chat_id, config, username, reply_markup):
         return
     # The shadowtls configuration is a JSON document, far longer than the 1024
     # character caption limit, so the photo and the text are sent separately.
-    context.bot.send_photo(
+    await context.bot.send_photo(
         chat_id=chat_id, photo=image, caption=label, reply_markup=reply_markup
     )
-    context.bot.send_message(
+    await context.bot.send_message(
         chat_id=chat_id, text=f'<pre>{html.escape(config)}</pre>', parse_mode='HTML'
     )
 
@@ -216,40 +247,44 @@ def is_admin(chat):
 
 
 def restricted(handler):
-    """Reject non-admins and turn command failures into readable messages."""
+    """Reject non-admins and turn command failures into readable messages.
+
+    Handlers are coroutines in python-telegram-bot 22.x, so this wrapper is one
+    too and awaits the handler it guards.
+    """
 
     @wraps(handler)
-    def wrapper(update, context, *args, **kwargs):
+    async def wrapper(update, context, *args, **kwargs):
         chat = update.effective_chat
         message = update.effective_message
         if chat is None or message is None:
             return None
         if not is_admin(chat):
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=chat.id, text='You are not authorized to use this bot.'
             )
             return None
         try:
-            return handler(update, context, *args, **kwargs)
+            return await handler(update, context, *args, **kwargs)
         except RealityError as error:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=chat.id, text=f'reality failed: {error}'
             )
         except Exception as error:  # noqa: BLE001 - a bad command must not stop polling
-            context.bot.send_message(chat_id=chat.id, text=f'Unexpected error: {error}')
+            await context.bot.send_message(chat_id=chat.id, text=f'Unexpected error: {error}')
         return None
 
     return wrapper
 
 
 @restricted
-def start(update, context):
+async def start(update, context):
     keyboard = [
         [InlineKeyboardButton('Show User', callback_data='show_user')],
         [InlineKeyboardButton('Add User', callback_data='add_user')],
         [InlineKeyboardButton('Delete User', callback_data='delete_user')],
     ]
-    send_menu(
+    await send_menu(
         context,
         update.effective_chat.id,
         'Reality User Management Bot\n\nChoose an option:',
@@ -258,21 +293,21 @@ def start(update, context):
 
 
 @restricted
-def users_list(update, context, text, callback):
+async def users_list(update, context, text, callback):
     keyboard = [
         [InlineKeyboardButton(user, callback_data=f'{callback}!{user}')]
-        for user in get_users()
+        for user in await get_users()
     ]
     keyboard.append([InlineKeyboardButton('Back', callback_data='start')])
-    send_menu(context, update.effective_chat.id, text, keyboard)
+    await send_menu(context, update.effective_chat.id, text, keyboard)
 
 
 @restricted
-def show_user(update, context, username):
+async def show_user(update, context, username):
     chat_id = update.effective_chat.id
-    configs = get_configs(username)
+    configs = await get_configs(username)
     if not configs:
-        send_menu(
+        await send_menu(
             context,
             chat_id,
             f'No configuration found for "{username}".',
@@ -283,14 +318,14 @@ def show_user(update, context, username):
         [[InlineKeyboardButton('Back', callback_data='show_user')]]
     )
     for config in configs:
-        send_config(context, chat_id, config, username, reply_markup)
+        await send_config(context, chat_id, config, username, reply_markup)
 
 
 @restricted
-def delete_user(update, context, username):
+async def delete_user(update, context, username):
     chat_id = update.effective_chat.id
-    if len(get_users()) == 1:
-        send_menu(
+    if len(await get_users()) == 1:
+        await send_menu(
             context,
             chat_id,
             'You cannot delete the only user.\nAt least one user is needed.\n'
@@ -298,7 +333,7 @@ def delete_user(update, context, username):
             [[InlineKeyboardButton('Back', callback_data='start')]],
         )
         return
-    send_menu(
+    await send_menu(
         context,
         chat_id,
         f'Are you sure to delete "{username}"?',
@@ -310,9 +345,9 @@ def delete_user(update, context, username):
 
 
 @restricted
-def add_user(update, context):
+async def add_user(update, context):
     context.user_data['expected_input'] = 'username'
-    send_menu(
+    await send_menu(
         context,
         update.effective_chat.id,
         'Enter the username:',
@@ -321,9 +356,9 @@ def add_user(update, context):
 
 
 @restricted
-def approve_delete(update, context, username):
-    delete_user_via_script(username)
-    send_menu(
+async def approve_delete(update, context, username):
+    await delete_user_via_script(username)
+    await send_menu(
         context,
         update.effective_chat.id,
         f'User {username} has been deleted.',
@@ -332,61 +367,61 @@ def approve_delete(update, context, username):
 
 
 @restricted
-def cancel(update, context):
+async def cancel(update, context):
     context.user_data.pop('expected_input', None)
-    start(update, context)
+    await start(update, context)
 
 
 @restricted
-def button(update, context):
+async def button(update, context):
     query = update.callback_query
     try:
-        query.answer()
+        await query.answer()
     except Exception:  # noqa: BLE001 - expired callback queries are harmless
         pass
     action, _, argument = query.data.partition('!')
     if not argument:
         if action == 'start':
-            start(update, context)
+            await start(update, context)
         elif action == 'cancel':
-            cancel(update, context)
+            await cancel(update, context)
         elif action == 'show_user':
-            users_list(update, context, 'Select user to view config:', 'show_user')
+            await users_list(update, context, 'Select user to view config:', 'show_user')
         elif action == 'delete_user':
-            users_list(update, context, 'Select user to delete:', 'delete_user')
+            await users_list(update, context, 'Select user to delete:', 'delete_user')
         elif action == 'add_user':
-            add_user(update, context)
+            await add_user(update, context)
         else:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=update.effective_chat.id, text=f'Button pressed: {action}'
             )
         return
     if action == 'show_user':
-        show_user(update, context, argument)
+        await show_user(update, context, argument)
     elif action == 'delete_user':
-        delete_user(update, context, argument)
+        await delete_user(update, context, argument)
     elif action == 'approve_delete':
-        approve_delete(update, context, argument)
+        await approve_delete(update, context, argument)
 
 
 @restricted
-def user_input(update, context):
+async def user_input(update, context):
     if context.user_data.pop('expected_input', None) != 'username':
         return
     username = (update.message.text or '').strip()
     if not USERNAME_RE.match(username):
-        update.message.reply_text(
+        await update.message.reply_text(
             'Username can only contains A-Z, a-z and 0-9, try another username.'
         )
-        add_user(update, context)
+        await add_user(update, context)
         return
-    if username in get_users():
-        update.message.reply_text(f'User "{username}" exists, try another username.')
-        add_user(update, context)
+    if username in await get_users():
+        await update.message.reply_text(f'User "{username}" exists, try another username.')
+        await add_user(update, context)
         return
-    add_user_via_script(username)
-    update.message.reply_text(f'User "{username}" is created.')
-    show_user(update, context, username)
+    await add_user_via_script(username)
+    await update.message.reply_text(f'User "{username}" is created.')
+    await show_user(update, context, username)
 
 
 def main():
@@ -396,14 +431,13 @@ def main():
     if not BOT_ADMINS and not BOT_ADMIN_IDS:
         print('BOT_ADMIN environment variable is not set.', file=sys.stderr)
         return 1
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dispatcher = updater.dispatcher
-    dispatcher.add_handler(CommandHandler('start', start))
-    dispatcher.add_handler(CallbackQueryHandler(button))
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, user_input))
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CallbackQueryHandler(button))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, user_input))
     # Drop updates queued while the container was down instead of replaying them.
-    updater.start_polling(drop_pending_updates=True)
-    updater.idle()
+    # run_polling() blocks: it installs the signal handlers and owns the loop.
+    application.run_polling(drop_pending_updates=True)
     return 0
 
 

@@ -11,3 +11,15 @@
 # Python
 __pycache__/
 *.py[cod]
+
+# WorkBuddy workspace: the ops tooling is worth versioning, but these must
+# never be published. `.workbuddy/backups/` holds the server archive, which
+# embeds the reality private key and the client UUIDs; `.workbuddy/memory/`
+# is the internal work log and carries host and IP details of the deployment;
+# `tmp/` is scratch and `engine-matrix/` is regenerable build output.
+.workbuddy/backups/
+.workbuddy/memory/
+.workbuddy/tmp/
+.workbuddy/tools/engine-matrix/
+.workbuddy/tools/vps_matrix_check.sh
+.workbuddy/tools/vps_tgbot_check.sh

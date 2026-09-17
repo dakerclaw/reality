@@ -43,12 +43,28 @@ CHOICE_HEIGHT=20
 #   xray-core  -> GHCR, published by XTLS (ghcr.io/xtls/xray-core)
 #   sing-box   -> GHCR, published by SagerNet (ghcr.io/sagernet/sing-box)
 #   nginx/certbot/haproxy/python -> official Docker Hub images/library
-image[xray]="ghcr.io/xtls/xray-core:25.12.8"
-image[sing-box]="ghcr.io/sagernet/sing-box:v1.12.23"
-image[nginx]="nginx:1.24.0"
-image[certbot]="certbot/certbot:v2.6.0"
-image[haproxy]="haproxy:2.8.0"
-image[python]="python:3.11-alpine"
+#
+# Every tag is pinned to the newest *stable* release of its project, never to a
+# floating tag, so two servers installed on different days run the same code.
+# How to re-check (all of these need no credentials):
+#   xray      https://api.github.com/repos/XTLS/Xray-core/releases/latest
+#             Everything from v26.4 on is flagged "prerelease" upstream, so the
+#             latest *stable* release is still v26.3.27 while newer tags exist.
+#   sing-box  https://api.github.com/repos/SagerNet/sing-box/releases/latest
+#   nginx     https://nginx.org/en/download.html          (the "Stable version"
+#             line; the odd-numbered minor branch is mainline)
+#   haproxy   https://hub.docker.com/v2/repositories/library/haproxy/tags
+#   certbot   https://hub.docker.com/v2/repositories/certbot/certbot/tags
+#   python    https://hub.docker.com/v2/repositories/library/python/tags
+#             The bot image is on the newest Python because tgbot.py targets
+#             python-telegram-bot 22.x (asyncio). 13.x vendors a six-based
+#             urllib3 that cannot even be imported on Python 3.12+.
+image[xray]="ghcr.io/xtls/xray-core:26.3.27"
+image[sing-box]="ghcr.io/sagernet/sing-box:v1.14.1"
+image[nginx]="nginx:1.30.5"
+image[certbot]="certbot/certbot:v5.8.0"
+image[haproxy]="haproxy:3.4.4"
+image[python]="python:3.14-alpine"
 
 # Upstream project coordinates. The bot script and the update helper are pulled
 # from this repository instead of a third-party fork.
@@ -1286,7 +1302,7 @@ function generate_tgbot_dockerfile {
 FROM ${image[python]}
 WORKDIR ${config_path}/tgbot
 RUN apk add --no-cache docker-cli-compose curl bash newt libqrencode-tools sudo openssl jq zip unzip
-RUN pip install --no-cache-dir python-telegram-bot==13.5 qrcode[pil]==7.4.2
+RUN pip install --no-cache-dir python-telegram-bot==22.8 "qrcode[pil]==8.2"
 CMD [ "python", "./tgbot.py" ]
 EOF
 }

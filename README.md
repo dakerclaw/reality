@@ -186,12 +186,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 
 | 组件 | 镜像 | 来源 |
 | --- | --- | --- |
-| xray 引擎 | `ghcr.io/xtls/xray-core:25.12.8` | GHCR，XTLS 官方发布 |
-| sing-box 引擎 | `ghcr.io/sagernet/sing-box:v1.12.23` | GHCR，SagerNet 官方发布 |
-| nginx | `nginx:1.24.0` | Docker Hub 官方 library |
-| haproxy | `haproxy:2.8.0` | Docker Hub 官方 library |
-| certbot | `certbot/certbot:v2.6.0` | Docker Hub 官方 certbot 镜像 |
-| Telegram 机器人基础镜像 | `python:3.11-alpine` | Docker Hub 官方 library |
+| xray 引擎 | `ghcr.io/xtls/xray-core:26.3.27` | GHCR，XTLS 官方发布 |
+| sing-box 引擎 | `ghcr.io/sagernet/sing-box:v1.14.1` | GHCR，SagerNet 官方发布 |
+| nginx | `nginx:1.30.5` | Docker Hub 官方 library |
+| haproxy | `haproxy:3.4.4` | Docker Hub 官方 library |
+| certbot | `certbot/certbot:v5.8.0` | Docker Hub 官方 certbot 镜像 |
+| Telegram 机器人基础镜像 | `python:3.14-alpine` | Docker Hub 官方 library |
+
+每个镜像都钉在各自项目的**最新稳定版**上，不使用 `latest` 一类的浮动 tag，因此不同时间安装的
+两台服务器跑的是同一份代码。xray 从 v26.4 起的版本都被上游标记为 pre-release，所以这里取的是
+最后一个正式版；升级镜像时 `reality.sh` 顶部的 `image[]` 和上面这张表必须一起改。
 
 引擎容器始终显式声明 `command`（`run -c /etc/<core>/config.json`），因此不依赖镜像自带的
 默认 `CMD`，换镜像也不会跑错配置。

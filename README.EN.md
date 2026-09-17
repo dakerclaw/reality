@@ -206,12 +206,18 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 
 | Component | Image | Registry |
 | --- | --- | --- |
-| xray engine | `ghcr.io/xtls/xray-core:25.12.8` | GHCR, published by XTLS |
-| sing-box engine | `ghcr.io/sagernet/sing-box:v1.12.23` | GHCR, published by SagerNet |
-| nginx | `nginx:1.24.0` | Docker Hub official library |
-| haproxy | `haproxy:2.8.0` | Docker Hub official library |
-| certbot | `certbot/certbot:v2.6.0` | Docker Hub, official certbot image |
-| Telegram bot base | `python:3.11-alpine` | Docker Hub official library |
+| xray engine | `ghcr.io/xtls/xray-core:26.3.27` | GHCR, published by XTLS |
+| sing-box engine | `ghcr.io/sagernet/sing-box:v1.14.1` | GHCR, published by SagerNet |
+| nginx | `nginx:1.30.5` | Docker Hub official library |
+| haproxy | `haproxy:3.4.4` | Docker Hub official library |
+| certbot | `certbot/certbot:v5.8.0` | Docker Hub, official certbot image |
+| Telegram bot base | `python:3.14-alpine` | Docker Hub official library |
+
+Every image is pinned to the newest **stable** release of its project, never to a
+floating tag such as `latest`, so two servers installed months apart run exactly
+the same code. For xray, everything from v26.4 on is flagged pre-release
+upstream, so the last official release is pinned instead. When bumping an image,
+change `image[]` at the top of `reality.sh` and this table together.
 
 The engine container always runs with an explicit `command`
 (`run -c /etc/<core>/config.json`), so the deployment does not depend on an
