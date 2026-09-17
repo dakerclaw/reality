@@ -4,8 +4,6 @@
 .tmp/
 *.diff
 
-# WorkBuddy workspace state
-.workbuddy/
 
 .selftest*.sh
 .selftest_tgbot.py
