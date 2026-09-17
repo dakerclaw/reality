@@ -995,7 +995,12 @@ function install_docker {
     docker_cmd="docker compose"
     return 0
   fi
-  if command -v docker-compose >/dev/null 2>&1; then
+  # Only accept a v2 binary under the legacy "docker-compose" name. Compose v1
+  # parses a version-less compose file as the legacy format, where the top-level
+  # keys are service names, so it cannot read the file generated above - fall
+  # through and install the current release instead.
+  if command -v docker-compose >/dev/null 2>&1 &&
+    [[ $(docker-compose version --short 2>/dev/null) == 2.* ]]; then
     docker_cmd="docker-compose"
     return 0
   fi
@@ -1021,8 +1026,12 @@ function generate_docker_compose {
   else
     engine_command='["run", "-c", "/etc/sing-box/config.json"]'
   fi
+  # No top-level "version:" key: Compose v2 ignores it and prints
+  #   WARN the attribute version is obsolete, it will be ignored
+  # on every command. Do not add it back - see the guard in install_docker,
+  # which keeps this file away from Compose v1 (v1 reads a version-less file
+  # as the legacy format, where the top-level keys are service names).
   cat >"${path[compose]}" <<EOF
-version: "3"
 networks:
   reality:
     driver: bridge
@@ -1102,8 +1111,9 @@ EOF
 }
 
 function generate_tgbot_compose {
+  # Same as generate_docker_compose: a "version:" key is obsolete in Compose v2
+  # and only produces a warning.
   cat >"${path[tgbot_compose]}" <<EOF
-version: "3"
 networks:
   tgbot:
     driver: bridge
@@ -1475,6 +1485,17 @@ function generate_engine_config {
         users_object=${users_object}'{"uuid": "'"${users[${user}]}"'", "flow": "'"$([[ ${config[transport]} == 'tcp' ]] && echo 'xtls-rprx-vision' || true)"'", "name": "'"${user}"'"}'
       fi
     done
+    # Remote rule-sets are fetched through an explicitly declared HTTP client.
+    # Its "detour" key must stay empty: the only candidate is "internet", which
+    # is always a bare direct outbound here (WARP is an endpoint, not an
+    # outbound), and sing-box 1.14 aborts at *startup* on that with
+    #   FATAL start service: ... Get "https://...srs": detour to an empty
+    #   direct outbound makes no sense
+    # Measured against sing-box v1.14.1: declaring the client without a detour
+    # starts cleanly with no warning; the old download_detour key still works
+    # but warns; a detour to "internet" sends the engine into a restart loop;
+    # and omitting the client warns "implicit default HTTP client ... deprecated".
+    # "sing-box check" accepts all four, so this has to be validated with "run".
     cat >"${path[engine]}" <<EOF
 {
   "log": {
@@ -1548,8 +1569,7 @@ function generate_engine_config {
   ],
   "http_clients": [
     {
-      "tag": "internet",
-      "detour": "internet"
+      "tag": "internet"
     }
   ],
   "route": {

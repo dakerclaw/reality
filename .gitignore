@@ -1,7 +1,10 @@
 # Local development scaffolding
 .orig-backup/
 .selftest-tmp/
+# the suites create their own scratch directories, and leave residue behind
+.selftest-tmp*/
 .tmp/
+.tmp-*
 *.diff
 
 
@@ -23,3 +26,4 @@ __pycache__/
 .workbuddy/tools/engine-matrix/
 .workbuddy/tools/vps_matrix_check.sh
 .workbuddy/tools/vps_tgbot_check.sh
+.workbuddy/tools/vps_resync.sh

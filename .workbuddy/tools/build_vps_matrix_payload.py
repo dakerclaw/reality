@@ -117,9 +117,14 @@ pick_mode() { # image  candidate...
   return 1
 }
 XMODE=$(pick_mode @@XRAY@@ "run -test -c" "test -c") || XMODE=""
-SMODE=$(pick_mode @@SB@@ "check -c" "run -c") || SMODE=""
+# sing-box is validated with "run", never with "check": "check" happily accepts
+# configs that abort at startup - a rule-set http_client whose detour points at
+# the bare direct outbound is one - so it hides exactly the class of failure
+# this harness exists to find. The probe is killed by the timeout, and that is
+# the success case (rc=124).
+SMODE="run -c"
 echo "xray 校验模式 = '${XMODE}'"
-echo "sing-box 校验模式 = '${SMODE}'"
+echo "sing-box 校验模式 = '${SMODE}'（真实启动，非 check）"
 echo
 
 echo "########## 5. xray 引擎配置校验 ##########"
@@ -137,16 +142,26 @@ done
 echo "xray: ${xp} 通过 / ${xf} 失败"
 echo
 
-echo "########## 6. sing-box 引擎配置校验 ##########"
+echo "########## 6. sing-box 引擎配置校验（真实启动）##########"
 sp=0; sf=0
+n=0
 for f in sing-box__*.json; do
-  if [ -z "${SMODE}" ]; then echo "SKIP ${f} (无可用校验子命令)"; continue; fi
-  out=$(timeout 60 docker run --rm -v "${M}/${f}":/tmp/c.json -v "${CRT}":/etc/sing-box:ro @@SB@@ ${SMODE} /tmp/c.json 2>&1); rc=$?
-  if [ ${rc} -eq 0 ]; then
+  n=$((n + 1))
+  port=$((19000 + n))
+  # The matrix configs listen on 8443, the port the live engine holds, so the
+  # probe runs on a private port; otherwise a collision would look like a
+  # config error.
+  sed "s/\"listen_port\": 8443/\"listen_port\": ${port}/" "${M}/${f}" > /tmp/sbprobe.json
+  out=$(timeout 30 docker run --rm -v /tmp/sbprobe.json:/tmp/c.json -v "${CRT}":/etc/sing-box:ro @@SB@@ ${SMODE} /tmp/c.json 2>&1); rc=$?
+  errs=$(printf '%s' "${out}" | tr -d '\r' | grep -cE 'FATAL|ERROR')
+  dep=$(printf '%s' "${out}" | tr -d '\r' | grep -cE 'download_detour|implicit default HTTP client')
+  if [ ${rc} -eq 124 ] && [ ${errs} -eq 0 ] && [ ${dep} -eq 0 ]; then
     sp=$((sp + 1))
-    printf 'PASS %-46s %s\n' "${f}" "$(printf '%s' "${out}" | tr -d '\r' | grep -iE 'warn|deprecat' | head -1)"
+    printf 'PASS %-46s 存活 30s，无错误/无弃用告警\n' "${f}"
   else
-    sf=$((sf + 1)); echo "FAIL ${f} (rc=${rc})"; printf '%s\n' "${out}" | tr -d '\r' | head -14
+    sf=$((sf + 1))
+    echo "FAIL ${f} (rc=${rc} 错误=${errs} 弃用告警=${dep})"
+    printf '%s\n' "${out}" | tr -d '\r' | head -14
   fi
 done
 echo "sing-box: ${sp} 通过 / ${sf} 失败"
