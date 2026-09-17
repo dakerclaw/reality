@@ -29,10 +29,10 @@ declare -A md5
 declare -A regex
 declare -A image
 
-config_path="/opt/reality-ezpz"
-compose_project='reality-ezpz'
+config_path="/opt/reality"
+compose_project='reality'
 tgbot_project='tgbot'
-BACKTITLE=RealityEZPZ
+BACKTITLE=Reality
 MENU="Select an option:"
 HEIGHT=30
 WIDTH=60
@@ -67,7 +67,7 @@ private_ip_cidr='["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.25
 
 # One rule data file (the "bypass" list) has no upstream counterpart, so it is
 # still fetched from a community repository. Override it to self-host:
-#   RULESET_BASE_URL=https://example.com/rules ./reality-ezpz.sh
+#   RULESET_BASE_URL=https://example.com/rules ./reality.sh
 ruleset_base_url="${RULESET_BASE_URL:-https://raw.githubusercontent.com/aleskxyz/sing-box-rules/refs/heads/rule-set}"
 
 defaults[transport]=tcp
@@ -170,7 +170,7 @@ regex[url]="^(http|https)://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[0-9]{1,3}(\.[0-9]{1,3
 
 function show_help {
   echo ""
-  echo "Usage: reality-ezpz.sh [-t|--transport=tcp|http|grpc|ws|tuic|hysteria2|shadowtls] [-d|--domain=<domain>] [--camouflage=<domain[:port]>] [--server=<server>]
+  echo "Usage: reality.sh [-t|--transport=tcp|http|grpc|ws|tuic|hysteria2|shadowtls] [-d|--domain=<domain>] [--camouflage=<domain[:port]>] [--server=<server>]
   [--regenerate] [--default] [-r|--restart] [--enable-safenet=true|false] [--enable-bbr=true|false] [--port=<port>] [--http-port=<port|off>] [-c|--core=xray|sing-box]
   [--enable-warp=true|false] [--warp-license=<license>] [--security=reality|letsencrypt|selfsigned] [-m|--menu] [--show-server-config]
   [--add-user=<username>] [--lists-users] [--show-user=<username>] [--delete-user=<username>] [--backup] [--restore=<url|file>]
@@ -498,7 +498,7 @@ function backup {
   local backup_password="$1"
   local backup_file_url
   local exit_code
-  backup_name="reality-ezpz-backup-$(date +%Y-%m-%d_%H-%M-%S).zip"
+  backup_name="reality-backup-$(date +%Y-%m-%d_%H-%M-%S).zip"
   cd "${config_path}"
   if [ -z "${backup_password}" ]; then
     zip -r "/tmp/${backup_name}" . > /dev/null
@@ -552,7 +552,7 @@ function restore {
   eval "$current_state"
   if [[ ${unzip_exit_code} -eq 0 ]]; then
     if ! echo "${unzip_output}" | grep -q 'config'; then
-      echo "The provided file is not a reality-ezpz backup file." >&2
+      echo "The provided file is not a reality backup file." >&2
       rm -f "${temp_file}"
       return 1
     fi
@@ -643,8 +643,8 @@ function parse_users_file {
     fi
   fi
   if [[ ${#users[@]} -eq 0 ]]; then
-    users[RealityEZPZ]=$(cat /proc/sys/kernel/random/uuid)
-    echo "RealityEZPZ=${users[RealityEZPZ]}" >> "${path[users]}"
+    users[Reality]=$(cat /proc/sys/kernel/random/uuid)
+    echo "Reality=${users[Reality]}" >> "${path[users]}"
     return 0
   fi
   return 0
@@ -913,7 +913,7 @@ function uninstall {
     docker-compose --project-directory "${config_path}/tgbot" -p ${tgbot_project} down --timeout 2 || true
   fi
   rm -rf "${config_path}"
-  echo "Reality-EZPZ uninstalled successfully."
+  echo "Reality uninstalled successfully."
   exit 0
 }
 
@@ -1311,14 +1311,14 @@ function download_tgbot_script {
 
 function install_local_script_copy {
   # Keep a copy of this script inside the configuration directory. Operators are
-  # told to manage the server through ${config_path}/reality-ezpz.sh, and the
+  # told to manage the server through ${config_path}/reality.sh, and the
   # Telegram bot container mounts that directory and prefers this local copy over
   # downloading anything at runtime - so it has to exist whether or not the bot is
   # enabled. Everything is written to a temporary file and moved into place, so a
   # failed or truncated copy can never replace a working one.
-  local url="https://raw.githubusercontent.com/${repo_owner}/${repo_name}/${repo_branch}/reality-ezpz.sh"
-  local target="${config_path}/reality-ezpz.sh"
-  local temp_file="${config_path}/.reality-ezpz.sh.$$"
+  local url="https://raw.githubusercontent.com/${repo_owner}/${repo_name}/${repo_branch}/reality.sh"
+  local target="${config_path}/reality.sh"
+  local temp_file="${config_path}/.reality.sh.$$"
   local source_file=${BASH_SOURCE[0]:-}
   # `bash <(curl ...)` and `bash /dev/stdin` leave BASH_SOURCE[0] pointing at a
   # pipe that this very interpreter has already drained, so copying from it would
@@ -1346,12 +1346,12 @@ function install_local_script_copy {
   fi
   if ! curl -fsSL -m 30 "${url}" -o "${temp_file}"; then
     rm -f "${temp_file}"
-    echo "Could not place reality-ezpz.sh in ${config_path}: no usable local copy and ${url} is unreachable." >&2
+    echo "Could not place reality.sh in ${config_path}: no usable local copy and ${url} is unreachable." >&2
     return 1
   fi
   if [[ ! -s ${temp_file} ]] || ! bash -n "${temp_file}" 2>/dev/null; then
     rm -f "${temp_file}"
-    echo "The reality-ezpz.sh downloaded from ${url} is empty or truncated!" >&2
+    echo "The reality.sh downloaded from ${url} is empty or truncated!" >&2
     return 1
   fi
   chmod 755 "${temp_file}"
@@ -1825,7 +1825,7 @@ function generate_config {
   # picks it up as well. Failing to place it is a warning, not an error - the stack
   # is already configured by the time this runs.
   if ! install_local_script_copy; then
-    echo "Warning: could not place reality-ezpz.sh in ${config_path}; save this script to a file and run it again to retry." >&2
+    echo "Warning: could not place reality.sh in ${config_path}; save this script to a file and run it again to retry." >&2
   fi
 }
 
@@ -1906,6 +1906,44 @@ function print_client_configuration {
   fi
 }
 
+function migrate_legacy_install {
+  # Releases before this one kept everything in /opt/reality-ezpz. The tree is
+  # moved rather than copied because it holds the Reality key pair, the short id,
+  # the user list and the website; regenerating them would invalidate every
+  # client that is already configured.
+  #
+  # The containers of the old compose project are removed first: their names are
+  # derived from the project name (reality-ezpz-engine-1, ...), so the new
+  # project would otherwise fail to publish 8443/8080 while the old ones keep
+  # holding those ports.
+  # The legacy path is a parameter only so the regression suite can point it at a
+  # scratch directory instead of the real /opt; the single caller omits it.
+  local legacy_config_path="${1:-/opt/reality-ezpz}"
+  if [[ ! -e ${legacy_config_path}/config ]]; then
+    return 0
+  fi
+  if [[ -e ${config_path} ]]; then
+    echo "Warning: both ${legacy_config_path} and ${config_path} exist. Keeping ${config_path}; remove the old directory manually to silence this warning." >&2
+    return 0
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    if docker compose >/dev/null 2>&1; then
+      docker compose --project-directory "${legacy_config_path}" -p 'reality-ezpz' down --remove-orphans --timeout 2 >/dev/null 2>&1 || true
+    elif command -v docker-compose >/dev/null 2>&1; then
+      docker-compose --project-directory "${legacy_config_path}" -p 'reality-ezpz' down --remove-orphans --timeout 2 >/dev/null 2>&1 || true
+    fi
+  fi
+  if ! mv "${legacy_config_path}" "${config_path}"; then
+    echo "Could not move ${legacy_config_path} to ${config_path}. Move it by hand (mv ${legacy_config_path} ${config_path}) and run this script again." >&2
+    exit 1
+  fi
+  # The kernel tuning drop-in was renamed as well. Leaving the old one behind
+  # would keep applying its BBR settings even after BBR has been switched off.
+  rm -f '/etc/sysctl.d/99-reality-ezpz.conf'
+  echo "An installation from an older release was found in ${legacy_config_path}: it has been moved to ${config_path}, and its containers are recreated under the new project name."
+  return 0
+}
+
 function upgrade {
   local uuid
   local warp_token
@@ -1917,7 +1955,7 @@ function upgrade {
   uuid=$(grep '^uuid=' "${path[config]}" 2>/dev/null | cut -d= -f2 || true)
   if [[ -n $uuid ]]; then
     sed -i '/^uuid=/d' "${path[users]}"
-    echo "RealityEZPZ=${uuid}" >> "${path[users]}"
+    echo "Reality=${uuid}" >> "${path[users]}"
   fi
   rm -f "${config_path}/xray.conf"
   rm -f "${config_path}/singbox.conf"
@@ -3152,7 +3190,7 @@ function load_bbr_modules {
 function tune_kernel {
   # The path is a parameter only so the regression suite can write to a scratch
   # file instead of the real /etc; every caller in this script omits it.
-  local sysctl_file="${1:-/etc/sysctl.d/99-reality-ezpz.conf}"
+  local sysctl_file="${1:-/etc/sysctl.d/99-reality.conf}"
   local bbr_block
   local line key value
   local failed=()
@@ -3266,6 +3304,10 @@ if [[ $EUID -ne 0 ]]; then
     echo "This script must be run as root."
     exit 1
 fi
+# Deliberately early: --backup and --restore read the configuration directory
+# directly, so a server still using the old layout has to be migrated before any
+# of them runs.
+migrate_legacy_install
 if [[ ${args[backup]} == true ]]; then
   if [[ -n ${args[backup_password]} ]]; then
     backup_url=$(backup "${args[backup_password]}")

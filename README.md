@@ -56,11 +56,11 @@
 ## 快速开始
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh)
 ```
 
-安装脚本会把全部内容写入 `/opt/reality-ezpz`，启动服务栈，输出第一个客户端配置，并在需要时
-打开 TUI。它同时会把**本脚本自身的一份副本放到 `/opt/reality-ezpz/reality-ezpz.sh`**，
+安装脚本会把全部内容写入 `/opt/reality`，启动服务栈，输出第一个客户端配置，并在需要时
+打开 TUI。它同时会把**本脚本自身的一份副本放到 `/opt/reality/reality.sh`**，
 此后所有管理操作都通过这一份执行；因为副本就在配置目录里，每次运行都会被刷新为当前版本。
 这件事与是否启用 Telegram 机器人无关 —— 机器人只是恰好也挂载同一个目录。
 
@@ -68,19 +68,19 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 
 ```bash
 # 使用默认配置安装（reality + sing-box，主端口 8443，网站端口 8080）
-bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh)
 
 # 指定伪装回落的远端大站（同时会作为 SNI）
-bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
+bash <(curl -fsSL .../reality.sh) --camouflage www.microsoft.com
 
 # 自定义端口，并完全不挂网站
-bash <(curl -fsSL .../reality-ezpz.sh) --port 2087 --http-port off
+bash <(curl -fsSL .../reality.sh) --port 2087 --http-port off
 
 # 使用 letsencrypt 证书（这是唯一会占用 80 端口的模式）
-bash <(curl -fsSL .../reality-ezpz.sh) --security letsencrypt --server vpn.example.com
+bash <(curl -fsSL .../reality.sh) --security letsencrypt --server vpn.example.com
 
 # 之后随时打开管理菜单
-bash /opt/reality-ezpz/reality-ezpz.sh --menu
+bash /opt/reality/reality.sh --menu
 ```
 
 ---
@@ -118,10 +118,10 @@ bash /opt/reality-ezpz/reality-ezpz.sh --menu
 
 ```bash
 # 伪装目标 = www.microsoft.com，自有网站在 8080
-bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
+bash <(curl -fsSL .../reality.sh) --camouflage www.microsoft.com
 
 # 挂自己的网站：把文件丢进根目录即可，不需要其他操作
-ls /opt/reality-ezpz/config/website
+ls /opt/reality/config/website
 ```
 
 几点说明：
@@ -138,7 +138,7 @@ ls /opt/reality-ezpz/config/website
 * 从没有 `--camouflage` 的旧版本升级时，脚本会把原 `domain` 的值沿用到新配置项上，
   不会让你的回落目标在升级中悄悄换掉。
 * 首次运行会写入一个中性的占位首页
-  `/opt/reality-ezpz/config/website/index.html`。**已存在的文件绝不会被覆盖** —— 把你自己的
+  `/opt/reality/config/website/index.html`。**已存在的文件绝不会被覆盖** —— 把你自己的
   站点放进去，升级时不会丢。
 * 在 `reality` / `shadowtls` 模式下，这个网站就是全部 HTTP 暴露面；不再通过明文 HTTP
   转发远端伪装站点的内容。
@@ -161,10 +161,10 @@ ls /opt/reality-ezpz/config/website
 
 ```bash
 # reality + sing-box，伪装目标默认 www.fastly.com，无需任何额外参数
-bash <(curl -fsSL .../reality-ezpz.sh)
+bash <(curl -fsSL .../reality.sh)
 
 # 同样不需要域名，只是换个探测者会看到的站点
-bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
+bash <(curl -fsSL .../reality.sh) --camouflage www.microsoft.com
 ```
 
 * 不用配 DNS 记录，也不用在本地签证书：`reality` / `shadowtls` 模式下引擎只是把握手转发给
@@ -197,7 +197,7 @@ bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
 
 * Docker 由 `https://get.docker.com` 安装，Compose 取自官方 `docker/compose` 仓库的
   release 产物。
-* `tgbot.py` 以及放在 `/opt/reality-ezpz` 下的本脚本副本都从本仓库拉取；机器人优先使用
+* `tgbot.py` 以及放在 `/opt/reality` 下的本脚本副本都从本仓库拉取；机器人优先使用
   本地副本，仅在缺失时才联网下载。
 * 路由规则集来自 SagerNet 官方 `sing-geosite` 仓库；私有地址段直接内联写进生成的配置，
   不再下载第三方 geoip 文件。
@@ -214,7 +214,7 @@ bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
 ```bash
 BACKUP_UPLOAD_URL=https://files.example.com/upload \
 RULESET_BASE_URL=https://rules.example.com/sing-box \
-  bash /opt/reality-ezpz/reality-ezpz.sh
+  bash /opt/reality/reality.sh
 ```
 
 ---
@@ -250,7 +250,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `--restore <url\|file>` | 从备份恢复 |
 | `--backup-password <password>` | 为备份设置密码 |
 | `-m, --menu` | 打开 TUI |
-| `-u, --uninstall` | 卸载服务栈与 `/opt/reality-ezpz` |
+| `-u, --uninstall` | 卸载服务栈与 `/opt/reality` |
 | `-h, --help` | 查看帮助 |
 
 ---
@@ -258,10 +258,10 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 ## 用户管理
 
 ```bash
-bash /opt/reality-ezpz/reality-ezpz.sh --add-user john
-bash /opt/reality-ezpz/reality-ezpz.sh --show-user john   # 客户端链接 + 二维码
-bash /opt/reality-ezpz/reality-ezpz.sh --list-users
-bash /opt/reality-ezpz/reality-ezpz.sh --delete-user john
+bash /opt/reality/reality.sh --add-user john
+bash /opt/reality/reality.sh --show-user john   # 客户端链接 + 二维码
+bash /opt/reality/reality.sh --list-users
+bash /opt/reality/reality.sh --delete-user john
 ```
 
 用户名只允许字母与数字（`A-Z`、`a-z`、`0-9`）。
@@ -269,13 +269,13 @@ bash /opt/reality-ezpz/reality-ezpz.sh --delete-user john
 ## Telegram 机器人
 
 ```bash
-bash /opt/reality-ezpz/reality-ezpz.sh \
+bash /opt/reality/reality.sh \
   --enable-tgbot true \
   --tgbot-token 123456789:AA... \
   --tgbot-admins your_telegram_username
 ```
 
-机器人运行在独立容器中，挂载 `/opt/reality-ezpz`，并以 argv 列表方式调用本地脚本副本——
+机器人运行在独立容器中，挂载 `/opt/reality`，并以 argv 列表方式调用本地脚本副本——
 来自按钮的用户名不可能被当作 shell 命令执行。支持的命令：`/start`、`/add`、`/delete`、
 `/list`、`/show`。
 
@@ -285,17 +285,17 @@ bash /opt/reality-ezpz/reality-ezpz.sh \
 ## Cloudflare WARP
 
 ```bash
-bash /opt/reality-ezpz/reality-ezpz.sh --enable-warp true
-bash /opt/reality-ezpz/reality-ezpz.sh --enable-warp true --warp-license XXXXXXXX-XXXXXXXX-XXXXXXXX
+bash /opt/reality/reality.sh --enable-warp true
+bash /opt/reality/reality.sh --enable-warp true --warp-license XXXXXXXX-XXXXXXXX-XXXXXXXX
 ```
 
 注册过程会向 Cloudflare 申请一个免费 WARP 设备，把设备 id、token、client id、接口地址以及
-本机生成的私钥写入 `/opt/reality-ezpz/config`，并作为引擎出口使用。关闭 WARP 时会在
+本机生成的私钥写入 `/opt/reality/config`，并作为引擎出口使用。关闭 WARP 时会在
 Cloudflare 侧删除该设备。
 
 ## 内核调优与 BBR
 
-每次运行都会写入并应用 `/etc/sysctl.d/99-reality-ezpz.conf`，因此调优以标准 sysctl drop-in 的
+每次运行都会写入并应用 `/etc/sysctl.d/99-reality.conf`，因此调优以标准 sysctl drop-in 的
 形式在重启后依然有效。除 socket 缓冲、backlog、conntrack 等参数外，**BBR 默认开启**：
 
 ```ini
@@ -307,7 +307,7 @@ BBR 是内核自带能力，不需要从软件源安装任何东西 —— 脚�
 `sch_fq`，写入上面两个键。它不做的是「假装成功」：状态会从 `/proc` 读回来并如实汇报。
 
 ```
-$ bash /opt/reality-ezpz/reality-ezpz.sh --show-server-config
+$ bash /opt/reality/reality.sh --show-server-config
 ...
 BBR: ON (kernel: bbr, qdisc: fq)
 ```
@@ -326,8 +326,8 @@ BBR: ON (kernel: bbr, qdisc: fq)
 `congestion_control=bbr`，那是客户端传输层设置，与本项互相独立。
 
 ```bash
-bash /opt/reality-ezpz/reality-ezpz.sh --enable-bbr false   # 关闭
-bash /opt/reality-ezpz/reality-ezpz.sh --enable-bbr true    # 重新开启
+bash /opt/reality/reality.sh --enable-bbr false   # 关闭
+bash /opt/reality/reality.sh --enable-bbr true    # 重新开启
 ```
 
 ---
@@ -336,19 +336,19 @@ bash /opt/reality-ezpz/reality-ezpz.sh --enable-bbr true    # 重新开启
 
 ```bash
 # 上传加密备份，输出下载地址
-bash /opt/reality-ezpz/reality-ezpz.sh --backup --backup-password '一个强密码'
+bash /opt/reality/reality.sh --backup --backup-password '一个强密码'
 
 # 在本机或其他机器上恢复
-bash /opt/reality-ezpz/reality-ezpz.sh --restore <url 或路径> --backup-password '一个强密码'
+bash /opt/reality/reality.sh --restore <url 或路径> --backup-password '一个强密码'
 ```
 
-备份包内含用户列表与 `/opt/reality-ezpz/config`。请务必设置密码：不设密码时压缩包就是
+备份包内含用户列表与 `/opt/reality/config`。请务必设置密码：不设密码时压缩包就是
 明文的密钥集合。
 
 ## 升级
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh)
 ```
 
 重复执行安装脚本会保留原有配置，缺失的配置项（例如新引入的 `http_port`、`camouflage`）
@@ -356,20 +356,27 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 请注意当前默认值已改为 `8443`，明文 HTTP 侧也从 `80` 变为 `8080`；如需保持旧布局，请显式
 传入 `--port 443`。
 
-从更早的版本升级时还有一处修复值得一提：`/opt/reality-ezpz/reality-ezpz.sh` 过去只在启用
-Telegram 机器人时才会生成，因此按文档执行 `bash /opt/reality-ezpz/reality-ezpz.sh --menu`
+项目名从 `reality-ezpz` 改为 `reality` 之后，安装目录也从 `/opt/reality-ezpz` 变为 `/opt/reality`。
+用旧版本部署过的服务器**无需手工搬迁**：脚本每次启动都会先检查旧目录，存在的话先停掉旧的
+compose 项目（旧容器 `reality-ezpz-engine-1` / `reality-ezpz-nginx-1` 占着 `8443` 与 `8080`，
+不停掉新容器起不来），再把整棵目录移动到新位置——密钥、用户列表与网站都原样保留——最后按新
+项目名 `reality` 重建容器。整个过程只移动、不删除数据。如果新旧目录同时存在，脚本会保留新目录
+并给出告警，把旧目录留给你自行处置。
+
+从更早的版本升级时还有一处修复值得一提：`/opt/reality/reality.sh` 过去只在启用
+Telegram 机器人时才会生成，因此按文档执行 `bash /opt/reality/reality.sh --menu`
 会报文件不存在。现在这份副本与机器人开关无关，重跑一次安装命令即可补上。
 
 从还没有 `camouflage` 的版本升级时，有两处行为变化：
 
 * 远端伪装目标会沿用旧的 `domain` 值，回落目标不会在升级中改变。
 * HTTP 端口过去是把远端站点的内容以明文 HTTP 转发出来，现在改为提供**你自己的**网站。
-  想保持原来的观感，可把那个站点的页面复制到 `/opt/reality-ezpz/config/website`。
+  想保持原来的观感，可把那个站点的页面复制到 `/opt/reality/config/website`。
 
 ## 卸载
 
 ```bash
-bash /opt/reality-ezpz/reality-ezpz.sh --uninstall   # 不会卸载 Docker 本身
+bash /opt/reality/reality.sh --uninstall   # 不会卸载 Docker 本身
 ```
 
 ---
@@ -391,17 +398,18 @@ bash /opt/reality-ezpz/reality-ezpz.sh --uninstall   # 不会卸载 Docker 本�
 
 | 现象 | 排查方向 |
 | --- | --- |
-| `bash: /opt/reality-ezpz/reality-ezpz.sh: No such file or directory` | 该副本由安装器放置。旧版本只在启用 Telegram 机器人时才创建它，重跑一次安装命令即可补上；或手动 `curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh -o /opt/reality-ezpz/reality-ezpz.sh` |
+| `bash: /opt/reality/reality.sh: No such file or directory` | 该副本由安装器放置。旧版本只在启用 Telegram 机器人时才创建它，重跑一次安装命令即可补上；或手动 `curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh -o /opt/reality/reality.sh` |
 | 提示 `Port 80 must be free ...` | 你选择了 `letsencrypt`，但 80 端口已被其他服务占用 |
-| 容器反复重启 | `docker logs $(docker compose -p reality-ezpz ps -q engine)` |
+| 升级后提示 `both /opt/reality-ezpz and /opt/reality exist` | 两个目录同时存在，脚本保留了 `/opt/reality` 并跳过迁移；确认数据在哪一边后手工删掉另一个 |
+| 容器反复重启 | `docker logs $(docker compose -p reality ps -q engine)` |
 | 客户端连不上 | 主端口是否放行（防火墙 / 安全组），SNI 域名是否匹配 |
 | 提示 `WARP account creation has been failed!` | 能否访问 `api.cloudflareclient.com` |
 | 提示 `BBR was requested but is not active` | 当前内核没有 BBR（需 4.9+），或容器无法加载宿主机模块；`--enable-bbr false` 可消除该提示 |
 | 提示 `these kernel settings ... were skipped` | 列出的键在当前内核上不存在；其余键已应用，不影响 BBR |
 | 提示 `the SNI (...) differs from the camouflage site (...)` | 你同时传了 `--domain` 与 `--camouflage`；除确有需要外，两者应指向同一个站点 |
-| HTTP 端口上显示的是占位首页 | 把你的文件放进 `/opt/reality-ezpz/config/website` —— `index.html` 只在目录为空时生成 |
+| HTTP 端口上显示的是占位首页 | 把你的文件放进 `/opt/reality/config/website` —— `index.html` 只在目录为空时生成 |
 | 伪装站点连接失败 | `--camouflage` 必须是本机能够访问的真实站点，本机不会为它提供任何内容 |
-| Telegram 机器人无响应 | Token / 管理员名单是否正确，`/opt/reality-ezpz/tgbot/tgbot.py` 是否存在 |
+| Telegram 机器人无响应 | Token / 管理员名单是否正确，`/opt/reality/tgbot/tgbot.py` 是否存在 |
 | xray 容器启动即退出 | 官方镜像会降权运行，证书文件必须可读（安装脚本已 chmod 到 `644`） |
 
 ---

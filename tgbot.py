@@ -1,7 +1,7 @@
-"""Telegram bot for managing reality-ezpz users.
+"""Telegram bot for managing reality users.
 
-The bot runs inside the `tgbot` container that reality-ezpz.sh generates, and
-that container bind-mounts the whole reality-ezpz directory at /opt/reality-ezpz.
+The bot runs inside the `tgbot` container that reality.sh generates, and
+that container bind-mounts the whole reality directory at /opt/reality.
 The local copy of the installer script is therefore used directly instead of
 re-downloading it from GitHub for every single command (the previous behaviour,
 which was also the reason the bot stopped working entirely while offline).
@@ -28,15 +28,15 @@ from telegram.ext import (
     Updater,
 )
 
-REALITY_PATH = os.environ.get('REALITY_PATH', '/opt/reality-ezpz')
-LOCAL_SCRIPT = os.path.join(REALITY_PATH, 'reality-ezpz.sh')
-SCRIPT_CACHE = '/tmp/reality-ezpz.sh'
+REALITY_PATH = os.environ.get('REALITY_PATH', '/opt/reality')
+LOCAL_SCRIPT = os.path.join(REALITY_PATH, 'reality.sh')
+SCRIPT_CACHE = '/tmp/reality.sh'
 # Download fallback only: used when the script is not bind-mounted into the
 # container. It points at this project's own repository, and can be overridden
 # to self-host through REALITY_SCRIPT_URL.
 REMOTE_SCRIPT = os.environ.get(
     'REALITY_SCRIPT_URL',
-    'https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh',
+    'https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh',
 )
 
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '').strip()
@@ -56,8 +56,8 @@ COMMAND_TIMEOUT = 300
 TELEGRAM_CAPTION_LIMIT = 1024
 
 
-class EzpzError(RuntimeError):
-    """reality-ezpz.sh exited with a non-zero status."""
+class RealityError(RuntimeError):
+    """reality.sh exited with a non-zero status."""
 
 
 def resolve_script():
@@ -73,15 +73,15 @@ def resolve_script():
                 stderr=subprocess.PIPE,
             )
         except (OSError, subprocess.CalledProcessError):
-            raise EzpzError(
-                'reality-ezpz.sh is neither mounted nor downloadable, '
+            raise RealityError(
+                'reality.sh is neither mounted nor downloadable, '
                 'check the container volumes and network'
             )
     return SCRIPT_CACHE
 
 
-def run_ezpz(*arguments):
-    """Run reality-ezpz.sh and return its stdout.
+def run_reality(*arguments):
+    """Run reality.sh and return its stdout.
 
     The arguments are passed as an argv list and never interpolated into a shell
     string, so a username coming from a callback button can not inject commands.
@@ -96,17 +96,17 @@ def run_ezpz(*arguments):
             timeout=COMMAND_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        raise EzpzError(f'reality-ezpz.sh timed out after {COMMAND_TIMEOUT}s')
+        raise RealityError(f'reality.sh timed out after {COMMAND_TIMEOUT}s')
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or '').strip().splitlines()
-        raise EzpzError(detail[-1] if detail else f'exit status {result.returncode}')
+        raise RealityError(detail[-1] if detail else f'exit status {result.returncode}')
     return result.stdout
 
 
 def get_users():
     """Return the existing usernames, ignoring unrelated banner output."""
     users = []
-    for line in run_ezpz('--list-users').splitlines():
+    for line in run_reality('--list-users').splitlines():
         line = line.strip()
         if USERNAME_RE.match(line):
             users.append(line)
@@ -116,19 +116,19 @@ def get_users():
 def get_configs(username):
     """Return the client configuration strings printed by `--show-user`."""
     configs = []
-    for line in run_ezpz('--show-user', username).splitlines():
+    for line in run_reality('--show-user', username).splitlines():
         line = line.strip()
         if CONFIG_LINE_RE.search(line):
             configs.append(line)
     return configs
 
 
-def add_user_ezpz(username):
-    run_ezpz('--add-user', username)
+def add_user_via_script(username):
+    run_reality('--add-user', username)
 
 
-def delete_user_ezpz(username):
-    run_ezpz('--delete-user', username)
+def delete_user_via_script(username):
+    run_reality('--delete-user', username)
 
 
 def is_ipv6_config(config):
@@ -185,9 +185,9 @@ def restricted(handler):
             return None
         try:
             return handler(update, context, *args, **kwargs)
-        except EzpzError as error:
+        except RealityError as error:
             context.bot.send_message(
-                chat_id=chat.id, text=f'reality-ezpz failed: {error}'
+                chat_id=chat.id, text=f'reality failed: {error}'
             )
         except Exception as error:  # noqa: BLE001 - a bad command must not stop polling
             context.bot.send_message(chat_id=chat.id, text=f'Unexpected error: {error}')
@@ -206,7 +206,7 @@ def start(update, context):
     send_menu(
         context,
         update.effective_chat.id,
-        'Reality-EZPZ User Management Bot\n\nChoose an option:',
+        'Reality User Management Bot\n\nChoose an option:',
         keyboard,
     )
 
@@ -276,7 +276,7 @@ def add_user(update, context):
 
 @restricted
 def approve_delete(update, context, username):
-    delete_user_ezpz(username)
+    delete_user_via_script(username)
     send_menu(
         context,
         update.effective_chat.id,
@@ -338,7 +338,7 @@ def user_input(update, context):
         update.message.reply_text(f'User "{username}" exists, try another username.')
         add_user(update, context)
         return
-    add_user_ezpz(username)
+    add_user_via_script(username)
     update.message.reply_text(f'User "{username}" is created.')
     show_user(update, context, username)
 

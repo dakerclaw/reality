@@ -64,12 +64,12 @@ with three design rules on top of the upstream feature set:
 ## Quick start
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh)
 ```
 
-The installer writes everything to `/opt/reality-ezpz`, starts the stack, prints
+The installer writes everything to `/opt/reality`, starts the stack, prints
 the first client configuration and opens the TUI on demand. It also places **a
-copy of this script itself at `/opt/reality-ezpz/reality-ezpz.sh`**, which is what
+copy of this script itself at `/opt/reality/reality.sh`**, which is what
 every later management command runs; because that copy lives in the configuration
 directory, each run refreshes it to the current version. This has nothing to do
 with the Telegram bot being enabled — the bot merely mounts the same directory.
@@ -78,19 +78,19 @@ Common invocations:
 
 ```bash
 # plain install with defaults (reality, sing-box, port 8443, website on 8080)
-bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh)
 
 # name the remote site the camouflage falls back to (also becomes the SNI)
-bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
+bash <(curl -fsSL .../reality.sh) --camouflage www.microsoft.com
 
 # pick your own ports, no website at all
-bash <(curl -fsSL .../reality-ezpz.sh) --port 2087 --http-port off
+bash <(curl -fsSL .../reality.sh) --port 2087 --http-port off
 
 # letsencrypt certificate (this mode is the only one that binds port 80)
-bash <(curl -fsSL .../reality-ezpz.sh) --security letsencrypt --server vpn.example.com
+bash <(curl -fsSL .../reality.sh) --security letsencrypt --server vpn.example.com
 
 # open the management menu later
-bash /opt/reality-ezpz/reality-ezpz.sh --menu
+bash /opt/reality/reality.sh --menu
 ```
 
 ---
@@ -130,10 +130,10 @@ Two different jobs, deliberately kept apart:
 
 ```bash
 # camouflage = www.microsoft.com, own site on 8080
-bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
+bash <(curl -fsSL .../reality.sh) --camouflage www.microsoft.com
 
 # serve your own site: drop files into the docroot, nothing else to do
-ls /opt/reality-ezpz/config/website
+ls /opt/reality/config/website
 ```
 
 Notes:
@@ -153,7 +153,7 @@ Notes:
 * Upgrading from a version without `--camouflage` carries the old `domain` value
   over to it, so the fallback target does not change under your feet.
 * The first run writes a neutral placeholder page to
-  `/opt/reality-ezpz/config/website/index.html`. **An existing file is never
+  `/opt/reality/config/website/index.html`. **An existing file is never
   overwritten** — put your own site there and it survives upgrades.
 * In the `reality`/`shadowtls` modes this website is the whole HTTP surface;
   nothing is relayed to the remote camouflage site over plain HTTP anymore.
@@ -176,10 +176,10 @@ So for a plain IP-only box there is nothing to name at all:
 
 ```bash
 # reality + sing-box, camouflage defaults to www.fastly.com — nothing to supply
-bash <(curl -fsSL .../reality-ezpz.sh)
+bash <(curl -fsSL .../reality.sh)
 
 # still no domain, but choose what a probe will see instead
-bash <(curl -fsSL .../reality-ezpz.sh) --camouflage www.microsoft.com
+bash <(curl -fsSL .../reality.sh) --camouflage www.microsoft.com
 ```
 
 * No DNS record to create and no certificate to issue locally: in the
@@ -217,7 +217,7 @@ Other sources:
 
 * Docker is installed from `https://get.docker.com`, Compose from the official
   `docker/compose` GitHub release.
-* `tgbot.py` and the copy of this script placed in `/opt/reality-ezpz` are pulled
+* `tgbot.py` and the copy of this script placed in `/opt/reality` are pulled
   from this repository; the bot prefers the local copy and only downloads when it
   is missing.
 * Route rule sets come from SagerNet's official `sing-geosite` repository. The
@@ -237,7 +237,7 @@ Two network dependencies are not first-party and can be redirected:
 ```bash
 BACKUP_UPLOAD_URL=https://files.example.com/upload \
 RULESET_BASE_URL=https://rules.example.com/sing-box \
-  bash /opt/reality-ezpz/reality-ezpz.sh
+  bash /opt/reality/reality.sh
 ```
 
 ---
@@ -273,7 +273,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `--restore <url\|file>` | Restore from a backup |
 | `--backup-password <password>` | Password-protect the backup |
 | `-m, --menu` | Open the TUI |
-| `-u, --uninstall` | Remove the stack and `/opt/reality-ezpz` |
+| `-u, --uninstall` | Remove the stack and `/opt/reality` |
 | `-h, --help` | Show help |
 
 ---
@@ -281,10 +281,10 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 ## User management
 
 ```bash
-bash /opt/reality-ezpz/reality-ezpz.sh --add-user john
-bash /opt/reality-ezpz/reality-ezpz.sh --show-user john   # client link + QR code
-bash /opt/reality-ezpz/reality-ezpz.sh --list-users
-bash /opt/reality-ezpz/reality-ezpz.sh --delete-user john
+bash /opt/reality/reality.sh --add-user john
+bash /opt/reality/reality.sh --show-user john   # client link + QR code
+bash /opt/reality/reality.sh --list-users
+bash /opt/reality/reality.sh --delete-user john
 ```
 
 Usernames must be alphanumeric (`A-Z`, `a-z`, `0-9`).
@@ -292,13 +292,13 @@ Usernames must be alphanumeric (`A-Z`, `a-z`, `0-9`).
 ## Telegram bot
 
 ```bash
-bash /opt/reality-ezpz/reality-ezpz.sh \
+bash /opt/reality/reality.sh \
   --enable-tgbot true \
   --tgbot-token 123456789:AA... \
   --tgbot-admins your_telegram_username
 ```
 
-The bot runs in its own container, mounts `/opt/reality-ezpz` and executes the
+The bot runs in its own container, mounts `/opt/reality` and executes the
 locally mounted copy of this script with an argv list — a username coming from a
 button can never be interpreted as a shell command. Bot commands: `/start`,
 `/add`, `/delete`, `/list`, `/show`.
@@ -309,18 +309,18 @@ root-equivalent permissions. Enable it only if you need it.
 ## Cloudflare WARP
 
 ```bash
-bash /opt/reality-ezpz/reality-ezpz.sh --enable-warp true
-bash /opt/reality-ezpz/reality-ezpz.sh --enable-warp true --warp-license XXXXXXXX-XXXXXXXX-XXXXXXXX
+bash /opt/reality/reality.sh --enable-warp true
+bash /opt/reality/reality.sh --enable-warp true --warp-license XXXXXXXX-XXXXXXXX-XXXXXXXX
 ```
 
 Registration creates a free WARP device against Cloudflare, stores the device id,
 token, client id, interface addresses and the locally generated private key in
-`/opt/reality-ezpz/config`, and uses the device as the engine's outbound. Turning
+`/opt/reality/config`, and uses the device as the engine's outbound. Turning
 WARP off deletes the device on Cloudflare's side.
 
 ## Kernel tuning and BBR
 
-Every run writes `/etc/sysctl.d/99-reality-ezpz.conf` and applies it, so the
+Every run writes `/etc/sysctl.d/99-reality.conf` and applies it, so the
 tuning survives reboots by being a normal sysctl drop-in. On top of the socket
 buffer, backlog and conntrack values, **BBR is enabled by default**:
 
@@ -334,7 +334,7 @@ installer loads `tcp_bbr` and `sch_fq` and writes the two keys. What it does *no
 do is pretend: the state is read back from `/proc` and reported.
 
 ```
-$ bash /opt/reality-ezpz/reality-ezpz.sh --show-server-config
+$ bash /opt/reality/reality.sh --show-server-config
 ...
 BBR: ON (kernel: bbr, qdisc: fq)
 ```
@@ -354,8 +354,8 @@ additionally advertises `congestion_control=bbr` in its QUIC configuration, whic
 is a client-side transport setting and is independent of this.
 
 ```bash
-bash /opt/reality-ezpz/reality-ezpz.sh --enable-bbr false   # turn it off
-bash /opt/reality-ezpz/reality-ezpz.sh --enable-bbr true    # turn it back on
+bash /opt/reality/reality.sh --enable-bbr false   # turn it off
+bash /opt/reality/reality.sh --enable-bbr true    # turn it back on
 ```
 
 ---
@@ -364,19 +364,19 @@ bash /opt/reality-ezpz/reality-ezpz.sh --enable-bbr true    # turn it back on
 
 ```bash
 # upload an encrypted archive, prints a URL
-bash /opt/reality-ezpz/reality-ezpz.sh --backup --backup-password 'a strong password'
+bash /opt/reality/reality.sh --backup --backup-password 'a strong password'
 
 # restore on this or another machine
-bash /opt/reality-ezpz/reality-ezpz.sh --restore <url-or-path> --backup-password 'a strong password'
+bash /opt/reality/reality.sh --restore <url-or-path> --backup-password 'a strong password'
 ```
 
-The archive contains the user list and `/opt/reality-ezpz/config`. Always use a
+The archive contains the user list and `/opt/reality/config`. Always use a
 password: without one the archive is a plain zip of your keys.
 
 ## Upgrade
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh)
 ```
 
 Re-running the installer keeps the existing configuration; missing keys (for
@@ -386,9 +386,19 @@ an earlier version that pinned the main port to `443`, note that the default is
 now `8443` and the plain HTTP side moved from `80` to `8080` — set `--port 443`
 explicitly if you want to keep the old layout.
 
-One older fix is worth knowing about: `/opt/reality-ezpz/reality-ezpz.sh` used to
+Now that the project is called `reality` rather than `reality-ezpz`, the install
+directory moved from `/opt/reality-ezpz` to `/opt/reality`. A server deployed with
+an older release needs **no manual migration**: on every start the script looks for
+the old directory, stops the old compose project first (its containers
+`reality-ezpz-engine-1` / `reality-ezpz-nginx-1` keep holding `8443` and `8080`, so
+the new ones could not start), then moves the whole tree — keys, user list and
+website included — and recreates the containers under the new project name. It only
+moves data, never deletes it. If both directories exist, the script keeps the new
+one and warns, leaving the old one for you to deal with.
+
+One older fix is worth knowing about: `/opt/reality/reality.sh` used to
 be created only when the Telegram bot was enabled, so the documented
-`bash /opt/reality-ezpz/reality-ezpz.sh --menu` failed with "No such file or
+`bash /opt/reality/reality.sh --menu` failed with "No such file or
 directory". The copy no longer depends on the bot; re-running the installer once
 adds it.
 
@@ -398,12 +408,12 @@ Two behaviour changes when upgrading from a pre-`camouflage` version:
   fallback target stays what it was.
 * The HTTP port used to relay the remote site over plain HTTP; it now serves
   **your own** website. To keep the old look, put a copy of that site's content
-  into `/opt/reality-ezpz/config/website`.
+  into `/opt/reality/config/website`.
 
 ## Uninstall
 
 ```bash
-bash /opt/reality-ezpz/reality-ezpz.sh --uninstall   # keeps the Docker packages
+bash /opt/reality/reality.sh --uninstall   # keeps the Docker packages
 ```
 
 ---
@@ -430,17 +440,18 @@ bash /opt/reality-ezpz/reality-ezpz.sh --uninstall   # keeps the Docker packages
 
 | Symptom | Check |
 | --- | --- |
-| `bash: /opt/reality-ezpz/reality-ezpz.sh: No such file or directory` | The installer places that copy. Older versions only created it when the Telegram bot was enabled; re-run the installer to add it, or fetch it directly with `curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh -o /opt/reality-ezpz/reality-ezpz.sh` |
+| `bash: /opt/reality/reality.sh: No such file or directory` | The installer places that copy. Older versions only created it when the Telegram bot was enabled; re-run the installer to add it, or fetch it directly with `curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh -o /opt/reality/reality.sh` |
 | `Port 80 must be free ...` | You selected `letsencrypt` while another service owns port 80 |
-| Container restarts in a loop | `docker logs $(docker compose -p reality-ezpz ps -q engine)` |
+| `both /opt/reality-ezpz and /opt/reality exist` after an upgrade | Both directories are present, so the script kept `/opt/reality` and skipped the migration; check which one holds your data and remove the other by hand |
+| Container restarts in a loop | `docker logs $(docker compose -p reality ps -q engine)` |
 | Client cannot connect | The main port is reachable (firewall/security group), and the SNI domain matches |
 | `WARP account creation has been failed!` | Outbound access to `api.cloudflareclient.com` |
 | `BBR was requested but is not active` | The running kernel has no BBR (needs 4.9+) or is a container that cannot load its host's modules; `--enable-bbr false` silences it |
 | `these kernel settings ... were skipped` | The listed keys do not exist on this kernel; the rest were applied and BBR is unaffected |
 | `the SNI (...) differs from the camouflage site (...)` | You passed both `--domain` and `--camouflage`; point them at the same site unless you have a reason not to |
-| The HTTP port shows the placeholder page | Put your files into `/opt/reality-ezpz/config/website` — `index.html` is only created when nothing is there |
+| The HTTP port shows the placeholder page | Put your files into `/opt/reality/config/website` — `index.html` is only created when nothing is there |
 | The camouflage site is unreachable from the server | `--camouflage` must be a real site the machine can reach; nothing is served locally for it |
-| Telegram bot silent | Token/admins correct, and `/opt/reality-ezpz/tgbot/tgbot.py` exists |
+| Telegram bot silent | Token/admins correct, and `/opt/reality/tgbot/tgbot.py` exists |
 | `xray` exits immediately | The official image drops privileges; certificate files must be readable (the installer chmods them to `644`) |
 
 ---
