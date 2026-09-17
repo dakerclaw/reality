@@ -205,6 +205,8 @@ function show_help {
   echo "      --default             Restore default configuration"
   echo "  -r  --restart             Restart services"
   echo "  -u, --uninstall           Uninstall reality"
+  echo "                            Removes the stack and /opt/reality, plus an installation left by an older"
+  echo "                            release under /opt/reality-ezpz and the kernel tuning drop-in. Docker is kept."
   echo "      --enable-safenet <true|false> Enable or disable safenet (blocking malware and adult content)"
   echo "      --enable-bbr <true|false> Enable or disable the BBR congestion control (default: ${defaults[bbr]})"
   echo "                            BBR is a kernel feature: this loads tcp_bbr/sch_fq and writes the matching sysctls,"
@@ -502,10 +504,6 @@ function parse_args {
         ;;
     esac
   done
-
-  if [[ ${args[uninstall]} == true ]]; then
-    uninstall
-  fi
 
   if [[ -n ${args[warp_license]} ]]; then
     args[warp]=ON
@@ -921,17 +919,53 @@ function generate_keys {
   config_file[service_path]=$(openssl rand -hex 4)
 }
 
-function uninstall {
-  if docker compose >/dev/null 2>&1; then
-    docker compose --project-directory "${config_path}" down --timeout 2 || true
-    docker compose --project-directory "${config_path}" -p ${compose_project} down --timeout 2 || true
-    docker compose --project-directory "${config_path}/tgbot" -p ${tgbot_project} down --timeout 2 || true
+# Brings one compose project down, then makes sure its containers are really gone.
+# `docker compose down` alone is not enough: a Compose v1 binary parses the
+# generated, version-less compose file as the legacy format (top-level keys read
+# as service names), and a compose file that was already deleted leaves the daemon
+# nothing to stop - either way the containers survive and keep holding 8443/8080.
+# Removing them by project label closes both holes.
+# Uninstall also runs before install_docker has had a chance to resolve docker_cmd,
+# so this detects the compose command itself instead of relying on that variable.
+function remove_compose_project {
+  local directory="$1"
+  local project="$2"
+  local container
+  if docker compose version >/dev/null 2>&1; then
+    docker compose --project-directory "${directory}" -p "${project}" down --remove-orphans --timeout 2 >/dev/null 2>&1 || true
   elif command -v docker-compose >/dev/null 2>&1; then
-    docker-compose --project-directory "${config_path}" down --timeout 2 || true
-    docker-compose --project-directory "${config_path}" -p ${compose_project} down --timeout 2 || true
-    docker-compose --project-directory "${config_path}/tgbot" -p ${tgbot_project} down --timeout 2 || true
+    docker-compose --project-directory "${directory}" -p "${project}" down --remove-orphans --timeout 2 >/dev/null 2>&1 || true
   fi
-  rm -rf "${config_path}"
+  if command -v docker >/dev/null 2>&1; then
+    for container in $(docker ps -aq --filter "label=com.docker.compose.project=${project}" 2>/dev/null || true); do
+      docker rm -f "${container}" >/dev/null 2>&1 || true
+    done
+  fi
+  return 0
+}
+
+function uninstall {
+  # Releases before this one kept everything in /opt/reality-ezpz and ran their
+  # containers under the compose project "reality-ezpz". Container names derive
+  # from the project name, so a layout that is not torn down here keeps holding
+  # 8443/8080 and makes a later reinstall fail.
+  # Both layouts are removed outright rather than migrated: the single caller runs
+  # this before migrate_legacy_install, which would otherwise move the old tree
+  # into config_path and rewrite the kernel tuning drop-in only for all of it to be
+  # deleted right after - and would abort the uninstall if the move failed.
+  # The legacy path is a parameter only so the regression suite can point it at a
+  # scratch directory instead of the real /opt; the single caller omits it.
+  local legacy_config_path="${1:-/opt/reality-ezpz}"
+  local legacy_project='reality-ezpz'
+  local entry
+  for entry in "${config_path}:${compose_project}" "${config_path}/tgbot:${tgbot_project}" \
+    "${legacy_config_path}:${legacy_project}" "${legacy_config_path}/tgbot:${tgbot_project}"; do
+    remove_compose_project "${entry%%:*}" "${entry##*:}"
+  done
+  # The kernel tuning drop-in was renamed along with the project. Leaving either
+  # name behind would keep applying its BBR settings after reality is gone.
+  rm -f '/etc/sysctl.d/99-reality.conf' '/etc/sysctl.d/99-reality-ezpz.conf'
+  rm -rf "${config_path}" "${legacy_config_path}"
   echo "Reality uninstalled successfully."
   exit 0
 }
@@ -3349,6 +3383,13 @@ fi
 if [[ $EUID -ne 0 ]]; then
     echo "This script must be run as root."
     exit 1
+fi
+# --uninstall runs before the migration on purpose: it removes the old layout
+# itself, so there is nothing to migrate, and migrating first would rewrite the
+# system for an installation that is about to be deleted. It sits after the root
+# check because it needs to stop containers and delete /opt.
+if [[ ${args[uninstall]} == true ]]; then
+  uninstall
 fi
 # Deliberately early: --backup and --restore read the configuration directory
 # directly, so a server still using the old layout has to be migrated before any

@@ -283,7 +283,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `--restore <url\|file>` | Restore from a backup |
 | `--backup-password <password>` | Password-protect the backup |
 | `-m, --menu` | Open the TUI |
-| `-u, --uninstall` | Remove the stack and `/opt/reality` |
+| `-u, --uninstall` | Remove the stack and delete `/opt/reality`; an install left by an older release under `/opt/reality-ezpz` and the kernel tuning drop-in go too |
 | `-h, --help` | Show help |
 
 ---
@@ -448,6 +448,13 @@ script copy inside the configuration directory is refreshed too.
 ```bash
 bash /opt/reality/reality.sh --uninstall   # keeps the Docker packages
 ```
+
+`--uninstall` stops and removes every container this project created (engine, nginx, haproxy,
+certbot, telegram bot), then deletes the configuration directory and the kernel tuning drop-in
+`/etc/sysctl.d/99-reality.conf`; the images are kept. On a machine upgraded from an older release
+it also cleans up the legacy directory `/opt/reality-ezpz` and its old compose project
+(`reality-ezpz`), so nothing is left holding 8443/8080. It needs root; the Docker packages and
+`/etc/docker/daemon.json` are left alone.
 
 ---
 

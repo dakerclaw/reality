@@ -257,7 +257,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `--restore <url\|file>` | 从备份恢复 |
 | `--backup-password <password>` | 为备份设置密码 |
 | `-m, --menu` | 打开 TUI |
-| `-u, --uninstall` | 卸载服务栈与 `/opt/reality` |
+| `-u, --uninstall` | 卸载服务栈并删除 `/opt/reality`；旧版遗留的 `/opt/reality-ezpz` 与内核调优文件也会一并清理 |
 | `-h, --help` | 查看帮助 |
 
 ---
@@ -408,6 +408,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 ```bash
 bash /opt/reality/reality.sh --uninstall   # 不会卸载 Docker 本身
 ```
+
+`--uninstall` 会停掉并删除本项目创建的全部容器（引擎、nginx、haproxy、certbot、telegram bot），
+再删除配置目录与内核调优文件 `/etc/sysctl.d/99-reality.conf`；镜像保留。从更早版本升级上来的
+机器还会一并清理旧部署目录 `/opt/reality-ezpz` 与它的旧 compose 项目 `reality-ezpz`，所以不会留下
+仍占着 8443/8080 的容器。需要 root 权限；Docker 本身与 `/etc/docker/daemon.json` 保持不动。
 
 ---
 
