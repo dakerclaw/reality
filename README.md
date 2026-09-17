@@ -12,10 +12,10 @@
 
 1. **安装过程绝不占用知名端口。** 默认只绑定 `8443` 和 `8080`。端口 `80` 只有
    `letsencrypt` 模式会用（ACME HTTP-01 协议强制要求），且必须由你主动选择。
-2. **每个组件都来自它自己的上游。** 容器镜像全部使用官方镜像（不再使用任何第三方转载镜像），
-   Cloudflare WARP 直接调用 Cloudflare 官方接口注册，不再依赖社区的 `wgcf` 镜像。
+2. **每个组件都来自它自己的上游。** 容器镜像全部使用官方镜像 ，
+   Cloudflare WARP 直接调用 Cloudflare 官方接口注册 。
 3. **伪装目标与自有网站彻底分离。** 代理端口把未通过校验的流量回落到部署时指定的
-   **远端真实大站**，nginx 则在 HTTP 端口上正常负载**你自己的网站**。详见
+   **远端真实大站**  ，nginx 则在 HTTP 端口上正常负载**你自己的网站**。详见
    [网站与伪装](#网站与伪装)。
 
 ---
@@ -23,8 +23,8 @@
 ## 功能特性
 
 * 自动安装并配置 Docker 与 Compose 插件
-* 引擎可选 `sing-box` / `xray`，TLS 可选 `reality` / `letsencrypt` / `selfsigned`
-* 传输协议：`tcp`、`http`、`grpc`、`ws`、`tuic`、`hysteria2`、`shadowtls`
+* 引擎可选 `sing-box` / `xray`，默认为 `sing-box` ；TLS 可选 `reality` / `letsencrypt` / `selfsigned` ，默认为 `reality` 。
+* 传输协议：`tcp`、`http`、`grpc`、`ws`、`tuic`、`hysteria2`、`shadowtls` ，默认为 `tcp`。
 * 多用户，每用户独立 UUID / 密码，输出客户端链接与二维码
 * Cloudflare WARP 出口（支持免费版与 WARP+ 授权），不引入任何额外镜像
 * 自动开启 BBR 拥塞控制（加载 `tcp_bbr` + `fq` 队列，写入 `/etc/sysctl.d`），
@@ -87,7 +87,6 @@ bash /opt/reality/reality.sh --menu
 
 ## 端口策略
 
-这是与上游差异最大的部分。
 
 | 监听用途 | 默认宿主端口 | 由谁控制 | 说明 |
 | --- | --- | --- | --- |
@@ -113,7 +112,7 @@ bash /opt/reality/reality.sh --menu
 
 | | 是什么 | 在哪里配置 |
 | --- | --- | --- |
-| **伪装** | 未通过校验的探测者在代理端口上看到的内容。`reality` 模式下引擎不自己应答 TLS 握手，而是把握手转发给远端真实站点；`shadowtls` 模式下该站点就是握手目标。 | `--camouflage <domain[:port]>`，一个远端真实站点，部署时输入 |
+| **伪装** | 未通过校验的探测者在代理端口上看到的内容。`reality` 模式下引擎不自己应答 TLS 握手，而是把握手转发给远端真实站点；`shadowtls` 模式下该站点就是握手目标。 | `--camouflage <domain[:port]>`，一个远端真实站点，部署时自动设定 |
 | **网站** | 你自己的正常网站，由 nginx 从 `./website` 目录提供。 | `--http-port <port>` |
 
 ```bash
@@ -394,26 +393,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 ```
 
 重复执行安装脚本会保留原有配置，缺失的配置项（例如新引入的 `http_port`、`camouflage`）
-会自动补上，配置目录里的脚本副本也会一并刷新。如果你之前部署的版本把主端口固定在 `443`，
-请注意当前默认值已改为 `8443`，明文 HTTP 侧也从 `80` 变为 `8080`；如需保持旧布局，请显式
-传入 `--port 443`。
-
-项目名从 `reality-ezpz` 改为 `reality` 之后，安装目录也从 `/opt/reality-ezpz` 变为 `/opt/reality`。
-用旧版本部署过的服务器**无需手工搬迁**：脚本每次启动都会先检查旧目录，存在的话先停掉旧的
-compose 项目（旧容器 `reality-ezpz-engine-1` / `reality-ezpz-nginx-1` 占着 `8443` 与 `8080`，
-不停掉新容器起不来），再把整棵目录移动到新位置——密钥、用户列表与网站都原样保留——最后按新
-项目名 `reality` 重建容器。整个过程只移动、不删除数据。如果新旧目录同时存在，脚本会保留新目录
-并给出告警，把旧目录留给你自行处置。
-
-从更早的版本升级时还有一处修复值得一提：`/opt/reality/reality.sh` 过去只在启用
-Telegram 机器人时才会生成，因此按文档执行 `bash /opt/reality/reality.sh --menu`
-会报文件不存在。现在这份副本与机器人开关无关，重跑一次安装命令即可补上。
-
-从还没有 `camouflage` 的版本升级时，有两处行为变化：
-
-* 远端伪装目标会沿用旧的 `domain` 值，回落目标不会在升级中改变。
-* HTTP 端口过去是把远端站点的内容以明文 HTTP 转发出来，现在改为提供**你自己的**网站。
-  想保持原来的观感，可把那个站点的页面复制到 `/opt/reality/config/website`。
+会自动补上，配置目录里的脚本副本也会一并刷新。
 
 ## 卸载
 
@@ -440,9 +420,7 @@ bash /opt/reality/reality.sh --uninstall   # 不会卸载 Docker 本身
 
 | 现象 | 排查方向 |
 | --- | --- |
-| `bash: /opt/reality/reality.sh: No such file or directory` | 该副本由安装器放置。旧版本只在启用 Telegram 机器人时才创建它，重跑一次安装命令即可补上；或手动 `curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh -o /opt/reality/reality.sh` |
 | 提示 `Port 80 must be free ...` | 你选择了 `letsencrypt`，但 80 端口已被其他服务占用 |
-| 升级后提示 `both /opt/reality-ezpz and /opt/reality exist` | 两个目录同时存在，脚本保留了 `/opt/reality` 并跳过迁移；确认数据在哪一边后手工删掉另一个 |
 | 容器反复重启 | `docker logs $(docker compose -p reality ps -q engine)` |
 | 客户端连不上 | 主端口是否放行（防火墙 / 安全组），SNI 域名是否匹配 |
 | 提示 `WARP account creation has been failed!` | 能否访问 `api.cloudflareclient.com` |
