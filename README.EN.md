@@ -68,7 +68,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 ```
 
 The installer writes everything to `/opt/reality-ezpz`, starts the stack, prints
-the first client configuration and opens the TUI on demand.
+the first client configuration and opens the TUI on demand. It also places **a
+copy of this script itself at `/opt/reality-ezpz/reality-ezpz.sh`**, which is what
+every later management command runs; because that copy lives in the configuration
+directory, each run refreshes it to the current version. This has nothing to do
+with the Telegram bot being enabled — the bot merely mounts the same directory.
 
 Common invocations:
 
@@ -376,10 +380,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 ```
 
 Re-running the installer keeps the existing configuration; missing keys (for
-example `http_port` or the new `camouflage`) are added automatically. If you
-deployed an earlier version that pinned the main port to `443`, note that the
-default is now `8443` and the plain HTTP side moved from `80` to `8080` — set
-`--port 443` explicitly if you want to keep the old layout.
+example `http_port` or the new `camouflage`) are added automatically, and the
+script copy inside the configuration directory is refreshed too. If you deployed
+an earlier version that pinned the main port to `443`, note that the default is
+now `8443` and the plain HTTP side moved from `80` to `8080` — set `--port 443`
+explicitly if you want to keep the old layout.
+
+One older fix is worth knowing about: `/opt/reality-ezpz/reality-ezpz.sh` used to
+be created only when the Telegram bot was enabled, so the documented
+`bash /opt/reality-ezpz/reality-ezpz.sh --menu` failed with "No such file or
+directory". The copy no longer depends on the bot; re-running the installer once
+adds it.
 
 Two behaviour changes when upgrading from a pre-`camouflage` version:
 
@@ -419,6 +430,7 @@ bash /opt/reality-ezpz/reality-ezpz.sh --uninstall   # keeps the Docker packages
 
 | Symptom | Check |
 | --- | --- |
+| `bash: /opt/reality-ezpz/reality-ezpz.sh: No such file or directory` | The installer places that copy. Older versions only created it when the Telegram bot was enabled; re-run the installer to add it, or fetch it directly with `curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh -o /opt/reality-ezpz/reality-ezpz.sh` |
 | `Port 80 must be free ...` | You selected `letsencrypt` while another service owns port 80 |
 | Container restarts in a loop | `docker logs $(docker compose -p reality-ezpz ps -q engine)` |
 | Client cannot connect | The main port is reachable (firewall/security group), and the SNI domain matches |

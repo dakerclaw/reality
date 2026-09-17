@@ -1310,22 +1310,51 @@ function download_tgbot_script {
 }
 
 function install_local_script_copy {
-  # Keep a copy of this script inside the configuration directory. The Telegram
-  # bot container mounts that directory and prefers the local copy, so it works
-  # without downloading anything at runtime.
+  # Keep a copy of this script inside the configuration directory. Operators are
+  # told to manage the server through ${config_path}/reality-ezpz.sh, and the
+  # Telegram bot container mounts that directory and prefers this local copy over
+  # downloading anything at runtime - so it has to exist whether or not the bot is
+  # enabled. Everything is written to a temporary file and moved into place, so a
+  # failed or truncated copy can never replace a working one.
   local url="https://raw.githubusercontent.com/${repo_owner}/${repo_name}/${repo_branch}/reality-ezpz.sh"
   local target="${config_path}/reality-ezpz.sh"
   local temp_file="${config_path}/.reality-ezpz.sh.$$"
   local source_file=${BASH_SOURCE[0]:-}
-  if [[ -n ${source_file} && -r ${source_file} ]] && ! [[ "${source_file}" -ef "${target}" ]]; then
-    if cp -f "${source_file}" "${target}" 2>/dev/null; then
+  # `bash <(curl ...)` and `bash /dev/stdin` leave BASH_SOURCE[0] pointing at a
+  # pipe that this very interpreter has already drained, so copying from it would
+  # silently produce an empty file. Those paths are recognised by name rather than
+  # by `-p`, because the test for a fifo is not portable.
+  case ${source_file} in
+    /dev/fd/*|/dev/stdin|/proc/*/fd/*) source_file='' ;;
+  esac
+  mkdir -p "${config_path}"
+  if [[ -n ${source_file} && -f ${source_file} && -r ${source_file} && ! -p ${source_file} ]]; then
+    # Already running from the installed copy: nothing to do, and rewriting the
+    # file this very process is executing from would be pointless.
+    if [[ "${source_file}" -ef "${target}" ]]; then
       return 0
     fi
+    # A copy that is empty or does not parse is worse than none at all: it would
+    # replace a working script with a broken one, so it is validated before use.
+    if cp -f "${source_file}" "${temp_file}" 2>/dev/null \
+      && [[ -s ${temp_file} ]] && bash -n "${temp_file}" 2>/dev/null; then
+      chmod 755 "${temp_file}"
+      mv -f "${temp_file}" "${target}"
+      return 0
+    fi
+    rm -f "${temp_file}"
   fi
   if ! curl -fsSL -m 30 "${url}" -o "${temp_file}"; then
     rm -f "${temp_file}"
+    echo "Could not place reality-ezpz.sh in ${config_path}: no usable local copy and ${url} is unreachable." >&2
     return 1
   fi
+  if [[ ! -s ${temp_file} ]] || ! bash -n "${temp_file}" 2>/dev/null; then
+    rm -f "${temp_file}"
+    echo "The reality-ezpz.sh downloaded from ${url} is empty or truncated!" >&2
+    return 1
+  fi
+  chmod 755 "${temp_file}"
   mv -f "${temp_file}" "${target}"
   return 0
 }
@@ -1790,9 +1819,13 @@ function generate_config {
         echo "Warning: could not download tgbot.py, the Telegram bot image cannot be built." >&2
       fi
     fi
-    if ! install_local_script_copy; then
-      echo "Warning: could not place reality-ezpz.sh in ${config_path}; the bot downloads it at runtime instead." >&2
-    fi
+  fi
+  # Unconditional, and deliberately outside the bot branch above: this copy is the
+  # entry point the documentation points operators at, and the bot container mount
+  # picks it up as well. Failing to place it is a warning, not an error - the stack
+  # is already configured by the time this runs.
+  if ! install_local_script_copy; then
+    echo "Warning: could not place reality-ezpz.sh in ${config_path}; save this script to a file and run it again to retry." >&2
   fi
 }
 

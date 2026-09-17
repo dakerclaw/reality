@@ -60,7 +60,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 ```
 
 安装脚本会把全部内容写入 `/opt/reality-ezpz`，启动服务栈，输出第一个客户端配置，并在需要时
-打开 TUI。
+打开 TUI。它同时会把**本脚本自身的一份副本放到 `/opt/reality-ezpz/reality-ezpz.sh`**，
+此后所有管理操作都通过这一份执行；因为副本就在配置目录里，每次运行都会被刷新为当前版本。
+这件事与是否启用 Telegram 机器人无关 —— 机器人只是恰好也挂载同一个目录。
 
 常见用法：
 
@@ -350,8 +352,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 ```
 
 重复执行安装脚本会保留原有配置，缺失的配置项（例如新引入的 `http_port`、`camouflage`）
-会自动补上。如果你之前部署的版本把主端口固定在 `443`，请注意当前默认值已改为 `8443`，
-明文 HTTP 侧也从 `80` 变为 `8080`；如需保持旧布局，请显式传入 `--port 443`。
+会自动补上，配置目录里的脚本副本也会一并刷新。如果你之前部署的版本把主端口固定在 `443`，
+请注意当前默认值已改为 `8443`，明文 HTTP 侧也从 `80` 变为 `8080`；如需保持旧布局，请显式
+传入 `--port 443`。
+
+从更早的版本升级时还有一处修复值得一提：`/opt/reality-ezpz/reality-ezpz.sh` 过去只在启用
+Telegram 机器人时才会生成，因此按文档执行 `bash /opt/reality-ezpz/reality-ezpz.sh --menu`
+会报文件不存在。现在这份副本与机器人开关无关，重跑一次安装命令即可补上。
 
 从还没有 `camouflage` 的版本升级时，有两处行为变化：
 
@@ -384,6 +391,7 @@ bash /opt/reality-ezpz/reality-ezpz.sh --uninstall   # 不会卸载 Docker 本�
 
 | 现象 | 排查方向 |
 | --- | --- |
+| `bash: /opt/reality-ezpz/reality-ezpz.sh: No such file or directory` | 该副本由安装器放置。旧版本只在启用 Telegram 机器人时才创建它，重跑一次安装命令即可补上；或手动 `curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality-ezpz.sh -o /opt/reality-ezpz/reality-ezpz.sh` |
 | 提示 `Port 80 must be free ...` | 你选择了 `letsencrypt`，但 80 端口已被其他服务占用 |
 | 容器反复重启 | `docker logs $(docker compose -p reality-ezpz ps -q engine)` |
 | 客户端连不上 | 主端口是否放行（防火墙 / 安全组），SNI 域名是否匹配 |
