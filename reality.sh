@@ -146,6 +146,11 @@ defaults[harden_docker]="OFF"
 # website, so it gets a dedicated port; an empty value leaves it off.
 defaults[ss_port]=""
 defaults[ss_key]=""
+# Opt-in DNS-01 challenge. When a provider is set, certbot uses it instead of
+# the HTTP-01 challenge, so no inbound port is needed and a wildcard can be
+# issued. "dns_credentials" is the host path of the provider credentials file.
+defaults[dns_provider]=""
+defaults[dns_credentials]=""
 
 config_items=(
   "core"
@@ -179,6 +184,8 @@ config_items=(
   "harden_docker"
   "ss_port"
   "ss_key"
+  "dns_provider"
+  "dns_credentials"
 )
 
 # Fast membership lookup for config_items, used when rewriting the config file.
@@ -261,6 +268,8 @@ function show_help {
   echo "      --hysteria2-up <mbps>  Server-side uplink for the hysteria2 transport (Brutal); needs --hysteria2-down"
   echo "      --hysteria2-down <mbps> Server-side downlink for the hysteria2 transport; the pair switches off client-reported bandwidth"
   echo "      --ss-port <port|off>  Publish an additional Shadowsocks 2022 (aes-128-gcm) inbound on its own port (sing-box only, off by default)"
+  echo "      --dns-provider <cloudflare> Use a DNS-01 challenge instead of HTTP-01: no port 80 needed, wildcard included"
+  echo "      --dns-credentials <path>    Host path of the DNS provider credentials file (e.g. an ini with the Cloudflare API token)"
   echo "      --tuic-congestion <cubic|new_reno|bbr> Congestion control of the tuic transport (default: bbr)"
   echo "      --open-firewall       Open the proxy and website ports in the host firewall (ufw / firewalld); otherwise print them"
   echo "      --check-update        Compare the pinned image tags with the newest upstream tags and exit"
@@ -271,7 +280,7 @@ function show_help {
 
 function parse_args {
   local opts
-  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,harden-docker:,ss-port:,format:,hysteria2-up:,hysteria2-down:,tuic-congestion:,open-firewall,check-update,doctor,help -- "$@")
+  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,harden-docker:,ss-port:,format:,dns-provider:,dns-credentials:,hysteria2-up:,hysteria2-down:,tuic-congestion:,open-firewall,check-update,doctor,help -- "$@")
   if [[ $? -ne 0 ]]; then
     return 1
   fi
@@ -574,6 +583,29 @@ function parse_args {
             return 1
             ;;
         esac
+        ;;
+      --dns-provider)
+        case "${2,,}" in
+          off)
+            args[dns_provider]="off"
+            ;;
+          cloudflare)
+            args[dns_provider]="$2"
+            ;;
+          *)
+            echo "Invalid DNS provider: $2 (supported providers: cloudflare)"
+            return 1
+            ;;
+        esac
+        shift 2
+        ;;
+      --dns-credentials)
+        if [[ ${2,,} == 'off' ]]; then
+          args[dns_credentials]="off"
+        else
+          args[dns_credentials]="$2"
+        fi
+        shift 2
         ;;
       --ss-port)
         case "${2,,}" in
@@ -889,6 +921,28 @@ function build_config {
       config[ss_key]=$(openssl rand -base64 16)
     fi
   fi
+  # DNS-01 replaces the HTTP-01 challenge: no inbound port is needed and a
+  # wildcard certificate becomes possible.
+  if [[ ${config[dns_provider],,} == 'off' ]]; then
+    config[dns_provider]=""
+  fi
+  if [[ ${config[dns_credentials],,} == 'off' ]]; then
+    config[dns_credentials]=""
+  fi
+  if [[ -n ${config[dns_provider]} ]]; then
+    if [[ ${config[dns_provider]} != 'cloudflare' ]]; then
+      echo "Unsupported DNS provider: ${config[dns_provider]} (supported providers: cloudflare)"
+      exit 1
+    fi
+    if ! needs_certbot; then
+      echo 'A DNS provider is only used while a certificate is issued (letsencrypt, or camouflage self).'
+      exit 1
+    fi
+    if [[ -z ${config[dns_credentials]} || ! -r ${config[dns_credentials]} ]]; then
+      echo "The DNS credentials file is missing or unreadable: ${config[dns_credentials]:-<empty>}"
+      exit 1
+    fi
+  fi
   # The bandwidth pair only means something for hysteria2; a lone value is dropped
   # with a note instead of failing an install that merely switched transport.
   if [[ ${config[transport]} == 'hysteria2' && ( -n ${config[hysteria2_up]} || -n ${config[hysteria2_down]} ) ]]; then
@@ -908,7 +962,7 @@ function build_config {
   # letsencrypt is the only mode that needs port 80, because the ACME HTTP-01
   # challenge is always served there. It is an explicit opt-in, so the HTTP side
   # is pinned to 80 in that mode; every other mode keeps the default HTTP port.
-  if [[ ${config[security]} == 'letsencrypt' || ${config[camouflage]} == 'self' ]]; then
+  if [[ -z ${config[dns_provider]} && ( ${config[security]} == 'letsencrypt' || ${config[camouflage]} == 'self' ) ]]; then
     if [[ ${config[http_port]} != '80' ]]; then
       echo 'Note: the ACME HTTP-01 challenge is served on port 80; it is used as the HTTP port for this mode.'
       config[http_port]=80
@@ -1419,6 +1473,7 @@ echo "
     - ./${path[certbot_deployhook]#${config_path}/}:/deployhook.sh
     - ./${path[certbot_startup]#${config_path}/}:/startup.sh
     - ./website:/website
+    $([[ -n ${config[dns_credentials]} ]] && echo "- ${config[dns_credentials]}:/credentials.ini:ro" || true)
     networks:
     - reality
     entrypoint: /bin/sh
@@ -1670,6 +1725,14 @@ function generate_certbot_script {
   if engine_owns_tls; then
     certbot_authenticator='--webroot -w /website'
   fi
+  # A DNS-01 provider replaces the HTTP-01 challenge entirely: port 80 is never
+  # touched, and a wildcard certificate becomes possible.
+  local certbot_names="    -d ${config[server]} \\"
+  if [[ -n ${config[dns_provider]} ]]; then
+    certbot_authenticator="--dns-${config[dns_provider]} --dns-${config[dns_provider]}-credentials /credentials.ini --dns-${config[dns_provider]}-propagation-seconds 30"
+    certbot_names="${certbot_names}
+    -d '*.${config[server]}' \\"
+  fi
   cat >"${path[certbot_startup]}" << EOF
 #!/bin/sh
 trap exit TERM
@@ -1683,6 +1746,9 @@ awk -F= '{print \$2}' | tr -d : | tr '[:upper:]' '[:lower:]')
     /deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true) $(engine_owns_tls && echo 'nginx' || true)
   fi
 fi
+# The HTTP reachability probe only guards the HTTP-01 challenge; a DNS-01 setup
+# never needs an inbound connection at all.
+if [ -z "${config[dns_provider]}" ]; then
 while true; do
   ls -d /website/* | grep -E '^/website/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\$'|xargs rm -f
   uuid=\$(uuidgen)
@@ -1695,6 +1761,7 @@ while true; do
   sleep 5
 done
 ls -d /website/* | grep -E '^/website/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\$'|xargs rm -f
+fi
 while true; do
   certbot certonly -n \\
     ${certbot_authenticator} \\
@@ -1702,7 +1769,7 @@ while true; do
     --elliptic-curve secp256r1 \\
     --agree-tos \\
     --register-unsafely-without-email \\
-    -d ${config[server]} \\
+${certbot_names}
     --deploy-hook "/deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true) $(engine_owns_tls && echo 'nginx' || true)"
   sleep 1h &
   wait \$!
@@ -1731,9 +1798,16 @@ EOF
 }
 
 function generate_certbot_dockerfile {
+  # The DNS-01 provider rides in as a certbot plugin; the HTTP-01 modes need no
+  # extra package at all.
+  local dns_plugin=''
+  if [[ -n ${config[dns_provider]} ]]; then
+    dns_plugin="
+RUN pip install --no-cache-dir certbot-dns-${config[dns_provider]}"
+  fi
   cat >"${path[certbot_dockerfile]}" << EOF
 FROM ${image[certbot]}
-RUN apk add --no-cache docker-cli-compose curl uuidgen
+RUN apk add --no-cache docker-cli-compose curl uuidgen${dns_plugin}
 EOF
 }
 
@@ -4328,7 +4402,7 @@ function open_firewall {
   if [[ ${config[http_port]} != 'OFF' ]]; then
     tcp_ports+=("${config[http_port]}")
   fi
-  if needs_certbot; then
+  if needs_certbot && [[ -z ${config[dns_provider]} ]]; then
     tcp_ports+=('80')
   fi
   if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then

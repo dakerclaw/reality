@@ -278,6 +278,8 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `--hysteria2-up <mbps>` / `--hysteria2-down <mbps>` | hysteria2 服务端上下行（Mbps），两个都填才生效：等价于关闭 `ignore_client_bandwidth`，改由服务端按此速率用 Brutal 整形 |
 | `--tuic-congestion <cubic\|new_reno\|bbr>` | tuic v5 的拥塞控制算法（默认 `bbr`） |
 | `--ss-port <port\|off>` | 额外开放一个 Shadowsocks 2022（`2022-blake3-aes-128-gcm`）入口，自带独立端口（仅 sing-box；默认关闭）。它不参与 SNI 分流，因为纯 TCP 没有 TLS SNI 可分；每个用户会派生一把稳定的独立密钥 |
+| `--dns-provider <cloudflare>` | 改用 DNS-01 校验来签发证书（默认关闭）：不再需要 80 端口入站，并会自动附带一张 `*.你的域名` 泛域名证书 |
+| `--dns-credentials <path>` | DNS 服务商凭据文件的宿主机路径（Cloudflare 为含 `dns_cloudflare_api_token = ...` 的 ini 文件），会以只读方式挂进 certbot 容器 |
 | `--open-firewall` | 在宿主防火墙（ufw / firewalld）放行代理与网站端口；未识别到防火墙时只打印需要在安全组放行的端口 |
 | `--check-update` | 对比钉死的镜像 tag 与上游最新 tag 后退出（只读，不改任何东西） |
 | `--doctor` | 对运行中的服务栈做一次只读体检（容器、端口、SNI 分流、证书、DNS）后退出 |
