@@ -60,7 +60,7 @@ docker system df 2>&1 | sed 's/^/  /'
 echo "--- 在跑的服务必须完好 ---"
 docker ps --format '{{.Names}}\t{{.Status}}' 2>&1 | sed 's/^/  /'
 echo "--- 端口 ---"
-ss -tln 2>/dev/null | grep -E ':(8443|8080) ' | sed 's/^/  /'
+ss -tln 2>/dev/null | grep -E ':(443|8080) ' | sed 's/^/  /'
 echo "  fail2ban = $(systemctl is-active fail2ban 2>&1)"
 
 echo

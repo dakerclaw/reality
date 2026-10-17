@@ -55,11 +55,11 @@ echo "--- sysctl drop-in ---"
 for f in /etc/sysctl.d/99-reality.conf /etc/sysctl.d/99-reality-ezpz.conf; do
   if [ -e "$f" ]; then echo "  !! ${f} 仍存在"; else echo "  ${f} 已删除"; fi
 done
-echo "--- 端口 8443/8080 ---"
-if ss -tln 2>/dev/null | grep -qE ':(8443|8080) '; then
-  ss -tln | grep -E ':(8443|8080) ' | sed 's/^/  !! 仍占用: /'
+echo "--- 端口 443/8080 ---"
+if ss -tln 2>/dev/null | grep -qE ':(443|8080) '; then
+  ss -tln | grep -E ':(443|8080) ' | sed 's/^/  !! 仍占用: /'
 else
-  echo "  8443/8080 已释放"
+  echo "  443/8080 已释放"
 fi
 echo "--- 项目网络 ---"
 if docker network ls 2>/dev/null | grep -qiE 'reality|tgbot'; then

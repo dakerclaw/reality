@@ -65,7 +65,7 @@ engine_probe() { # core transport security
   config[domain]=www.microsoft.com
   config[camouflage]=www.microsoft.com
   config[server]=203.0.113.9
-  config[port]=8443
+  config[port]=443
   config[http_port]=8080
   config[service_path]=rand0mpath
   config[safenet]=OFF

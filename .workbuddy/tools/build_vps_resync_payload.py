@@ -85,8 +85,8 @@ print("\n".join(sorted(walk(d))))'
 docker run --rm -i "${PYIMG}" python -c "${PATHS}" < "${CFG}/engine.conf"
 
 echo
-echo "########## 4. 真实启动预演（配置原样，仅换端口避开线上 8443）##########"
-sed 's/"listen_port": 8443/"listen_port": 18443/' "${CFG}/engine.conf" > /tmp/engprobe.json
+echo "########## 4. 真实启动预演（配置原样，仅换端口避开线上 443）##########"
+sed 's/"listen_port": 443/"listen_port": 18443/' "${CFG}/engine.conf" > /tmp/engprobe.json
 out=$(timeout 30 docker run --rm -v /tmp/engprobe.json:/etc/sing-box/config.json:ro "${IMG}" run -c /etc/sing-box/config.json 2>&1); rc=$?
 echo "  rc=${rc}（124 = 存活满 30 秒即成功）"
 echo "  告警/错误条数: $(printf '%s' "${out}" | grep -cE 'WARN|FATAL|ERROR')"
@@ -100,11 +100,11 @@ sleep 25
 docker inspect reality-engine-1 --format '  status={{.State.Status}} exit={{.State.ExitCode}}'
 echo "  启动后日志:"
 docker logs --tail 4 reality-engine-1 2>&1 | cut -c1-170 | sed 's/^/  | /'
-echo "  8443 监听条目: $(ss -ltn 2>/dev/null | grep -c ':8443 ')"
-if timeout 8 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/8443' 2>/dev/null; then
-  echo "  8443 可连接 ✓"
+echo "  443 监听条目: $(ss -ltn 2>/dev/null | grep -c ':443 ')"
+if timeout 8 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/443' 2>/dev/null; then
+  echo "  443 可连接 ✓"
 else
-  echo "  8443 不可连接 ✗"
+  echo "  443 不可连接 ✗"
 fi
 echo "RESULT: resync done"
 '''

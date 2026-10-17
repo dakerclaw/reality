@@ -10,13 +10,15 @@
 本项目是 [reality-ezpz](https://github.com/aleskxyz/reality-ezpz) 的加固分支，在上游功能之上
 额外确立三条设计准则：
 
-1. **安装过程绝不占用知名端口。** 默认只绑定 `8443` 和 `8080`。端口 `80` 只有
-   `letsencrypt` 模式会用（ACME HTTP-01 协议强制要求），且必须由你主动选择。
+1. **443 一个端口同时承载代理与网站。** 默认只绑定 `443` 和 `8080`。`443` 上 haproxy
+   只读 TLS 握手里的 SNI 并原样转发：带伪装 SNI 的连接进引擎（REALITY 必须自己看握手，
+   所以这里不终结 TLS），其余连接交给 nginx 上你自己的网站。端口 `80` 只有
+   `letsencrypt` 模式会用（ACME HTTP-01 强制要求），且必须由你主动选择。
 2. **每个组件都来自它自己的上游。** 容器镜像全部使用官方镜像，
    Cloudflare WARP 直接调用 Cloudflare 官方接口注册。
-3. **伪装目标与自有网站彻底分离。** 代理端口把未通过校验的流量回落到部署时指定的
-   **远端真实大站**，nginx 则在 HTTP 端口上正常负载**你自己的网站**。详见
-   [网站与伪装](#网站与伪装)。
+3. **伪装目标与自有网站彻底分离。** 带伪装 SNI 的探测者被回落到部署时指定的
+   **远端真实大站**；不带该 SNI 的访问（例如浏览器直接打开 `https://<IP>`）看到的才是
+   **你自己的网站**。详见[网站与伪装](#网站与伪装)。
 
 ---
 
@@ -32,8 +34,8 @@
 * 通过 certbot 申请与自动续期 Letsencrypt 证书
 * 可选「安全上网」模式（拦截广告 / 恶意域名，sing-box 还可拦截成人内容）
 * 对话式文本管理界面（编号选择、无需方向键）与 Telegram 机器人管理用户
-* nginx 在 HTTP 端口上正常负载 `./website` 里的自有网站（`reality` / `shadowtls` 的
-  回落目标是远端站点，不会落在你自己的站上）
+* 自有网站由 nginx 提供：`https://<IP>` 走 `443`（与代理共用一个端口），另有
+  `--http-port` 的明文入口；`reality` / `shadowtls` 的回落目标仍是远端站点，不会混进来
 * 支持密码保护的备份与恢复（用户 + 配置）
 * 内核参数调优、IPv6 支持，`tcp` / `http` / `grpc` / `ws` 由 haproxy 复用端口
 
@@ -67,7 +69,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 常见用法：
 
 ```bash
-# 使用默认配置安装（reality + sing-box，主端口 8443，网站端口 8080）
+# 使用默认配置安装（reality + sing-box，代理与网站共用 443，另有 8080 明文网站）
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh)
 
 # 指定伪装回落的远端大站（同时会作为 SNI）
@@ -92,19 +94,28 @@ bash /opt/reality/reality.sh --menu
 
 | 监听用途 | 默认宿主端口 | 由谁控制 | 说明 |
 | --- | --- | --- | --- |
-| 主代理端口 | `8443/tcp`（tuic / hysteria2 另加 `/udp`） | `--port` | 可为任意空闲端口；`80` 会被拒绝，`443` 允许但会提示 |
-| 本机网站 | `8080/tcp` | `--http-port` | 由 nginx 从 `./website` 目录提供；设为 `off` 则完全不监听 |
+| 代理 + 网站（HTTPS） | `443/tcp`（tuic / hysteria2 另加 `/udp`） | `--port` | 一个端口两种用途，由 haproxy 按 SNI 分流；`80` 会被拒绝 |
+| 网站（明文 HTTP） | `8080/tcp` | `--http-port` | 由 nginx 从 `./website` 目录提供；设为 `off` 则不监听（`443` 上的网站不受影响） |
 | ACME 校验 | `80/tcp` | 强制 | **仅** `--security=letsencrypt` 模式使用 |
 
 需要了解的行为：
 
-* 默认安装只发布 `8443/tcp` 与 `8080/tcp`，此外不占用任何端口。本机继续在 `80`/`443`
-  上运行 Nginx 等 Web 服务不受影响。
-* `--http-port off` 会彻底去掉 HTTP 监听与 nginx 容器（最小暴露面）。
+* 默认安装只发布 `443/tcp` 与 `8080/tcp`，此外不占用任何端口。`443` 上 haproxy 只做一次
+  SNI 判别：带伪装 SNI 的连接按原样转给引擎，其余连接（浏览器打开 `https://<IP>`、别的
+  主机名）交给 nginx。默认（`reality`）模式下这个网站用自签证书，首次访问会提示不受信任
+  —— 这是预期行为，不是配置错误。
+* 代理端口与网站端口不能相同：`--port 443 --http-port 443` 这类组合会被拒绝。
+* `--http-port off` 只关掉明文 HTTP 监听；`https://<IP>` 上的网站仍然可用，因为它与代理共用
+  `443`，nginx 容器也仍然存在。
 * 选择 `--security letsencrypt` 时脚本会把 HTTP 端口切到 `80` 并明确提示，因为 ACME
   HTTP-01 校验只能走 80 端口；切回 `reality` / `selfsigned` 后会自动恢复为 `8080`。
-* 如果显式指定 `--port 443`，脚本仍会尊重你的选择（只提示、不阻止）——这是使用者的决定，
-  不由安装器替你决定。
+* `selfsigned` + `tcp` 与 `reality` 走同一套 SNI 分流（引擎自己终结 TLS，网站用自签证书）。
+  `http` / `grpc` / `ws` 传输则由 haproxy 终结 TLS 并按路径分流，网站同样在 `443` 上
+  （`letsencrypt` 用你申请到的证书，浏览器不会提示；`selfsigned` 仍是自签证书）。
+* `letsencrypt` + `tcp` 是唯一例外：浏览器和代理客户端发出的 SNI 完全相同，无法区分，
+  所以 `443` 整条留给代理，网站只走 `--http-port`。
+* 从旧版本升级时，配置里遗留的 `port=8443`（老版本的出厂值）会被自动改成 `443` 并打印
+  提示；其他自定义端口保持不变。
 
 ---
 
@@ -115,10 +126,10 @@ bash /opt/reality/reality.sh --menu
 | | 是什么 | 在哪里配置 |
 | --- | --- | --- |
 | **伪装** | 未通过校验的探测者在代理端口上看到的内容。`reality` 模式下引擎不自己应答 TLS 握手，而是把握手转发给远端真实站点；`shadowtls` 模式下该站点就是握手目标。 | `--camouflage <domain[:port]>`，一个远端真实站点，部署时自动设定 |
-| **网站** | 你自己的正常网站，由 nginx 从 `./website` 目录提供。 | `--http-port <port>` |
+| **网站** | 你自己的正常网站，由 nginx 从 `./website` 目录提供，`https://<IP>`（复用代理的 443）与明文 `--http-port` 都能访问。 | 把文件放进 `./website`，端口用 `--port` / `--http-port` |
 
 ```bash
-# 伪装目标 = www.microsoft.com，自有网站在 8080
+# 伪装目标 = www.microsoft.com，代理与网站共用 443，另有 8080 明文入口
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
   --camouflage www.microsoft.com
 
@@ -142,8 +153,11 @@ ls /opt/reality/config/website
 * 首次运行会写入一个中性的占位首页
   `/opt/reality/config/website/index.html`。**已存在的文件绝不会被覆盖** —— 把你自己的
   站点放进去，升级时不会丢。
-* 在 `reality` / `shadowtls` 模式下，这个网站就是全部 HTTP 暴露面；不再通过明文 HTTP
-  转发远端伪装站点的内容。
+* 在 `reality` / `shadowtls` 模式下，`443` 上只有带伪装 SNI 的连接会进引擎；直接用 IP
+  或不带该 SNI 的域名访问，看到的就是你自己的网站。反过来说，用伪装域名当 SNI 去访问
+  这台机器，看到的仍是远端大站 —— 那正是主动探测应该看到的东西。
+* 想用自己的证书替换 `443` 上的自签证书：把 `fullchain` 与私钥分别写到
+  `/opt/reality/config/certificate/server.crt` 和 `server.key`，再重启 nginx 容器。
 
 ---
 
@@ -234,8 +248,8 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `-d, --domain <domain>` | Reality 握手使用的 SNI 域名（默认跟随 `--camouflage`） |
 | `--camouflage <domain[:port]>` | `reality` / `shadowtls` 模式下未通过校验的流量所回落的远端真实站点（默认 `www.fastly.com`，端口默认 `443`） |
 | `--server <server>` | 本机公网 IP 或域名；使用 `letsencrypt` 时必须是域名 |
-| `--port <port>` | 主代理端口（默认 `8443`） |
-| `--http-port <port\|off>` | nginx 承载本机网站的宿主端口（默认 `8080`，`off` 表示不监听） |
+| `--port <port>` | 代理端口，同时用于网站 HTTPS（默认 `443`） |
+| `--http-port <port\|off>` | nginx 明文网站的宿主端口（默认 `8080`，`off` 表示不监听该入口） |
 | `-c, --core <xray\|sing-box>` | 引擎（默认 `sing-box`） |
 | `--security <reality\|letsencrypt\|selfsigned>` | TLS 模式（默认 `reality`） |
 | `--enable-safenet <true\|false>` | 拦截广告 / 恶意域名，sing-box 下还会拦截成人内容 |
@@ -428,7 +442,7 @@ bash /opt/reality/reality.sh --uninstall   # 不会卸载 Docker 本身
 `--uninstall` 会停掉并删除本项目创建的全部容器（引擎、nginx、haproxy、certbot、telegram bot），
 再删除配置目录与内核调优文件 `/etc/sysctl.d/99-reality.conf`；镜像保留。从更早版本升级上来的
 机器还会一并清理旧部署目录 `/opt/reality-ezpz` 与它的旧 compose 项目 `reality-ezpz`，所以不会留下
-仍占着 8443/8080 的容器。需要 root 权限；Docker 本身与 `/etc/docker/daemon.json` 保持不动。
+仍占着 443/8080 的容器。需要 root 权限；Docker 本身与 `/etc/docker/daemon.json` 保持不动。
 
 ---
 
@@ -456,7 +470,8 @@ bash /opt/reality/reality.sh --uninstall   # 不会卸载 Docker 本身
 | 提示 `BBR was requested but is not active` | 当前内核没有 BBR（需 4.9+），或容器无法加载宿主机模块；`--enable-bbr false` 可消除该提示 |
 | 提示 `these kernel settings ... were skipped` | 列出的键在当前内核上不存在；其余键已应用，不影响 BBR |
 | 提示 `the SNI (...) differs from the camouflage site (...)` | 你同时传了 `--domain` 与 `--camouflage`；除确有需要外，两者应指向同一个站点 |
-| HTTP 端口上显示的是占位首页 | 把你的文件放进 `/opt/reality/config/website` —— `index.html` 只在目录为空时生成 |
+| 网站显示的是占位首页 | 把你的文件放进 `/opt/reality/config/website` —— `index.html` 只在目录为空时生成 |
+| 浏览器打开 `https://<IP>` 提示证书不受信任 | `443` 上的网站用自签证书（CN 是 `--server` 的值），属预期；想消除提示就按[网站与伪装](#网站与伪装)换成自己的证书 |
 | 伪装站点连接失败 | `--camouflage` 必须是本机能够访问的真实站点，本机不会为它提供任何内容 |
 | Telegram 机器人无响应 | Token / 管理员名单是否正确，`/opt/reality/tgbot/tgbot.py` 是否存在 |
 | xray 容器启动即退出 | 官方镜像会降权运行，证书文件必须可读（安装脚本已 chmod 到 `644`） |

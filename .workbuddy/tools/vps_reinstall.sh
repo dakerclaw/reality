@@ -11,7 +11,7 @@
 #   EXPECT_USR_SHA  可选。users 的 sha256。
 #   REPO_RAW        可选。脚本下载地址。
 #   CORE/SECURITY/TRANSPORT/DOMAIN/CAMOUFLAGE/PORT/HTTP_PORT/BBR/TGBOT
-#                   可选。覆盖部署形态，默认与出厂一致的 reality+tcp+8443/8080。
+#                   可选。覆盖部署形态，默认与出厂一致的 reality+tcp+443/8080。
 #
 # 本脚本刻意不含任何主机地址或密钥，可安全入库；具体部署值全部由调用方注入。
 #
@@ -32,7 +32,7 @@ SECURITY="${SECURITY:-reality}"
 TRANSPORT="${TRANSPORT:-tcp}"
 DOMAIN="${DOMAIN:-www.fastly.com}"
 CAMOUFLAGE="${CAMOUFLAGE:-www.fastly.com}"
-PORT="${PORT:-8443}"
+PORT="${PORT:-443}"
 HTTP_PORT="${HTTP_PORT:-8080}"
 BBR="${BBR:-true}"
 TGBOT="${TGBOT:-true}"
@@ -127,7 +127,7 @@ docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>&1 | s
 echo "--- compose 项目 ---"
 docker compose ls -a 2>&1 | sed 's/^/  /'
 echo "--- 端口 ---"
-ss -tln 2>/dev/null | grep -E ':(8443|8080|80) ' | sed 's/^/  /'
+ss -tln 2>/dev/null | grep -E ':(443|8080|80) ' | sed 's/^/  /'
 echo "--- 内核参数 ---"
 echo "  cc    = $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
 echo "  qdisc = $(sysctl -n net.core.default_qdisc 2>/dev/null)"

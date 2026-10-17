@@ -148,10 +148,10 @@ n=0
 for f in sing-box__*.json; do
   n=$((n + 1))
   port=$((19000 + n))
-  # The matrix configs listen on 8443, the port the live engine holds, so the
+  # The matrix configs listen on 443, the port the live engine holds, so the
   # probe runs on a private port; otherwise a collision would look like a
   # config error.
-  sed "s/\"listen_port\": 8443/\"listen_port\": ${port}/" "${M}/${f}" > /tmp/sbprobe.json
+  sed "s/\"listen_port\": 443/\"listen_port\": ${port}/" "${M}/${f}" > /tmp/sbprobe.json
   out=$(timeout 30 docker run --rm -v /tmp/sbprobe.json:/tmp/c.json -v "${CRT}":/etc/sing-box:ro @@SB@@ ${SMODE} /tmp/c.json 2>&1); rc=$?
   errs=$(printf '%s' "${out}" | tr -d '\r' | grep -cE 'FATAL|ERROR')
   dep=$(printf '%s' "${out}" | tr -d '\r' | grep -cE 'download_detour|implicit default HTTP client')

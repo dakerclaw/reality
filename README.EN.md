@@ -12,16 +12,20 @@ you a conversational text menu plus an optional Telegram bot to manage users.
 It is a hardened fork of [reality-ezpz](https://github.com/aleskxyz/reality-ezpz)
 with three design rules on top of the upstream feature set:
 
-1. **An installation never takes a well-known port.** The default setup binds
-   `8443` and `8080`. Port `80` is used by exactly one mode — `letsencrypt`, which
-   the ACME HTTP-01 challenge forces — and only when you ask for it.
+1. **One port, `443`, carries both the proxy and the website.** The default setup
+   binds `443` and `8080`. On `443` haproxy only reads the SNI of the TLS
+   ClientHello and forwards the stream untouched: connections carrying the
+   camouflage SNI go to the engine (REALITY has to inspect the handshake itself,
+   so TLS is not terminated there), everything else lands on nginx and your own
+   site. Port `80` is used by exactly one mode — `letsencrypt`, which the ACME
+   HTTP-01 challenge forces — and only when you ask for it.
 2. **Every component comes from its own upstream.** Container images are the
    official ones, and Cloudflare WARP is registered directly against the
    Cloudflare client API.
-3. **Camouflage target and website are separate.** The proxy port falls back to a
-   real **remote** site, which is set automatically at deployment, while nginx
-   serves **your own** site on the HTTP port. See
-   [Website and camouflage](#website-and-camouflage).
+3. **Camouflage target and website are separate.** A probe carrying the
+   camouflage SNI is relayed to a real **remote** site set at deployment; only
+   traffic without that SNI (a browser opening `https://<ip>`) reaches
+   **your own** site. See [Website and camouflage](#website-and-camouflage).
 
 ---
 
@@ -39,8 +43,9 @@ with three design rules on top of the upstream feature set:
 * Letsencrypt certificate issuance and renewal through certbot
 * Optional "safe internet" mode (blocks ads/malware, optionally adult content)
 * Conversational text menu and Telegram bot for user management
-* nginx serves your own site from `./website` on the HTTP port (`reality`/`shadowtls`
-  fall back to a remote site instead, never to your own site)
+* nginx serves your own site from `./website` on `https://<ip>` (sharing `443`
+  with the proxy) and on the plain-HTTP `--http-port`; in `reality`/`shadowtls`
+  the fallback target stays a remote site, never your own
 * Password-protected backup / restore of users and configuration
 * Kernel tunables, IPv6 support, `tcp`/`http`/`grpc`/`ws` multiplexing behind haproxy
 
@@ -78,7 +83,7 @@ with the Telegram bot being enabled — the bot merely mounts the same directory
 Common invocations:
 
 ```bash
-# plain install with defaults (reality, sing-box, port 8443, website on 8080)
+# plain install with defaults (reality, sing-box, 443 shared by proxy and site)
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh)
 
 # name the remote site the camouflage falls back to (also becomes the SNI)
@@ -103,21 +108,34 @@ bash /opt/reality/reality.sh --menu
 
 | Listener | Default host port | Controlled by | Notes |
 | --- | --- | --- | --- |
-| Main proxy port | `8443/tcp` (and `/udp` for tuic/hysteria2) | `--port` | Any free port; `80` is refused, `443` is allowed but warns |
-| Local website | `8080/tcp` | `--http-port` | Served by nginx out of `./website`; `off` leaves it unpublished |
+| Proxy + website (HTTPS) | `443/tcp` (and `/udp` for tuic/hysteria2) | `--port` | Two jobs on one port, split by SNI in haproxy; `80` is refused |
+| Website (plain HTTP) | `8080/tcp` | `--http-port` | Served by nginx out of `./website`; `off` leaves this entry point unpublished (the `443` site stays up) |
 | ACME challenge | `80/tcp` | forced | **Only** in `--security=letsencrypt` mode |
 
 Behaviour worth knowing:
 
-* A default installation publishes `8443/tcp` and `8080/tcp` and nothing else.
-  Running a web server on `80`/`443` next to it is fine.
-* `--http-port off` removes the HTTP listener and the nginx container completely
-  (minimal footprint).
+* A default installation publishes `443/tcp` and `8080/tcp` and nothing else.
+  On `443` haproxy makes a single SNI decision: the camouflage SNI is passed to
+  the engine byte for byte, everything else (a browser opening `https://<ip>`,
+  any other host name) goes to nginx. In the default (`reality`) mode that site
+  uses a self-signed certificate, so the first visit warns about it — expected.
+* The proxy port and the website port must differ: `--port 443 --http-port 443`
+  is refused.
+* `--http-port off` only removes the plain-HTTP listener; `https://<ip>` keeps
+  working because it shares `443` with the proxy, so the nginx container stays.
 * Selecting `--security letsencrypt` switches the HTTP port to `80` and says so,
   because the ACME HTTP-01 challenge has no other port. Switching back to
   `reality`/`selfsigned` resets it to `8080` automatically.
-* Explicitly asking for `443` with `--port` is still honoured (the warning is only
-  a warning) — that is the user's call, not the installer's.
+* `selfsigned` + `tcp` uses the same SNI split as `reality` (the engine owns TLS,
+  the website uses the self-signed certificate). With the `http`/`grpc`/`ws`
+  transports haproxy terminates TLS itself and routes by path, so the website is
+  on `443` too (`letsencrypt` uses the certificate you obtained, `selfsigned`
+  still gets a browser warning).
+* `letsencrypt` + `tcp` is the one exception: a browser and a proxy client send
+  the very same SNI, so nothing can tell them apart — `443` stays with the proxy
+  and the website is only reachable on `--http-port`.
+* Upgrading from an older release migrates a stored `port=8443` (the old factory
+  default) to `443` and says so; any other custom port is left alone.
 
 ---
 
@@ -128,10 +146,10 @@ Two different jobs, deliberately kept apart:
 | | What it is | Where it lives |
 | --- | --- | --- |
 | **Camouflage** | What an unauthenticated probe sees on the proxy port. In `reality` the engine forwards the TLS handshake to a real remote site instead of answering it itself; in `shadowtls` the handshake server is that site. | `--camouflage <domain[:port]>`, a real remote site, set automatically at deployment |
-| **Website** | A normal site of your own, served by nginx from `./website`. | `--http-port <port>` |
+| **Website** | A normal site of your own, served by nginx from `./website`, reachable as `https://<ip>` (sharing the proxy's `443`) and over plain HTTP on `--http-port`. | drop files into `./website`; ports via `--port` / `--http-port` |
 
 ```bash
-# camouflage = www.microsoft.com, own site on 8080
+# camouflage = www.microsoft.com, proxy and site share 443, plain HTTP on 8080
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
   --camouflage www.microsoft.com
 
@@ -158,8 +176,14 @@ Notes:
 * The first run writes a neutral placeholder page to
   `/opt/reality/config/website/index.html`. **An existing file is never
   overwritten** — put your own site there and it survives upgrades.
-* In the `reality`/`shadowtls` modes this website is the whole HTTP surface;
-  nothing is relayed to the remote camouflage site over plain HTTP anymore.
+* In the `reality`/`shadowtls` modes only connections carrying the camouflage SNI
+  reach the engine; opening the server by IP (or with any other host name) gives
+  your own site. The other way round, visiting this machine with the camouflage
+  SNI still shows the remote site — which is exactly what an active probe should
+  see.
+* To replace the self-signed certificate on `443`, write the full chain and the
+  key to `/opt/reality/config/certificate/server.crt` and `server.key`, then
+  restart the nginx container.
 
 ---
 
@@ -260,8 +284,8 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `-d, --domain <domain>` | SNI domain used for the Reality handshake (default follows `--camouflage`) |
 | `--camouflage <domain[:port]>` | Remote site unauthenticated probes are relayed to, in the `reality`/`shadowtls` modes (default `www.fastly.com`; port defaults to `443`) |
 | `--server <server>` | Public IP or domain of this machine; a domain is required for `letsencrypt` |
-| `--port <port>` | Main proxy port (default `8443`) |
-| `--http-port <port\|off>` | Host port of the local website served by nginx (default `8080`, `off` = unpublished) |
+| `--port <port>` | Proxy port, also used by the website over HTTPS (default `443`) |
+| `--http-port <port\|off>` | Host port of the plain-HTTP website served by nginx (default `8080`, `off` = that entry point unpublished) |
 | `-c, --core <xray\|sing-box>` | Engine (default `sing-box`) |
 | `--security <reality\|letsencrypt\|selfsigned>` | TLS mode (default `reality`) |
 | `--enable-safenet <true\|false>` | Block ads/malware, plus adult content on sing-box |
@@ -473,7 +497,7 @@ bash /opt/reality/reality.sh --uninstall   # keeps the Docker packages
 certbot, telegram bot), then deletes the configuration directory and the kernel tuning drop-in
 `/etc/sysctl.d/99-reality.conf`; the images are kept. On a machine upgraded from an older release
 it also cleans up the legacy directory `/opt/reality-ezpz` and its old compose project
-(`reality-ezpz`), so nothing is left holding 8443/8080. It needs root; the Docker packages and
+(`reality-ezpz`), so nothing is left holding 443/8080. It needs root; the Docker packages and
 `/etc/docker/daemon.json` are left alone.
 
 ---
@@ -507,7 +531,8 @@ it also cleans up the legacy directory `/opt/reality-ezpz` and its old compose p
 | `BBR was requested but is not active` | The running kernel has no BBR (needs 4.9+) or is a container that cannot load its host's modules; `--enable-bbr false` silences it |
 | `these kernel settings ... were skipped` | The listed keys do not exist on this kernel; the rest were applied and BBR is unaffected |
 | `the SNI (...) differs from the camouflage site (...)` | You passed both `--domain` and `--camouflage`; point them at the same site unless you have a reason not to |
-| The HTTP port shows the placeholder page | Put your files into `/opt/reality/config/website` — `index.html` is only created when nothing is there |
+| The site shows the placeholder page | Put your files into `/opt/reality/config/website` — `index.html` is only created when nothing is there |
+| The browser warns about the certificate on `https://<ip>` | The `443` site uses a self-signed certificate (CN is `--server`); replace it as described in [Website and camouflage](#website-and-camouflage) to remove the warning |
 | The camouflage site is unreachable from the server | `--camouflage` must be a real site the machine can reach; nothing is served locally for it |
 | Telegram bot silent | Token/admins correct, and `/opt/reality/tgbot/tgbot.py` exists |
 | `xray` exits immediately | The official image drops privileges; certificate files must be readable (the installer chmods them to `644`) |

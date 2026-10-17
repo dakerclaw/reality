@@ -114,7 +114,7 @@ docker ps -a --format '  {{.Names}}\t{{.Status}}\t{{.Image}}' | head -12
 echo "  --- 引擎 ---"
 docker inspect reality-engine-1 --format '  status={{.State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}}' 2>/dev/null
 echo "  --- 端口 ---"
-ss -ltn 2>/dev/null | grep -E ':(80|8080|8443)\b' | awk '{print "  "$4}' | sort -u
+ss -ltn 2>/dev/null | grep -E ':(80|8080|443)\b' | awk '{print "  "$4}' | sort -u
 echo "  --- 引擎最近日志（应无 FATAL）---"
 docker logs --tail 8 reality-engine-1 2>&1 | sed -r 's/\x1b\[[0-9;]*m//g' | cut -c1-150 | sed 's/^/  | /'
 FATAL=$(docker logs --tail 200 reality-engine-1 2>&1 | grep -c 'FATAL' || true)

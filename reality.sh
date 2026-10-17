@@ -101,9 +101,14 @@ defaults[domain]=www.fastly.com
 # is the SNI itself, and a chain that roots in Certainly Root R1, which Mozilla,
 # Chrome, Apple and Oracle all carry.
 defaults[camouflage]=www.fastly.com
-# 8443 is deliberately not a well-known port: the default installation must not
-# take 80 or 443 away from whatever else runs on the machine.
-defaults[port]=8443
+# 443 is the default: the proxy and the local website share that one port.
+# haproxy peeks at the SNI of the incoming ClientHello and forwards it without
+# touching it, so the proxy handshake still reaches the engine byte for byte:
+# connections whose SNI is the proxy SNI go to the engine, everything else - a
+# browser opening https://<ip>, or any other host name - ends up in nginx,
+# which terminates TLS and serves ./website. See generate_haproxy_config.
+# Port 80 stays free: it is only bound by the letsencrypt mode.
+defaults[port]=443
 # Host port of the plain-HTTP side. It serves the local website out of
 # ./website (nginx), and in the letsencrypt mode it also carries the ACME
 # HTTP-01 challenge. "OFF" keeps it unpublished entirely.
@@ -208,7 +213,7 @@ function show_help {
   echo "      --enable-bbr <true|false> Enable or disable the BBR congestion control (default: ${defaults[bbr]})"
   echo "                            BBR is a kernel feature: this loads tcp_bbr/sch_fq and writes the matching sysctls,"
   echo "                            and is skipped with a warning on kernels that do not offer it (needs 4.9+)"
-  echo "      --port <port>         Server port (default: ${defaults[port]}; 80 and 443 are never used unless asked for)"
+  echo "      --port <port>         Server port, shared by the proxy and the website (default: ${defaults[port]}; 80 is reserved for letsencrypt)"
   echo "      --http-port <port|off> Host port of the local website served by nginx out of ./website, and the ACME challenge"
   echo "                            in the letsencrypt mode (default: ${defaults[http_port]}, \"off\" leaves it unpublished)"
   echo "      --enable-warp <true|false> Enable or disable Cloudflare warp"
@@ -345,9 +350,6 @@ function parse_args {
           echo "Invalid port number: 80 is reserved for the letsencrypt ACME challenge. Use another port (default: ${defaults[port]})."
           return 1
         fi
-        if [[ ${args[port]} -eq 443 ]]; then
-          echo "Warning: port 443 is a well-known port. The default is ${defaults[port]} exactly so the installation does not take 80 or 443 from other services."
-        fi
         shift 2
         ;;
       --http-port)
@@ -361,9 +363,7 @@ function parse_args {
               echo "Invalid HTTP port number: ${args[http_port]} (use \"off\" to leave it unpublished)"
               return 1
             fi
-            if [[ ${args[http_port]} -eq 443 ]]; then
-              echo "Warning: port 443 is a well-known port; the default HTTP port is ${defaults[http_port]}."
-            elif [[ ${args[http_port]} -eq 80 ]]; then
+            if [[ ${args[http_port]} -eq 80 ]]; then
               echo "Note: port 80 is only required for letsencrypt (ACME HTTP-01)."
             fi
             ;;
@@ -743,10 +743,9 @@ function build_config {
     echo 'You cannot use "shadowtls" transport with "xray" core. Use other transports or change core to sing-box'
     exit 1
   fi
-  # letsencrypt is the only mode that needs a well-known port, because the ACME
-  # HTTP-01 challenge is always served on port 80. It is an explicit opt-in, so
-  # the HTTP side is pinned to 80 there; every other mode keeps the 80/443-free
-  # defaults and never touches a well-known port.
+  # letsencrypt is the only mode that needs port 80, because the ACME HTTP-01
+  # challenge is always served there. It is an explicit opt-in, so the HTTP side
+  # is pinned to 80 in that mode; every other mode keeps the default HTTP port.
   if [[ ${config[security]} == 'letsencrypt' ]]; then
     if [[ ${config[http_port]} != '80' ]]; then
       echo 'Note: letsencrypt needs port 80 for the ACME HTTP-01 challenge; it is used as the HTTP port for this mode.'
@@ -766,10 +765,15 @@ function build_config {
       exit 1
     fi
   elif [[ ${config[http_port]} == '80' ]]; then
-    # Without letsencrypt there is no reason to claim port 80; keep the promise
-    # that an installation only binds non-privileged ports.
+    # Without letsencrypt there is no reason to claim port 80.
     echo "Port 80 is only used by the letsencrypt mode; switching the HTTP port back to ${defaults[http_port]}."
     config[http_port]="${defaults[http_port]}"
+  fi
+  # Both ports become docker port mappings on the same address, so they must
+  # differ - otherwise the second mapping fails and the stack does not start.
+  if [[ ${config[http_port]} != 'OFF' && ${config[http_port]} == ${config[port]} ]]; then
+    echo "The HTTP port (${config[http_port]}) must differ from the proxy port (${config[port]})."
+    exit 1
   fi
 
   if [[ -n "${args[security]}" && "${args[security]}" == 'reality' && "${config_file[security]}" != 'reality' && "${config_file[transport]}" != 'shadowtls' && -z "${args[domain]}" ]]; then
@@ -913,7 +917,7 @@ function generate_keys {
 # `docker compose down` alone is not enough: a Compose v1 binary parses the
 # generated, version-less compose file as the legacy format (top-level keys read
 # as service names), and a compose file that was already deleted leaves the daemon
-# nothing to stop - either way the containers survive and keep holding 8443/8080.
+# nothing to stop - either way the containers survive and keep holding 443/8080.
 # Removing them by project label closes both holes.
 # Uninstall also runs before install_docker has had a chance to resolve docker_cmd,
 # so this detects the compose command itself instead of relying on that variable.
@@ -938,7 +942,7 @@ function uninstall {
   # Releases before this one kept everything in /opt/reality-ezpz and ran their
   # containers under the compose project "reality-ezpz". Container names derive
   # from the project name, so a layout that is not torn down here keeps holding
-  # 8443/8080 and makes a later reinstall fail.
+  # 443/8080 and makes a later reinstall fail.
   # Both layouts are removed outright rather than migrated: the single caller runs
   # this before migrate_legacy_install, which would otherwise move the old tree
   # into config_path and rewrite the kernel tuning drop-in only for all of it to be
@@ -1032,12 +1036,88 @@ function install_docker {
   return 0
 }
 
+# True when the TLS handshake has to reach the engine itself: REALITY and
+# shadowtls always inspect it, and selfsigned + tcp hands TLS to the engine as
+# well. In those modes haproxy may only peek at the SNI, so the website has to
+# terminate TLS in nginx. Everywhere else haproxy terminates TLS itself and
+# routes by path, and the website is just another backend.
+function engine_owns_tls {
+  if [[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]]; then
+    return 0
+  fi
+  # selfsigned + tcp behaves the same way: the engine is the TLS endpoint and
+  # there is no ACME challenge to route, so the SNI split applies as well.
+  # letsencrypt is deliberately excluded: its ACME challenge needs the HTTP
+  # frontend, and a browser sends the very same SNI the proxy clients do, so
+  # there is no SNI that could distinguish the website from the proxy.
+  if [[ ${config[transport]} == 'tcp' && ${config[security]} == 'selfsigned' ]]; then
+    return 0
+  fi
+  return 1
+}
+
 function generate_docker_compose {
   # The official images are run with an explicit command: the engine binary is
   # addressed directly instead of relying on the image default CMD (the official
   # xray image defaults to "-confdir /usr/local/etc/xray/", which would ignore
   # the mounted configuration).
   local engine_command
+  # Fragments that differ between the passthrough modes (reality / shadowtls)
+  # and the terminating ones (letsencrypt / selfsigned). Built here, with plain
+  # if statements, so the heredoc below stays readable.
+  local engine_udp_ports=''
+  local nginx_ports=''
+  local nginx_expose=''
+  local nginx_tls_volumes=''
+  local haproxy_http_port=''
+  local haproxy_cert_volume=''
+  local nginx_service
+  local haproxy_service
+  if engine_owns_tls; then
+    # haproxy only peeks at the ClientHello, so nginx terminates the website
+    # TLS itself and needs the certificate mounted.
+    if [[ ${config[http_port]} != 'OFF' ]]; then
+      nginx_ports="    ports:
+    - ${config[http_port]}:80"
+    fi
+    nginx_expose="    expose:
+    - 443"
+    nginx_tls_volumes="    - ./${path[nginx_conf]#${config_path}/}:/etc/nginx/conf.d/default.conf
+    - ./${path[server_crt]#${config_path}/}:/etc/nginx/certificate/server.crt
+    - ./${path[server_key]#${config_path}/}:/etc/nginx/certificate/server.key"
+  else
+    nginx_expose="    expose:
+    - 80"
+    if [[ ${config[http_port]} != 'OFF' ]]; then
+      haproxy_http_port="    - ${config[http_port]}:8080"
+    fi
+    haproxy_cert_volume="    - ./${path[server_pem]#${config_path}/}:/usr/local/etc/haproxy/server.pem"
+  fi
+  if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
+    engine_udp_ports="    ports:
+    - ${config[port]}:443/udp"
+  fi
+  nginx_service="  nginx:
+    image: ${image[nginx]}
+${nginx_ports}
+${nginx_expose}
+    restart: always
+    volumes:
+    - ./website:/usr/share/nginx/html
+${nginx_tls_volumes}
+    networks:
+    - reality"
+  haproxy_service="  haproxy:
+    image: ${image[haproxy]}
+    ports:
+    - ${config[port]}:443
+${haproxy_http_port}
+    restart: always
+    volumes:
+    - ./${path[haproxy]#${config_path}/}:/usr/local/etc/haproxy/haproxy.cfg
+${haproxy_cert_volume}
+    networks:
+    - reality"
   if [[ ${config[core]} == 'xray' ]]; then
     engine_command='["run", "-c", "/etc/xray/config.json"]'
   else
@@ -1060,12 +1140,9 @@ services:
   engine:
     image: ${image[${config[core]}]}
     command: ${engine_command}
-    $([[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]] && echo "ports:" || true)
-    $([[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]] && echo "- ${config[port]}:8443" || true)
-    $([[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]] && echo "ports:" || true)
-    $([[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]] && echo "- ${config[port]}:8443/udp" || true)
-    $([[ ${config[security]} != 'reality' && ${config[transport]} != 'shadowtls' ]] && echo "expose:" || true)
-    $([[ ${config[security]} != 'reality' && ${config[transport]} != 'shadowtls' ]] && echo "- 8443" || true)
+${engine_udp_ports}
+    expose:
+    - 443
     restart: always
     environment:
       TZ: Etc/UTC
@@ -1075,35 +1152,8 @@ services:
     $([[ ${config[security]} != 'reality' ]] && { [[ ${config[transport]} == 'http' ]] || [[ ${config[transport]} == 'tcp' ]] || [[ ${config[transport]} == 'tuic' ]] || [[ ${config[transport]} == 'hysteria2' ]]; } && echo "- ./${path[server_key]#${config_path}/}:/etc/${config[core]}/server.key" || true)
     networks:
     - reality
-$(if [[ (${config[security]} != 'reality' && ${config[transport]} != 'shadowtls') || ${config[http_port]} != 'OFF' ]]; then
-echo "
-  nginx:
-    image: ${image[nginx]}
-$(if [[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]]; then echo "
-    ports:
-    - ${config[http_port]}:80"; else echo "
-    expose:
-    - 80"; fi)
-    restart: always
-    volumes:
-    - ./website:/usr/share/nginx/html
-    networks:
-    - reality"
-fi)
-$(if [[ ${config[security]} != 'reality' && ${config[transport]} != 'shadowtls' ]]; then
-echo "
-  haproxy:
-    image: ${image[haproxy]}
-    ports:
-    - ${config[port]}:8443
-    $([[ ${config[http_port]} != 'OFF' ]] && echo "- ${config[http_port]}:8080" || true)
-    restart: always
-    volumes:
-    - ./${path[haproxy]#${config_path}/}:/usr/local/etc/haproxy/haproxy.cfg
-    - ./${path[server_pem]#${config_path}/}:/usr/local/etc/haproxy/server.pem
-    networks:
-    - reality"
-fi)
+${nginx_service}
+${haproxy_service}
 $(if [[ ${config[security]} == 'letsencrypt' && ${config[transport]} != 'shadowtls' ]]; then
 echo "
   certbot:
@@ -1188,6 +1238,42 @@ EOF
 }
 
 function generate_haproxy_config {
+  # reality / shadowtls: the engine has to see the TLS handshake exactly as the
+  # client sent it (REALITY inspects it itself), so haproxy is a pure TCP front.
+  # It waits for the ClientHello, reads the SNI out of it and forwards the very
+  # same bytes to the engine. Anything that does not carry the proxy SNI - a
+  # browser opening https://<ip>, a probe with any other host name - goes to
+  # nginx, which terminates TLS and serves ./website.
+  if engine_owns_tls; then
+    cat >"${path[haproxy]}" <<EOF
+defaults
+  mode tcp
+  timeout connect 5s
+  timeout client 50s
+  timeout client-fin 1s
+  timeout server-fin 1s
+  timeout server 50s
+  timeout tunnel 50s
+frontend proxy
+  bind :::443 v4v6
+  mode tcp
+  # Hold the first bytes back for at most 5s: a real client sends its
+  # ClientHello immediately, this only caps how long a silent connection waits
+  # before the default backend takes it.
+  tcp-request inspect-delay 5s
+  tcp-request content accept if { req_ssl_hello_type 1 }
+  # The SNI the proxy clients send. Nothing else is routed to the engine.
+  use_backend engine if { req_ssl_sni -i ${config[domain]%%:*} }
+  default_backend website
+backend engine
+  mode tcp
+  server engine engine:443 check
+backend website
+  mode tcp
+  server nginx nginx:443 check
+EOF
+    return 0
+  fi
 echo "
 global
   ssl-default-bind-options ssl-min-ver TLSv1.2
@@ -1212,7 +1298,7 @@ $(if [[ ${config[security]} == 'letsencrypt' ]]; then echo "
   use_backend default
 frontend tls
 $(if [[ ${config[transport]} != 'tcp' ]]; then echo "
-  bind :::8443 v4v6 ssl crt /usr/local/etc/haproxy/server.pem alpn h2,http/1.1
+  bind :::443 v4v6 ssl crt /usr/local/etc/haproxy/server.pem alpn h2,http/1.1
   mode http
   http-request set-header Host ${config[server]}
 $(if [[ ${config[security]} == 'letsencrypt' ]]; then echo "
@@ -1223,7 +1309,7 @@ $(if [[ ${config[transport]} != 'tuic' && ${config[transport]} != 'hysteria2' ]]
 "; fi)
   use_backend default
 "; else echo "
-  bind :::8443 v4v6
+  bind :::443 v4v6
   mode tcp
   use_backend engine
 "; fi)
@@ -1236,13 +1322,13 @@ $(if [[ ${config[transport]} != 'tcp' ]]; then echo "
   mode tcp
 "; fi)
 $(if [[ ${config[transport]} == 'grpc' ]]; then echo "
-  server engine engine:8443 check tfo proto h2
+  server engine engine:443 check tfo proto h2
 "; elif [[ ${config[transport]} == 'http' && ${config[core]} == 'sing-box' ]]; then echo "
-  server engine engine:8443 check tfo proto h2 ssl verify none
+  server engine engine:443 check tfo proto h2 ssl verify none
 "; elif [[ ${config[transport]} == 'http' && ${config[core]} != 'sing-box' ]]; then echo "
-  server engine engine:8443 check tfo ssl verify none
+  server engine engine:443 check tfo ssl verify none
 "; else echo "
-  server engine engine:8443 check tfo
+  server engine engine:443 check tfo
 "; fi)
 "; fi)
 $(if [[ ${config[security]} == 'letsencrypt' ]]; then echo "
@@ -1254,6 +1340,30 @@ backend default
   mode http
   server nginx nginx:80
 " | grep -vE '^\s*$' > "${path[haproxy]}"
+}
+
+# In the passthrough modes haproxy must not terminate TLS, so nginx owns the
+# website certificate. It is self-signed by default; put a real certificate into
+# certificate/server.crt + certificate/server.key to replace it.
+function generate_nginx_config {
+  cat >"${path[nginx_conf]}" <<EOF
+server {
+  listen 80 default_server;
+  listen 443 ssl default_server;
+  http2 on;
+  server_name _;
+  root /usr/share/nginx/html;
+  index index.html;
+  ssl_certificate /etc/nginx/certificate/server.crt;
+  ssl_certificate_key /etc/nginx/certificate/server.key;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  ssl_session_cache shared:SSL:10m;
+  ssl_session_timeout 1h;
+  location / {
+    try_files \$uri \$uri/ =404;
+  }
+}
+EOF
 }
 
 function generate_certbot_script {
@@ -1530,7 +1640,7 @@ function generate_engine_config {
       "type": "${type}",
       "tag": "in",	
       "listen": "::",
-      "listen_port": 8443,
+      "listen_port": 443,
       "users": [${users_object}],
       $(if [[ ${config[security]} == 'reality' && ${config[transport]} != 'shadowtls' ]]; then
         echo "${reality_object}"
@@ -1734,7 +1844,7 @@ EOF
   "inbounds": [
     {
       "listen": "0.0.0.0",
-      "port": 8443,
+      "port": 443,
       "protocol": "vless",
       "tag": "inbound",
       "settings": {
@@ -1856,12 +1966,14 @@ function generate_config {
   generate_docker_compose
   generate_engine_config
   generate_website
-  if [[ ${config[security]} != "reality" && ${config[transport]} != 'shadowtls' ]]; then
-    mkdir -p "${config_path}/certificate"
-    generate_haproxy_config
-    if [[ ! -r "${path[server_pem]}" || ! -r "${path[server_crt]}" || ! -r "${path[server_key]}" ]]; then
-      generate_selfsigned_certificate
-    fi
+  generate_haproxy_config
+  mkdir -p "${config_path}/certificate"
+  if engine_owns_tls; then
+    # nginx terminates the website TLS here, so it needs the certificate too.
+    generate_nginx_config
+  fi
+  if [[ ! -r "${path[server_pem]}" || ! -r "${path[server_crt]}" || ! -r "${path[server_key]}" ]]; then
+    generate_selfsigned_certificate
   fi
   if [[ ${config[security]} == "letsencrypt" && ${config[transport]} != 'shadowtls' ]]; then
     mkdir -p "${config_path}/certbot"
@@ -1977,7 +2089,7 @@ function migrate_legacy_install {
   #
   # The containers of the old compose project are removed first: their names are
   # derived from the project name (reality-ezpz-engine-1, ...), so the new
-  # project would otherwise fail to publish 8443/8080 while the old ones keep
+  # project would otherwise fail to publish 443/8080 while the old ones keep
   # holding those ports.
   # The legacy path is a parameter only so the regression suite can point it at a
   # scratch directory instead of the real /opt; the single caller omits it.
@@ -2034,6 +2146,13 @@ function upgrade {
     # Normalise them to ON/OFF, otherwise every `== 'ON'` comparison silently
     # evaluates to false after an upgrade.
     sed -i 's|=true$|=ON|; s|=false$|=OFF|' "${path[config]}"
+    # The default proxy port moved from 8443 to 443, because the website now
+    # shares that port. 8443 is the value every previous default install wrote,
+    # so it is migrated once; any other port is a deliberate choice and stays.
+    if grep -qx 'port=8443' "${path[config]}"; then
+      sed -i 's|^port=8443$|port=443|' "${path[config]}"
+      echo 'The default proxy port moved from 8443 to 443 (the website now shares it); port=8443 has been migrated. Pick another port from the menu if you prefer.'
+    fi
   fi
   for key in "${!path[@]}"; do
     if [[ -d "${path[$key]}" ]]; then
@@ -2572,10 +2691,9 @@ function config_port_menu {
       message_box "Invalid Port" "Port 80 is reserved for the letsencrypt ACME challenge. Use another port (default: ${defaults[port]})."
       continue
     fi
-    if [[ ${port} -eq 443 ]]; then
-      if ! ui_yesno "Well-known Port" "Port 443 is a well-known port. The default (${defaults[port]}) is used so that the installation does not take 443 away from another service.\n\nUse 443 anyway?"; then
-        continue
-      fi
+    if [[ ${config[http_port]} != 'OFF' && ${port} -eq ${config[http_port]} ]]; then
+      message_box "Invalid Port" "The proxy port must differ from the website port (${config[http_port]})."
+      continue
     fi
     config[port]=$port
     update_config_file
@@ -2599,8 +2717,8 @@ function config_http_port_menu {
     elif [[ ${http_port} -eq 80 ]]; then
       message_box "Port 80" "Port 80 is only bound by the letsencrypt mode. Pick another port (default: ${defaults[http_port]}) or switch the security mode to letsencrypt."
       continue
-    elif [[ ${http_port} -eq 443 ]]; then
-      message_box "Port 443" "Port 443 is a well-known port and must not be claimed by an unencrypted HTTP listener."
+    elif [[ ${http_port} -eq ${config[port]} ]]; then
+      message_box "Port In Use" "Port ${config[port]} belongs to the proxy; pick another port for the website."
       continue
     else
       config[http_port]=${http_port}
@@ -3052,6 +3170,14 @@ function check_reload {
       md5["$key"]=$(get_md5 "${path[$key]}")
     fi
   done
+  # In the passthrough modes nginx is the process that reads the website
+  # certificate (haproxy must not terminate TLS there), so a changed
+  # certificate has to restart it as well.
+  if [[ "${restart[server_crt]}" == 'true' || "${restart[server_key]}" == 'true' ]]; then
+    if engine_owns_tls; then
+      restart[nginx]='true'
+    fi
+  fi
   if [[ "${restart[tgbot]}" == 'true' && "${config[tgbot]}" == 'ON' ]]; then
     restart_tgbot_compose
   fi
@@ -3293,6 +3419,7 @@ function generate_file_list {
   path[compose]="${config_path}/docker-compose.yml"
   path[engine]="${config_path}/engine.conf"
   path[haproxy]="${config_path}/haproxy.cfg"
+  path[nginx_conf]="${config_path}/nginx.conf"
   path[website]="${config_path}/website/index.html"
   path[certbot_deployhook]="${config_path}/certbot/deployhook.sh"
   path[certbot_dockerfile]="${config_path}/certbot/Dockerfile"
@@ -3309,6 +3436,7 @@ function generate_file_list {
   service[compose]='compose'
   service[engine]='engine'
   service[haproxy]='haproxy'
+  service[nginx_conf]='nginx'
   service[website]='nginx'
   service[certbot_deployhook]='certbot'
   service[certbot_dockerfile]='compose'
