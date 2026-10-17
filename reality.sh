@@ -142,6 +142,10 @@ defaults[hysteria2_down]=""
 defaults[tuic_congestion]="bbr"
 # Opt-in: put the Docker socket behind a narrow proxy for the Telegram bot.
 defaults[harden_docker]="OFF"
+# Opt-in Shadowsocks 2022 inbound. It is plain TCP with no TLS to share with the
+# website, so it gets a dedicated port; an empty value leaves it off.
+defaults[ss_port]=""
+defaults[ss_key]=""
 
 config_items=(
   "core"
@@ -173,6 +177,8 @@ config_items=(
   "tgbot_token"
   "tgbot_admins"
   "harden_docker"
+  "ss_port"
+  "ss_key"
 )
 
 # Fast membership lookup for config_items, used when rewriting the config file.
@@ -206,13 +212,14 @@ regex[cdn_camouflage]="(^|\.)(cloudflare|fastly|akamai|akamaiedge|cloudfront|ama
 
 function show_help {
   echo ""
-  echo "Usage: reality.sh [-t|--transport=tcp|http|grpc|ws|tuic|hysteria2|shadowtls] [-d|--domain=<domain>] [--camouflage=<domain[:port]>] [--server=<server>]
+  echo "Usage: reality.sh [-t|--transport=tcp|http|grpc|ws|tuic|hysteria2|shadowtls|anytls] [-d|--domain=<domain>] [--camouflage=<domain[:port]>] [--server=<server>]
   [--regenerate] [--default] [-r|--restart] [--enable-safenet=true|false] [--enable-bbr=true|false] [--port=<port>] [--http-port=<port|off>] [-c|--core=xray|sing-box]
   [--enable-warp=true|false] [--warp-license=<license>] [--security=reality|letsencrypt|selfsigned] [-m|--menu] [--show-server-config]
   [--add-user=<username>] [--lists-users] [--show-user=<username>] [--delete-user=<username>] [--backup] [--restore=<url|file>]
   [--backup-password=<password>] [-u|--uninstall]"
   echo ""
-  echo "  -t, --transport <tcp|http|grpc|ws|tuic|hysteria2|shadowtls> Transport protocol (tcp, http, grpc, ws, tuic, hysteria2, shadowtls, default: ${defaults[transport]})"
+  echo "  -t, --transport <tcp|http|grpc|ws|tuic|hysteria2|shadowtls|anytls> Transport protocol (default: ${defaults[transport]})"
+  echo "                            anytls needs the sing-box core and a real or self-signed certificate (not reality)"
   echo "  -d, --domain <domain>     Domain to use as SNI (default: ${defaults[domain]})"
   echo "      --camouflage <domain[:port]|self> Remote site the camouflage falls back to in the reality and shadowtls modes."
   echo "                            Unauthenticated probes are relayed to it, so it must be a real site whose certificate"
@@ -252,6 +259,7 @@ function show_help {
   echo "      --backup-password <password> Create/Restore password protected backup file"
   echo "      --hysteria2-up <mbps>  Server-side uplink for the hysteria2 transport (Brutal); needs --hysteria2-down"
   echo "      --hysteria2-down <mbps> Server-side downlink for the hysteria2 transport; the pair switches off client-reported bandwidth"
+  echo "      --ss-port <port|off>  Publish an additional Shadowsocks 2022 (aes-128-gcm) inbound on its own port (sing-box only, off by default)"
   echo "      --tuic-congestion <cubic|new_reno|bbr> Congestion control of the tuic transport (default: bbr)"
   echo "      --open-firewall       Open the proxy and website ports in the host firewall (ufw / firewalld); otherwise print them"
   echo "      --check-update        Compare the pinned image tags with the newest upstream tags and exit"
@@ -262,7 +270,7 @@ function show_help {
 
 function parse_args {
   local opts
-  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,harden-docker:,hysteria2-up:,hysteria2-down:,tuic-congestion:,open-firewall,check-update,doctor,help -- "$@")
+  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,harden-docker:,ss-port:,hysteria2-up:,hysteria2-down:,tuic-congestion:,open-firewall,check-update,doctor,help -- "$@")
   if [[ $? -ne 0 ]]; then
     return 1
   fi
@@ -272,7 +280,7 @@ function parse_args {
       -t|--transport)
         args[transport]="$2"
         case ${args[transport]} in
-          tcp|http|grpc|ws|tuic|hysteria2|shadowtls)
+          tcp|http|grpc|ws|tuic|hysteria2|shadowtls|anytls)
             shift 2
             ;;
           *)
@@ -554,6 +562,21 @@ function parse_args {
             ;;
         esac
         ;;
+      --ss-port)
+        case "${2,,}" in
+          ''|off)
+            args[ss_port]="off"
+            ;;
+          *)
+            if [[ ! $2 =~ ${regex[port]} ]] || (( $2 < 1 || $2 > 65535 )); then
+              echo "Invalid Shadowsocks port: $2"
+              return 1
+            fi
+            args[ss_port]="$2"
+            ;;
+        esac
+        shift 2
+        ;;
       --open-firewall)
         args[open_firewall]=true
         shift
@@ -822,6 +845,36 @@ function build_config {
   if [[ ${config[transport]} == 'shadowtls' && ${config[core]} == 'xray' ]]; then
     echo 'You cannot use "shadowtls" transport with "xray" core. Use other transports or change core to sing-box'
     exit 1
+  fi
+  if [[ ${config[transport]} == 'anytls' && ${config[core]} == 'xray' ]]; then
+    echo 'You cannot use "anytls" transport with "xray" core. Use other transports or change core to sing-box'
+    exit 1
+  fi
+  if [[ ${config[transport]} == 'anytls' && ${config[security]} == 'reality' ]]; then
+    echo 'You cannot use "anytls" transport with "reality" TLS certificate. Use other transports or change TLS certificate to letsencrypt or selfsigned'
+    exit 1
+  fi
+  # Shadowsocks 2022 is a second, plain inbound on a port of its own: it carries
+  # no TLS, so it cannot share the SNI-routed proxy port with the website.
+  if [[ ${config[ss_port],,} == 'off' ]]; then
+    config[ss_port]=""
+  fi
+  if [[ -n ${config[ss_port]} ]]; then
+    if [[ ! ${config[ss_port]} =~ ${regex[port]} ]] || (( config[ss_port] < 1 || config[ss_port] > 65535 )); then
+      echo "Invalid Shadowsocks port: ${config[ss_port]}"
+      exit 1
+    fi
+    if [[ ${config[ss_port]} == ${config[port]} || ${config[ss_port]} == ${config[http_port]} || ${config[ss_port]} == '80' ]]; then
+      echo "The Shadowsocks port (${config[ss_port]}) must differ from the proxy port, the HTTP port and 80."
+      exit 1
+    fi
+    if [[ ${config[core]} != 'sing-box' ]]; then
+      echo 'Shadowsocks 2022 is only generated for the sing-box core; use sing-box or drop --ss-port.'
+      exit 1
+    fi
+    if [[ -z ${config[ss_key]} ]]; then
+      config[ss_key]=$(openssl rand -base64 16)
+    fi
   fi
   # The bandwidth pair only means something for hysteria2; a lone value is dropped
   # with a note instead of failing an install that merely switched transport.
@@ -1185,7 +1238,19 @@ function engine_owns_tls {
   if [[ ${config[transport]} == 'tcp' && ${config[security]} == 'selfsigned' ]]; then
     return 0
   fi
+  # AnyTLS always terminates TLS in the engine (it has its own protocol framing),
+  # so the SNI split applies here too.
+  if [[ ${config[transport]} == 'anytls' ]]; then
+    return 0
+  fi
   return 1
+}
+
+# Shadowsocks 2022 wants per-user keys that are the base64 of a key of a fixed
+# length (16 bytes for aes-128-gcm). Deriving them from the user id keeps them
+# stable across regenerations, so existing clients stay valid.
+function ss2022_user_key {
+  printf '%s' "${1}${2}" | openssl dgst -sha256 -binary | head -c 16 | base64
 }
 
 # True when an ACME certificate has to be issued: the letsencrypt mode, or the
@@ -1207,7 +1272,7 @@ function generate_docker_compose {
   # Fragments that differ between the passthrough modes (reality / shadowtls)
   # and the terminating ones (letsencrypt / selfsigned). Built here, with plain
   # if statements, so the heredoc below stays readable.
-  local engine_udp_ports=''
+  local engine_ports=''
   local nginx_ports=''
   local nginx_expose=''
   local nginx_tls_volumes=''
@@ -1236,8 +1301,18 @@ function generate_docker_compose {
     haproxy_cert_volume="    - ./${path[server_pem]#${config_path}/}:/usr/local/etc/haproxy/server.pem"
   fi
   if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
-    engine_udp_ports="    ports:
+    engine_ports="
     - ${config[port]}:443/udp"
+  fi
+  # Shadowsocks 2022 is plain TCP/UDP on a port of its own; it never goes through
+  # haproxy, because it carries no TLS and therefore no SNI to split on.
+  if [[ -n ${config[ss_port]} ]]; then
+    engine_ports="${engine_ports}
+    - ${config[ss_port]}:${config[ss_port]}/tcp
+    - ${config[ss_port]}:${config[ss_port]}/udp"
+  fi
+  if [[ -n ${engine_ports} ]]; then
+    engine_ports="    ports:${engine_ports}"
   fi
   nginx_service="  nginx:
     image: ${image[nginx]}
@@ -1292,7 +1367,7 @@ services:
   engine:
     image: ${image[${config[core]}]}
     command: ${engine_command}
-${engine_udp_ports}
+${engine_ports}
     expose:
     - 443
     restart: always
@@ -1305,8 +1380,8 @@ ${engine_udp_ports}
       TZ: Etc/UTC
     volumes:
     - ./${path[engine]#${config_path}/}:/etc/${config[core]}/config.json
-    $([[ ${config[security]} != 'reality' ]] && { [[ ${config[transport]} == 'http' ]] || [[ ${config[transport]} == 'tcp' ]] || [[ ${config[transport]} == 'tuic' ]] || [[ ${config[transport]} == 'hysteria2' ]]; } && echo "- ./${path[server_crt]#${config_path}/}:/etc/${config[core]}/server.crt" || true)
-    $([[ ${config[security]} != 'reality' ]] && { [[ ${config[transport]} == 'http' ]] || [[ ${config[transport]} == 'tcp' ]] || [[ ${config[transport]} == 'tuic' ]] || [[ ${config[transport]} == 'hysteria2' ]]; } && echo "- ./${path[server_key]#${config_path}/}:/etc/${config[core]}/server.key" || true)
+    $([[ ${config[security]} != 'reality' ]] && { [[ ${config[transport]} == 'http' ]] || [[ ${config[transport]} == 'tcp' ]] || [[ ${config[transport]} == 'tuic' ]] || [[ ${config[transport]} == 'hysteria2' ]] || [[ ${config[transport]} == 'anytls' ]]; } && echo "- ./${path[server_crt]#${config_path}/}:/etc/${config[core]}/server.crt" || true)
+    $([[ ${config[security]} != 'reality' ]] && { [[ ${config[transport]} == 'http' ]] || [[ ${config[transport]} == 'tcp' ]] || [[ ${config[transport]} == 'tuic' ]] || [[ ${config[transport]} == 'hysteria2' ]] || [[ ${config[transport]} == 'anytls' ]]; } && echo "- ./${path[server_key]#${config_path}/}:/etc/${config[core]}/server.key" || true)
     networks:
     - reality
 ${nginx_service}
@@ -1579,7 +1654,7 @@ function generate_certbot_script {
   # certbot drops the challenge into the shared website directory instead of
   # binding port 80 itself (which that stack does not give it).
   local certbot_authenticator='--standalone'
-  if [[ ${config[camouflage]} == 'self' ]]; then
+  if engine_owns_tls; then
     certbot_authenticator='--webroot -w /website'
   fi
   cat >"${path[certbot_startup]}" << EOF
@@ -1592,7 +1667,7 @@ awk -F= '{print \$2}' | tr -d : | tr '[:upper:]' '[:lower:]')
   installed_fingerprint=\$(openssl x509 -noout -fingerprint -sha256 -in /certificate/server.pem 2>/dev/null |\
 awk -F= '{print \$2}' | tr -d : | tr '[:upper:]' '[:lower:]')
   if [[ \$fullchain_fingerprint != \$installed_fingerprint ]]; then
-    /deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true) $([[ ${config[camouflage]} == 'self' ]] && echo 'nginx' || true)
+    /deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true) $(engine_owns_tls && echo 'nginx' || true)
   fi
 fi
 while true; do
@@ -1615,7 +1690,7 @@ while true; do
     --agree-tos \\
     --register-unsafely-without-email \\
     -d ${config[server]} \\
-    --deploy-hook "/deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true) $([[ ${config[camouflage]} == 'self' ]] && echo 'nginx' || true)"
+    --deploy-hook "/deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true) $(engine_owns_tls && echo 'nginx' || true)"
   sleep 1h &
   wait \$!
 done
@@ -1747,6 +1822,7 @@ function generate_engine_config {
   local reality_object=""
   local tls_object=""
   local warp_object=""
+  local ss_users_object=""
   # The camouflage site is what unauthenticated probes reach; it is a separate
   # deployment input from the SNI, and its optional ":port" suffix defaults to 443.
   local camouflage_host="${config[camouflage]%%:*}"
@@ -1771,6 +1847,8 @@ function generate_engine_config {
     type='hysteria2'
   elif [[ ${config[transport]} == 'shadowtls' ]]; then
     type='shadowtls'
+  elif [[ ${config[transport]} == 'anytls' ]]; then
+    type='anytls'
   else
     type='vless'
   fi
@@ -1832,12 +1910,18 @@ function generate_engine_config {
       fi
       if [[ ${config[transport]} == 'tuic' ]]; then
         users_object=${users_object}'{"uuid": "'"${users[${user}]}"'", "password": "'"$(echo -n "${user}${users[${user}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)"'", "name": "'"${user}"'"}'
-      elif [[ ${config[transport]} == 'hysteria2' ]]; then
+      elif [[ ${config[transport]} == 'hysteria2' || ${config[transport]} == 'anytls' ]]; then
         users_object=${users_object}'{"password": "'"$(echo -n "${user}${users[${user}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)"'", "name": "'"${user}"'"}'
       elif [[ ${config[transport]} == 'shadowtls' ]]; then
         users_object=${users_object}'{"password": "'"${users[${user}]}"'", "name": "'"${user}"'"}'
       else
         users_object=${users_object}'{"uuid": "'"${users[${user}]}"'", "flow": "'"$([[ ${config[transport]} == 'tcp' ]] && echo 'xtls-rprx-vision' || true)"'", "name": "'"${user}"'"}'
+      fi
+      if [[ -n ${config[ss_port]} ]]; then
+        if [ -n "$ss_users_object" ]; then
+          ss_users_object="${ss_users_object},"$'\n'
+        fi
+        ss_users_object=${ss_users_object}'{"name": "'"${user}"'", "password": "'"$(ss2022_user_key "${user}" "${users[${user}]}")"'"}'
       fi
     done
     # Remote rule-sets are fetched through an explicitly declared HTTP client.
@@ -1872,7 +1956,7 @@ function generate_engine_config {
       "users": [${users_object}],
       $(if [[ ${config[security]} == 'reality' && ${config[transport]} != 'shadowtls' ]]; then
         echo "${reality_object}"
-      elif [[ ${config[transport]} == 'http' || ${config[transport]} == 'tcp' || ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
+      elif [[ ${config[transport]} == 'http' || ${config[transport]} == 'tcp' || ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' || ${config[transport]} == 'anytls' ]]; then
         echo "${tls_object}"
       elif [[ ${config[transport]} == 'shadowtls' ]]; then
         :
@@ -1908,6 +1992,17 @@ function generate_engine_config {
       "method": "chacha20-ietf-poly1305",
       "password": "'"${config[private_key]}"'",
       "users": ['"${users_object}"']
+    }'
+    fi )
+    $(if [[ -n ${config[ss_port]} ]]; then
+    echo ', {
+      "type": "shadowsocks",
+      "tag": "ss",
+      "listen": "::",
+      "listen_port": '"${config[ss_port]}"',
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "'"${config[ss_key]}"'",
+      "users": ['"${ss_users_object}"']
     }'
     fi )
   ],
@@ -2241,6 +2336,8 @@ function print_client_configuration {
   local client_config
   local ipv6
   local client_config_ipv6
+  local ss_config=''
+  local ss_config_ipv6=''
   if [[ ${config[transport]} == 'tuic' ]]; then
     client_config="tuic://"
     client_config="${client_config}${users[${username}]}"
@@ -2257,6 +2354,14 @@ function print_client_configuration {
     client_config="${client_config}:${config[port]}"
     client_config="${client_config}/?obfs=salamander&obfs-password=${config[service_path]}"
     client_config="${client_config}$([[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]] && echo "&up=${config[hysteria2_up]}&down=${config[hysteria2_down]}" || true)"
+    client_config="${client_config}$([[ ${config[security]} == 'selfsigned' ]] && echo "&insecure=1" || true)"
+    client_config="${client_config}#${username}"
+  elif [[ ${config[transport]} == 'anytls' ]]; then
+    client_config="anytls://"
+    client_config="${client_config}$(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)"
+    client_config="${client_config}@${config[server]}"
+    client_config="${client_config}:${config[port]}"
+    client_config="${client_config}/?sni=${config[domain]%%:*}"
     client_config="${client_config}$([[ ${config[security]} == 'selfsigned' ]] && echo "&insecure=1" || true)"
     client_config="${client_config}#${username}"
   elif [[ ${config[transport]} == 'shadowtls' ]]; then
@@ -2283,6 +2388,9 @@ function print_client_configuration {
     client_config="${client_config}$([[ ${config[transport]} == 'grpc' ]] && echo "&serviceName=${config[service_path]}" || true)"
     client_config="${client_config}#${username}"
   fi
+  if [[ -n ${config[ss_port]} ]]; then
+    ss_config="ss://$(printf '%s' "2022-blake3-aes-128-gcm:$(ss2022_user_key "${username}" "${users[${username}]}")" | base64 | tr -d '\n')@${config[server]}:${config[ss_port]}#${username}-ss"
+  fi
   echo ""
   echo "=================================================="
   echo "Client configuration:"
@@ -2292,12 +2400,26 @@ function print_client_configuration {
   echo "Or you can scan the QR code:"
   echo ""
   qrencode -t ansiutf8 "${client_config}"
+  if [[ -n ${ss_config} ]]; then
+    echo ""
+    echo "==================Shadowsocks 2022======================"
+    echo "Client configuration:"
+    echo ""
+    echo "${ss_config}"
+    echo ""
+    echo "Or you can scan the QR code:"
+    echo ""
+    qrencode -t ansiutf8 "${ss_config}"
+  fi
   ipv6=$(get_ipv6)
   if [[ -n $ipv6 ]]; then
     if [[ ${config[transport]} != 'shadowtls' ]]; then
       client_config_ipv6=$(echo "$client_config" | sed "s/@${config[server]//./\\.}:/@[${ipv6}]:/" | sed "s/#${username}/#${username}-ipv6/")
     else
       client_config_ipv6=$(echo "$client_config" | sed "s/\"server\":\"${config[server]//./\\.}\"/\"server\":\"${ipv6}\"/")
+    fi
+    if [[ -n ${ss_config} ]]; then
+      ss_config_ipv6=$(echo "$ss_config" | sed "s/@${config[server]//./\\.}:/@[${ipv6}]:/" | sed "s/#${username}-ss/#${username}-ss-ipv6/")
     fi
     echo ""
     echo "==================IPv6 Config======================"
@@ -2308,6 +2430,14 @@ function print_client_configuration {
     echo "Or you can scan the QR code:"
     echo ""
     qrencode -t ansiutf8 "${client_config_ipv6}"
+    if [[ -n ${ss_config_ipv6} ]]; then
+      echo ""
+      echo "Client configuration (Shadowsocks 2022):"
+      echo ""
+      echo "${ss_config_ipv6}"
+      echo ""
+      qrencode -t ansiutf8 "${ss_config_ipv6}"
+    fi
   fi
 }
 
@@ -2510,6 +2640,16 @@ OBFS Password: ${config[service_path]}
 $([[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]] && echo "Up: ${config[hysteria2_up]} Mbps" || true)
 $([[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]] && echo "Down: ${config[hysteria2_down]} Mbps" || true)
       " | tr -s '\n')
+    elif [[ ${config[transport]} == 'anytls' ]]; then
+      user_config=$(echo "
+Protocol: anytls
+Remarks: ${username}
+Address: ${config[server]}
+Port: ${config[port]}
+Password: $(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)
+SNI: ${config[domain]%%:*}
+$([[ ${config[security]} == 'selfsigned' ]] && echo "Allow Insecure: true" || true)
+      " | tr -s '\n')
     elif [[ ${config[transport]} == 'shadowtls' ]]; then
       user_config=$(echo "
 === First item of the chain proxy ===
@@ -2552,6 +2692,15 @@ $([[ ${config[security]} == 'selfsigned' ]] && echo "Allow Insecure: true" || tr
 $([[ ${config[security]} == 'reality' ]] && echo "PublicKey: ${config[public_key]}" || true)
 $([[ ${config[security]} == 'reality' ]] && echo "ShortId: ${config[short_id]}" || true)
       " | tr -s '\n')
+    fi
+    if [[ -n ${config[ss_port]} ]]; then
+      user_config="${user_config}
+Shadowsocks 2022 (extra inbound)
+Address: ${config[server]}
+Port: ${config[ss_port]}
+Method: 2022-blake3-aes-128-gcm
+Password: $(ss2022_user_key "${username}" "${users[${username}]}")
+"
     fi
     if ui_yesno "${username} details" "${user_config}\n\nShow the QR code and the client link?"; then
       print_client_configuration "${username}"
@@ -2786,7 +2935,8 @@ function config_transport_menu {
       "ws" "ws" \
       "tuic" "tuic" \
       "hysteria2" "hysteria2" \
-      "shadowtls" "shadowtls")
+      "shadowtls" "shadowtls" \
+      "anytls" "anytls")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2812,6 +2962,14 @@ function config_transport_menu {
     fi
     if [[ ${transport} == 'shadowtls' && ${config[core]} == 'xray' ]]; then
       message_box 'Invalid Configuration' 'You cannot use "shadowtls" transport with "xray" core. Use other transports or change core to "sing-box"'
+      continue
+    fi
+    if [[ ${transport} == 'anytls' && ${config[core]} == 'xray' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "anytls" transport with "xray" core. Use other transports or change core to "sing-box"'
+      continue
+    fi
+    if [[ ${transport} == 'anytls' && ${config[security]} == 'reality' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "anytls" transport with "reality" TLS certificate. Use other transports or change TLS certificate to "letsencrypt" or "selfsigned"'
       continue
     fi
     if [[ ${config[transport]} != 'shadowtls' && ${transport} == 'shadowtls' && ${config[security]} != 'reality' ]]; then
@@ -3967,6 +4125,10 @@ function open_firewall {
   fi
   if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
     udp_ports+=("${config[port]}")
+  fi
+  if [[ -n ${config[ss_port]} ]]; then
+    tcp_ports+=("${config[ss_port]}")
+    udp_ports+=("${config[ss_port]}")
   fi
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
     for port in "${tcp_ports[@]}"; do ufw allow "${port}/tcp" >/dev/null 2>&1 || true; done

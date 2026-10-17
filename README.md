@@ -247,7 +247,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 
 | 参数 | 说明 |
 | --- | --- |
-| `-t, --transport <tcp\|http\|grpc\|ws\|tuic\|hysteria2\|shadowtls>` | 传输协议（默认 `tcp`） |
+| `-t, --transport <tcp\|http\|grpc\|ws\|tuic\|hysteria2\|shadowtls\|anytls>` | 传输协议（默认 `tcp`）；`anytls` 需要 sing-box 内核与真实 / 自签证书（不能配 `reality`），由引擎自己终止 TLS |
 | `-d, --domain <domain>` | Reality 握手使用的 SNI 域名（默认跟随 `--camouflage`） |
 | `--camouflage <domain[:port]\|self>` | `reality` / `shadowtls` 模式下未通过校验的流量所回落的远端真实站点（默认 `www.fastly.com`，端口默认 `443`）；填 `self` 则回落本机网站并为 SNI 域名签发真实证书（需要 `--server` 是域名，且 ACME HTTP-01 使用端口 80） |
 | `--server <server>` | 本机公网 IP 或域名；使用 `letsencrypt` 时必须是域名 |
@@ -276,6 +276,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `--backup-password <password>` | 为备份设置密码 |
 | `--hysteria2-up <mbps>` / `--hysteria2-down <mbps>` | hysteria2 服务端上下行（Mbps），两个都填才生效：等价于关闭 `ignore_client_bandwidth`，改由服务端按此速率用 Brutal 整形 |
 | `--tuic-congestion <cubic\|new_reno\|bbr>` | tuic v5 的拥塞控制算法（默认 `bbr`） |
+| `--ss-port <port\|off>` | 额外开放一个 Shadowsocks 2022（`2022-blake3-aes-128-gcm`）入口，自带独立端口（仅 sing-box；默认关闭）。它不参与 SNI 分流，因为纯 TCP 没有 TLS SNI 可分；每个用户会派生一把稳定的独立密钥 |
 | `--open-firewall` | 在宿主防火墙（ufw / firewalld）放行代理与网站端口；未识别到防火墙时只打印需要在安全组放行的端口 |
 | `--check-update` | 对比钉死的镜像 tag 与上游最新 tag 后退出（只读，不改任何东西） |
 | `--doctor` | 对运行中的服务栈做一次只读体检（容器、端口、SNI 分流、证书、DNS）后退出 |
