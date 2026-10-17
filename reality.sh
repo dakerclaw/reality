@@ -134,6 +134,12 @@ defaults[server]=$(curl -fsSL --ipv4 -m 5 https://cloudflare.com/cdn-cgi/trace 2
 defaults[tgbot]=OFF
 defaults[tgbot_token]=""
 defaults[tgbot_admins]=""
+# QUIC transport tuning. hysteria2 ignores the rates while "ignore_client_bandwidth"
+# is true (the client reports its own); giving both switches the server to Brutal
+# shaping at the given rates. tuic v5 picks its congestion controller here.
+defaults[hysteria2_up]=""
+defaults[hysteria2_down]=""
+defaults[tuic_congestion]="bbr"
 
 config_items=(
   "core"
@@ -148,6 +154,9 @@ config_items=(
   "server"
   "port"
   "http_port"
+  "hysteria2_up"
+  "hysteria2_down"
+  "tuic_congestion"
   "safenet"
   "bbr"
   "warp"
@@ -232,13 +241,19 @@ function show_help {
   echo "      --backup              Backup users and configuration and upload it to ${backup_upload_url} (override with BACKUP_UPLOAD_URL)"
   echo "      --restore <url|file>  Restore backup from URL or file"
   echo "      --backup-password <password> Create/Restore password protected backup file"
+  echo "      --hysteria2-up <mbps>  Server-side uplink for the hysteria2 transport (Brutal); needs --hysteria2-down"
+  echo "      --hysteria2-down <mbps> Server-side downlink for the hysteria2 transport; the pair switches off client-reported bandwidth"
+  echo "      --tuic-congestion <cubic|new_reno|bbr> Congestion control of the tuic transport (default: bbr)"
+  echo "      --open-firewall       Open the proxy and website ports in the host firewall (ufw / firewalld); otherwise print them"
+  echo "      --check-update        Compare the pinned image tags with the newest upstream tags and exit"
+  echo "      --doctor              Run a health check of the running stack and exit"
   echo "  -h, --help                Display this help message"
   return 0
 }
 
 function parse_args {
   local opts
-  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,help -- "$@")
+  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,hysteria2-up:,hysteria2-down:,tuic-congestion:,open-firewall,check-update,doctor,help -- "$@")
   if [[ $? -ne 0 ]]; then
     return 1
   fi
@@ -489,6 +504,46 @@ function parse_args {
       --backup-password)
         args[backup_password]="$2"
         shift 2
+        ;;
+      --hysteria2-up)
+        args[hysteria2_up]="$2"
+        if ! [[ ${args[hysteria2_up]} =~ ^[0-9]+$ ]] || (( args[hysteria2_up] < 1 )); then
+          echo "Invalid hysteria2 uplink: ${args[hysteria2_up]} (a positive integer, Mbps)"
+          return 1
+        fi
+        shift 2
+        ;;
+      --hysteria2-down)
+        args[hysteria2_down]="$2"
+        if ! [[ ${args[hysteria2_down]} =~ ^[0-9]+$ ]] || (( args[hysteria2_down] < 1 )); then
+          echo "Invalid hysteria2 downlink: ${args[hysteria2_down]} (a positive integer, Mbps)"
+          return 1
+        fi
+        shift 2
+        ;;
+      --tuic-congestion)
+        args[tuic_congestion]="$2"
+        case ${args[tuic_congestion]} in
+          cubic|new_reno|bbr)
+            shift 2
+            ;;
+          *)
+            echo "Invalid tuic congestion control: ${args[tuic_congestion]} (cubic, new_reno or bbr)"
+            return 1
+            ;;
+        esac
+        ;;
+      --open-firewall)
+        args[open_firewall]=true
+        shift
+        ;;
+      --check-update)
+        args[check_update]=true
+        shift
+        ;;
+      --doctor)
+        args[doctor]=true
+        shift
         ;;
       -h|--help)
         args[help]=true
@@ -746,6 +801,22 @@ function build_config {
   if [[ ${config[transport]} == 'shadowtls' && ${config[core]} == 'xray' ]]; then
     echo 'You cannot use "shadowtls" transport with "xray" core. Use other transports or change core to sing-box'
     exit 1
+  fi
+  # The bandwidth pair only means something for hysteria2; a lone value is dropped
+  # with a note instead of failing an install that merely switched transport.
+  if [[ ${config[transport]} == 'hysteria2' && ( -n ${config[hysteria2_up]} || -n ${config[hysteria2_down]} ) ]]; then
+    if [[ -z ${config[hysteria2_up]} || -z ${config[hysteria2_down]} ]]; then
+      echo 'Note: both --hysteria2-up and --hysteria2-down are needed to shape bandwidth; ignoring the one that was given.'
+      config[hysteria2_up]=""
+      config[hysteria2_down]=""
+    fi
+  fi
+  # A stale value in the config file must not reach the engine as-is.
+  if [[ ${config[transport]} == 'tuic' ]]; then
+    case ${config[tuic_congestion]} in
+      cubic|new_reno|bbr) ;;
+      *) config[tuic_congestion]='bbr' ;;
+    esac
   fi
   # letsencrypt is the only mode that needs port 80, because the ACME HTTP-01
   # challenge is always served there. It is an explicit opt-in, so the HTTP side
@@ -1121,6 +1192,11 @@ function generate_docker_compose {
 ${nginx_ports}
 ${nginx_expose}
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     volumes:
     - ./website:/usr/share/nginx/html
 ${nginx_tls_volumes}
@@ -1132,6 +1208,11 @@ ${nginx_tls_volumes}
     - ${config[port]}:443
 ${haproxy_http_port}
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     volumes:
     - ./${path[haproxy]#${config_path}/}:/usr/local/etc/haproxy/haproxy.cfg
 ${haproxy_cert_volume}
@@ -1163,6 +1244,11 @@ ${engine_udp_ports}
     expose:
     - 443
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     environment:
       TZ: Etc/UTC
     volumes:
@@ -1181,6 +1267,11 @@ echo "
     expose:
     - 80
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     volumes:
     - /var/run/docker.sock:/var/run/docker.sock
     - ./certbot/data:/etc/letsencrypt
@@ -1211,6 +1302,11 @@ services:
   tgbot:
     build: ./
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     environment:
       BOT_TOKEN: ${config[tgbot_token]}
       BOT_ADMIN: ${config[tgbot_admins]}
@@ -1555,6 +1651,12 @@ function generate_engine_config {
   # deployment input from the SNI, and its optional ":port" suffix defaults to 443.
   local camouflage_host="${config[camouflage]%%:*}"
   local reality_port=443
+  # hysteria2 relays the bandwidth the client reports unless a rate pair is set,
+  # in which case the server shapes with Brutal instead.
+  local hysteria2_bandwidth=', "ignore_client_bandwidth": true'
+  if [[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]]; then
+    hysteria2_bandwidth=', "ignore_client_bandwidth": false, "up_mbps": '"${config[hysteria2_up]}"', "down_mbps": '"${config[hysteria2_down]}"''
+  fi
   local temp_file
   if [[ ${config[transport]} == 'tuic' ]]; then
     type='tuic'
@@ -1680,10 +1782,10 @@ function generate_engine_config {
       echo ',"transport": {"type": "ws", "headers": {"Host": "'"${config[server]}"'"}, "path": "/'"${config[service_path]}"'"}'
       fi
       if [[ ${config[transport]} == tuic ]]; then
-      echo ',"congestion_control": "bbr", "auth_timeout": "3s", "zero_rtt_handshake": false, "heartbeat": "10s"'
+      echo ',"congestion_control": "'"${config[tuic_congestion]}"'", "auth_timeout": "3s", "zero_rtt_handshake": false, "heartbeat": "10s"'
       fi
       if [[ ${config[transport]} == hysteria2 ]]; then
-      echo ',"obfs": {"type": "salamander", "password": "'"${config[service_path]}"'"}, "ignore_client_bandwidth": true, "masquerade": "https://'"${config[server]}:${config[port]}"'"'
+      echo ',"obfs": {"type": "salamander", "password": "'"${config[service_path]}"'"}'"${hysteria2_bandwidth}"', "masquerade": "https://'"${config[server]}:${config[port]}"'"'
       fi
       if [[ ${config[transport]} == shadowtls ]]; then
       echo '"version": 3, "strict_mode": false, "detour": "shadowsocks", "handshake": {"server": "'"${camouflage_host}"'", "server_port": '"${reality_port}"'}'
@@ -2038,7 +2140,7 @@ function print_client_configuration {
     client_config="${client_config}:$(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)"
     client_config="${client_config}@${config[server]}"
     client_config="${client_config}:${config[port]}"
-    client_config="${client_config}/?congestion_control=bbr&udp_relay_mode=quic"
+    client_config="${client_config}/?congestion_control=${config[tuic_congestion]}&udp_relay_mode=quic"
     client_config="${client_config}$([[ ${config[security]} == 'selfsigned' ]] && echo "&allow_insecure=1" || true)"
     client_config="${client_config}#${username}"
   elif [[ ${config[transport]} == 'hysteria2' ]]; then
@@ -2047,6 +2149,7 @@ function print_client_configuration {
     client_config="${client_config}@${config[server]}"
     client_config="${client_config}:${config[port]}"
     client_config="${client_config}/?obfs=salamander&obfs-password=${config[service_path]}"
+    client_config="${client_config}$([[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]] && echo "&up=${config[hysteria2_up]}&down=${config[hysteria2_down]}" || true)"
     client_config="${client_config}$([[ ${config[security]} == 'selfsigned' ]] && echo "&insecure=1" || true)"
     client_config="${client_config}#${username}"
   elif [[ ${config[transport]} == 'shadowtls' ]]; then
@@ -2286,7 +2389,7 @@ Port: ${config[port]}
 UUID: ${users[$username]}
 Password: $(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)
 UDP Relay Mode: quic
-Congestion Control: bbr
+Congestion Control: ${config[tuic_congestion]}
       " | tr -s '\n')
     elif [[ ${config[transport]} == 'hysteria2' ]]; then
       user_config=$(echo "
@@ -2297,6 +2400,8 @@ Port: ${config[port]}
 Password: $(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)
 OBFS Type: salamander
 OBFS Password: ${config[service_path]}
+$([[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]] && echo "Up: ${config[hysteria2_up]} Mbps" || true)
+$([[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]] && echo "Down: ${config[hysteria2_down]} Mbps" || true)
       " | tr -s '\n')
     elif [[ ${config[transport]} == 'shadowtls' ]]; then
       user_config=$(echo "
@@ -3661,6 +3766,210 @@ function configure_docker {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Actions that are not part of the install flow.
+# ---------------------------------------------------------------------------
+
+# Newest tag of a pinned image, restricted to the same "shape" as the pinned one
+# (same optional "v" prefix and suffix such as "-alpine"), so that a version is
+# compared like for like. Returns non-zero when the registry cannot be reached.
+function latest_image_tag {
+  local ref=$1
+  local repo="${ref%:*}"
+  local tags
+  local pattern
+  case "${ref}" in
+    ghcr.io/xtls/xray-core:*)    pattern='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    ghcr.io/sagernet/sing-box:*) pattern='^v[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    nginx:*)                     pattern='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    certbot/certbot:*)           pattern='^v[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    haproxy:*)                   pattern='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    python:*)                    pattern='^[0-9]+\.[0-9]+-alpine$' ;;
+    *)                           return 1 ;;
+  esac
+  if [[ ${repo} == ghcr.io/* ]]; then
+    local ghcr_repo="${repo#ghcr.io/}"
+    local token
+    token=$(curl -fsSL -m 15 "https://ghcr.io/token?scope=repository:${ghcr_repo}:pull&service=ghcr.io" | jq -r '.token // empty' 2>/dev/null) || return 1
+    if [[ -z ${token} ]]; then
+      return 1
+    fi
+    tags=$(curl -fsSL -m 15 -H "Authorization: Bearer ${token}" "https://ghcr.io/v2/${ghcr_repo}/tags/list" | jq -r '.tags[]? // empty' 2>/dev/null) || return 1
+  else
+    local hub_repo="${repo}"
+    if [[ ${hub_repo} != */* ]]; then
+      hub_repo="library/${hub_repo}"
+    fi
+    tags=$(curl -fsSL -m 20 "https://hub.docker.com/v2/repositories/${hub_repo}/tags?page_size=100" | jq -r '.results[]?.name // empty' 2>/dev/null) || return 1
+  fi
+  if [[ -z ${tags} ]]; then
+    return 1
+  fi
+  printf '%s\n' "${tags}" | grep -E "${pattern}" | sort -V | tail -n 1
+}
+
+function check_update {
+  if ! command -v jq >/dev/null 2>&1; then
+    echo 'The update check needs jq and curl; install them and try again.'
+    return 1
+  fi
+  echo "Pinned images vs. their upstream registries:"
+  local ref pinned latest
+  local outdated=0
+  for ref in "${image[xray]}" "${image[sing-box]}" "${image[nginx]}" "${image[certbot]}" "${image[haproxy]}" "${image[python]}"; do
+    pinned="${ref##*:}"
+    if latest=$(latest_image_tag "${ref}"); then
+      if [[ ${latest} == "${pinned}" ]]; then
+        printf '  ok   %-42s %s\n' "${ref}" "up to date"
+      else
+        printf '  !    %-42s pinned %s, newest %s\n' "${ref}" "${pinned}" "${latest}"
+        outdated=$((outdated + 1))
+      fi
+    else
+      printf '  ?    %-42s registry not reachable\n' "${ref}"
+    fi
+  done
+  if [[ ${outdated} -eq 0 ]]; then
+    echo 'All pinned images are current.'
+  else
+    echo "${outdated} image(s) have a newer tag upstream; update the image[] pins after reading the changelog."
+  fi
+}
+
+# Open the ports the stack publishes in the host firewall. ufw and firewalld are
+# handled directly; anything else (or none) just prints the list, because a wrong
+# nftables rule is worse than no rule at all.
+function open_firewall {
+  local tcp_ports=("${config[port]}")
+  local udp_ports=()
+  local port
+  if [[ ${config[http_port]} != 'OFF' ]]; then
+    tcp_ports+=("${config[http_port]}")
+  fi
+  if [[ ${config[security]} == 'letsencrypt' ]]; then
+    tcp_ports+=('80')
+  fi
+  if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
+    udp_ports+=("${config[port]}")
+  fi
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    for port in "${tcp_ports[@]}"; do ufw allow "${port}/tcp" >/dev/null 2>&1 || true; done
+    for port in "${udp_ports[@]}"; do ufw allow "${port}/udp" >/dev/null 2>&1 || true; done
+    echo "Opened in ufw: ${tcp_ports[*]}/tcp"
+    if [[ ${#udp_ports[@]} -gt 0 ]]; then
+      echo "Opened in ufw: ${udp_ports[*]}/udp"
+    fi
+    return 0
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+    for port in "${tcp_ports[@]}"; do firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true; done
+    for port in "${udp_ports[@]}"; do firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1 || true; done
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    echo "Opened in firewalld: ${tcp_ports[*]}/tcp"
+    if [[ ${#udp_ports[@]} -gt 0 ]]; then
+      echo "Opened in firewalld: ${udp_ports[*]}/udp"
+    fi
+    return 0
+  fi
+  echo 'No active ufw/firewalld was detected, so no host rule was changed.'
+  echo "Allow these in your provider's firewall / security group:"
+  echo "  tcp ${tcp_ports[*]}"
+  if [[ ${#udp_ports[@]} -gt 0 ]]; then
+    echo "  udp ${udp_ports[*]}"
+  fi
+  return 0
+}
+
+# A read-only health check of the local stack. It never changes anything.
+function doctor {
+  local -i problems=0
+  local check running
+  echo 'reality doctor'
+  echo '=============='
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    echo 'ok    docker daemon is running'
+  else
+    echo 'FAIL  docker daemon is not running (or docker is not installed)'
+    problems=$((problems + 1))
+  fi
+  for check in engine nginx haproxy; do
+    running=$(${docker_cmd} -p "${compose_project}" ps --status running -q "${check}" 2>/dev/null | head -n 1)
+    if [[ -n ${running} ]]; then
+      echo "ok    service ${check} is running"
+    else
+      echo "FAIL  service ${check} is not running"
+      problems=$((problems + 1))
+    fi
+  done
+  if [[ ${config[security]} == 'letsencrypt' && ${config[transport]} != 'shadowtls' ]]; then
+    running=$(${docker_cmd} -p "${compose_project}" ps --status running -q certbot 2>/dev/null | head -n 1)
+    if [[ -n ${running} ]]; then
+      echo 'ok    service certbot is running'
+    else
+      echo 'warn  service certbot is not running'
+    fi
+  fi
+  if port_in_use "${config[port]}"; then
+    echo "ok    proxy port ${config[port]} is listening"
+  else
+    echo "FAIL  nothing is listening on the proxy port ${config[port]}"
+    problems=$((problems + 1))
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    check=$(echo | timeout 10 openssl s_client -connect "127.0.0.1:${config[port]}" -servername "${config[domain]%%:*}" -tls1_3 2>/dev/null | grep -c 'TLSv1.3' || true)
+    if [[ ${check} -ge 1 ]]; then
+      echo "ok    TLS 1.3 handshake for SNI ${config[domain]%%:*} on ${config[port]} succeeds"
+    else
+      echo "FAIL  no TLS 1.3 handshake for SNI ${config[domain]%%:*} on ${config[port]}"
+      problems=$((problems + 1))
+    fi
+    if engine_owns_tls; then
+      check=$(echo | timeout 10 openssl s_client -connect "127.0.0.1:${config[port]}" -servername 'doctor.invalid' 2>/dev/null | grep -c 'BEGIN CERTIFICATE' || true)
+      if [[ ${check} -ge 1 ]]; then
+        echo 'ok    a non-proxy SNI still reaches a website certificate'
+      else
+        echo 'warn  a non-proxy SNI did not get a certificate back'
+      fi
+    fi
+  else
+    echo 'warn  openssl is not available; skipping the TLS checks'
+  fi
+  if [[ ${config[http_port]} != 'OFF' ]] && command -v curl >/dev/null 2>&1; then
+    if curl -fsS -m 5 -o /dev/null "http://127.0.0.1:${config[http_port]}/"; then
+      echo "ok    website answers on http://127.0.0.1:${config[http_port]}/"
+    else
+      echo "warn  the website did not answer on http://127.0.0.1:${config[http_port]}/"
+    fi
+  fi
+  if [[ -f ${path[server_pem]} ]] && command -v openssl >/dev/null 2>&1; then
+    check=$(openssl x509 -enddate -noout -in "${path[server_pem]}" 2>/dev/null | cut -d= -f2 || true)
+    if [[ -n ${check} ]]; then
+      echo "info  certificate notAfter: ${check}"
+    fi
+  fi
+  if [[ ${config[server]} =~ ${regex[domain]} ]]; then
+    check=$(getent hosts "${config[server]}" 2>/dev/null | awk '{print $1; exit}' || true)
+    if [[ -n ${check} ]]; then
+      echo "info  ${config[server]} resolves to ${check}"
+    else
+      echo "warn  ${config[server]} does not resolve"
+    fi
+  fi
+  echo
+  echo "Ports to allow in the provider firewall / security group:"
+  echo "  tcp: ${config[port]}$([[ ${config[http_port]} != 'OFF' ]] && echo " ${config[http_port]}" || true)$([[ ${config[security]} == 'letsencrypt' ]] && echo ' 80' || true)"
+  if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
+    echo "  udp: ${config[port]}"
+  fi
+  echo
+  if [[ ${problems} -eq 0 ]]; then
+    echo 'No hard failures found.'
+  else
+    echo "${problems} hard failure(s) found."
+  fi
+  return 0
+}
+
 if ! parse_args "$@"; then
   show_help
   exit 1
@@ -3713,6 +4022,10 @@ if [[ -n ${args[restore]} ]]; then
 fi
 generate_file_list
 install_packages
+if [[ ${args[check_update]} == true ]]; then
+  check_update || true
+  exit 0
+fi
 install_docker
 configure_docker
 upgrade
@@ -3728,6 +4041,16 @@ update_users_file
 RELOAD_DEFERRED=0
 tune_kernel
 flush_reload
+
+# --open-firewall and --doctor are one-shot diagnostics: they run after the
+# configuration is built so they can use the resolved ports and SNI.
+if [[ ${args[open_firewall]} == true ]]; then
+  open_firewall
+fi
+if [[ ${args[doctor]} == true ]]; then
+  doctor
+  exit 0
+fi
 
 if [[ ${args[menu]} == 'true' ]]; then
   set +e
