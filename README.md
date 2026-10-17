@@ -110,6 +110,7 @@ bash /opt/reality/reality.sh --menu
 * 选择 `--security letsencrypt` 时脚本会把 HTTP 端口切到 `80` 并明确提示，因为 ACME
   HTTP-01 校验只能走 80 端口；切回 `reality` / `selfsigned` 后会自动恢复为 `8080`。
 * `selfsigned` + `tcp` 与 `reality` 走同一套 SNI 分流（引擎自己终结 TLS，网站用自签证书）。
+  只填 IP 时 SNI 会自动落到默认站点（见[可以不买域名吗](#可以不买域名吗)）。
   `http` / `grpc` / `ws` 传输则由 haproxy 终结 TLS 并按路径分流，网站同样在 `443` 上
   （`letsencrypt` 用你申请到的证书，浏览器不会提示；`selfsigned` 仍是自签证书）。
 * `letsencrypt` + `tcp` 是唯一例外：浏览器和代理客户端发出的 SNI 完全相同，无法区分，
@@ -170,7 +171,7 @@ ls /opt/reality/config/website
 | --- | --- | --- |
 | `reality`（默认） | 不需要 | SNI 用的是**远端**伪装大站（`--camouflage`，默认 `www.fastly.com`），探测者拿到的是那个站点的真实证书 |
 | `shadowtls` 传输 | 不需要 | 握手服务器同样是远端伪装大站 |
-| `selfsigned` | 严格说不必要 | 自签证书；客户端必须接受不受信任的证书（`allow_insecure` / `insecure=1`），主动探测能够察觉 |
+| `selfsigned` | 不需要 | 自签证书；客户端必须接受不受信任的证书（`allow_insecure` / `insecure=1`，客户端链接里已经带上），主动探测能够察觉。只填公网 IP 时 SNI 会自动落到默认站点，因为客户端从不把 IP 当作 TLS SNI 发出去 |
 | `letsencrypt` | **需要** | 为你的自有域名签发公信证书 —— ACME HTTP-01 要求该域名解析到本机，并占用 `80` 端口 |
 
 所以纯粹只有公网 IP 的机器，**没有任何需要填写的东西**：
@@ -190,7 +191,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 * 只要不涉及 `letsencrypt`，`--server` 直接填公网 IP 即可；能自动探测时脚本会自己探测，
   只有在探测失败且未手工指定时才会以提示信息中止安装。
 * `ws`、`tuic`、`hysteria2` 与 `reality` 组合会被拒绝（它们需要真正的 TLS 终结）。没有域名时
-  可用的组合是 `reality` + `tcp` / `http` / `grpc`，或者 `shadowtls` 传输。
+  可用的组合是 `reality` + `tcp` / `http` / `grpc`、`selfsigned` + `tcp` / `http` / `grpc`，
+  或者 `shadowtls` 传输。`selfsigned` 只填 IP 时，SNI 会自动设成默认站点而不是那个 IP ——
+  客户端从不把 IP 当作 TLS SNI 发出去，若真设成 IP，`443` 上的 SNI 分流会把代理流量误送到网站。
 * 代价是你借用了别人的域名：请选一个**服务器与客户端都能访问**、且 TLS 指纹普通的站点。
   详见[安全说明](#安全说明)。
 

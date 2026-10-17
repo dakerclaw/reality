@@ -263,6 +263,10 @@ function parse_args {
           echo "Invalid domain: ${args[domain]}"
           return 1
         fi
+        if [[ ${args[domain]} =~ : ]] && (( ${args[domain]#*:} > 65535 )); then
+          echo "Domain port out of range: ${args[domain]#*:}"
+          return 1
+        fi
         shift 2
         ;;
       --camouflage)
@@ -776,22 +780,27 @@ function build_config {
     exit 1
   fi
 
+  # An explicit --domain always wins: none of the derivations below may silently
+  # overwrite it. When the SNI is taken from the server address and that address
+  # is a bare IP, a real host name is used instead - a client never puts an IP
+  # into the TLS SNI, so an IP SNI could never match the haproxy split and every
+  # proxy connection would end up on the website instead of the engine.
   if [[ -n "${args[security]}" && "${args[security]}" == 'reality' && "${config_file[security]}" != 'reality' && "${config_file[transport]}" != 'shadowtls' && -z "${args[domain]}" ]]; then
     config[domain]="${config[camouflage]}"
   fi
-  if [[ -n "${args[security]}" && "${args[security]}" != 'reality' && "${config_file[security]}" == 'reality' && "${config_file[transport]}" != 'shadowtls' ]]; then
-    config[domain]="${config[server]}"
+  if [[ -n "${args[security]}" && "${args[security]}" != 'reality' && "${config_file[security]}" == 'reality' && "${config_file[transport]}" != 'shadowtls' && -z "${args[domain]}" ]]; then
+    config[domain]="$([[ ${config[server]} =~ ${regex[ip]} ]] && echo "${defaults[domain]}" || echo "${config[server]}")"
   fi
-  
+
   if [[ -n "${args[transport]}" && "${args[transport]}" == 'shadowtls' && "${config_file[transport]}" != 'shadowtls' && "${config_file[security]}" != 'reality' && -z "${args[domain]}" ]]; then
     config[domain]="${config[camouflage]}"
   fi
-  if [[ -n "${args[transport]}" && "${args[transport]}" != 'shadowtls' && "${config_file[transport]}" == 'shadowtls' && "${config_file[security]}" != 'reality' ]]; then
-    config[domain]="${config[server]}"
+  if [[ -n "${args[transport]}" && "${args[transport]}" != 'shadowtls' && "${config_file[transport]}" == 'shadowtls' && "${config_file[security]}" != 'reality' && -z "${args[domain]}" ]]; then
+    config[domain]="$([[ ${config[server]} =~ ${regex[ip]} ]] && echo "${defaults[domain]}" || echo "${config[server]}")"
   fi
 
-  if [[ -n "${args[server]}" && "${config[security]}" != 'reality' && "${config[transport]}" != 'shadowtls' ]]; then
-    config[domain]="${config[server]}"
+  if [[ -n "${args[server]}" && "${config[security]}" != 'reality' && "${config[transport]}" != 'shadowtls' && -z "${args[domain]}" ]]; then
+    config[domain]="$([[ ${config[server]} =~ ${regex[ip]} ]] && echo "${defaults[domain]}" || echo "${config[server]}")"
   fi
 
   # The camouflage target only exists in the reality and shadowtls modes, where
@@ -815,6 +824,16 @@ function build_config {
       echo "Warning: the SNI (${config[domain]%%:*}) differs from the camouflage site (${config[camouflage]%%:*})."
       echo 'A probe sends the SNI and compares the certificate it gets back against it, so those are expected to be the same domain.'
     fi
+  fi
+
+  # letsencrypt issues the certificate for the server domain, so the SNI has to
+  # be that very domain; any other value would only break the client's
+  # certificate verification (there is no allow_insecure for a public cert).
+  if [[ ${config[security]} == 'letsencrypt' && ${config[transport]} != 'shadowtls' ]]; then
+    if [[ -n "${args[domain]}" && "${args[domain]%%:*}" != "${config[server]}" ]]; then
+      echo "Note: letsencrypt issues the certificate for ${config[server]}; the SNI is set to it and --domain is ignored."
+    fi
+    config[domain]="${config[server]}"
   fi
 
   if [[ -n "${args[warp]}" && "${args[warp]}" == 'OFF' && "${config_file[warp]}" == 'ON' ]]; then
@@ -2042,6 +2061,7 @@ function print_client_configuration {
     client_config="${client_config}&alpn=$([[ ${config[transport]} == 'ws' ]] && echo 'http/1.1' || echo 'h2,http/1.1')"
     client_config="${client_config}&headerType=none"
     client_config="${client_config}&fp=chrome"
+    client_config="${client_config}$([[ ${config[security]} == 'selfsigned' ]] && echo "&allowInsecure=1" || true)"
     client_config="${client_config}&type=$([[ ${config[core]} == 'xray' && ${config[transport]} == 'http' ]] && echo 'xhttp' || echo "${config[transport]}")"
     client_config="${client_config}&flow=$([[ ${config[transport]} == 'tcp' ]] && echo 'xtls-rprx-vision' || true)"
     client_config="${client_config}&sni=${config[domain]%%:*}"
@@ -2316,6 +2336,7 @@ TLS: $([[ ${config[security]} == 'reality' ]] && echo 'reality' || echo 'tls')
 SNI: ${config[domain]%%:*}
 ALPN: $([[ ${config[transport]} == 'ws' ]] && echo 'http/1.1' || echo 'h2,http/1.1')
 Fingerprint: chrome
+$([[ ${config[security]} == 'selfsigned' ]] && echo "Allow Insecure: true" || true)
 $([[ ${config[security]} == 'reality' ]] && echo "PublicKey: ${config[public_key]}" || true)
 $([[ ${config[security]} == 'reality' ]] && echo "ShortId: ${config[short_id]}" || true)
       " | tr -s '\n')
@@ -2513,16 +2534,30 @@ function config_server_menu {
     if [[ $? -ne 0 ]]; then
       break
     fi
+    if [[ -z ${server} ]]; then
+      server="${defaults[server]}"
+    fi
+    # An auto-detected address can be empty when the machine is offline. Storing
+    # it would make every client configuration point at nothing until the next
+    # full run aborts with a confusing message, so it is rejected here.
+    if [[ -z ${server} ]]; then
+      message_box 'Invalid Configuration' 'Could not determine the server address automatically. Enter the public IP address or domain name by hand.'
+      continue
+    fi
     if [[ ! ${server} =~ ${regex[domain]} && ${config[security]} == 'letsencrypt' ]]; then
       message_box 'Invalid Configuration' 'You have to assign a valid domain to server if you want to use "letsencrypt" certificate.'
       continue
     fi
-    if [[ -z ${server} ]]; then
-      server="${defaults[server]}"
-    fi
     config[server]="${server}"
     if [[ ${config[security]} != 'reality' && ${config[transport]} != 'shadowtls' ]]; then
-      config[domain]="${server}"
+      # A bare IP can never be sent as the TLS SNI by a client, so keep a real
+      # host name for it; otherwise the haproxy SNI split would route the proxy
+      # traffic to the website.
+      if [[ ${server} =~ ${regex[ip]} ]]; then
+        config[domain]="${defaults[domain]}"
+      else
+        config[domain]="${server}"
+      fi
     fi
     update_config_file
     break
@@ -2612,7 +2647,18 @@ function config_sni_domain_menu {
       message_box "Invalid Domain" '"'"${sni_domain}"'" in not a valid domain.'
       continue
     fi
+    if [[ $sni_domain =~ : ]] && (( ${sni_domain#*:} > 65535 )); then
+      message_box "Invalid Port" 'The SNI port must be between 1 and 65535.'
+      continue
+    fi
     config[domain]=$sni_domain
+    # In reality / shadowtls the fallback site has to answer with a certificate
+    # for this very name, so the two are kept in sync here just like the CLI does
+    # when only --domain is given. Otherwise a probe would receive a certificate
+    # that does not match the SNI it sent, which is what it looks for.
+    if [[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]]; then
+      config[camouflage]="${sni_domain%%:*}"
+    fi
     update_config_file
     break
   done
@@ -2661,10 +2707,19 @@ function config_security_menu {
       fi
     fi
     if [[ ${security} != 'reality' && ${config[transport]} != 'shadowtls' ]]; then
-      config[domain]="${config[server]}"
+      # A bare IP can never be an SNI; keep a host name so the haproxy split
+      # still reaches the engine.
+      if [[ ${config[server]} =~ ${regex[ip]} ]]; then
+        config[domain]="${defaults[domain]}"
+      else
+        config[domain]="${config[server]}"
+      fi
     fi
     if [[ ${config[security]} != 'reality' && ${security} == 'reality' && ${config[transport]} != 'shadowtls' ]]; then
-      config[domain]="${defaults[domain]}"
+      # reality falls back to a remote site, so its SNI has to be that site, not
+      # the default one - otherwise the returned certificate would not match.
+      config[domain]="${config[camouflage]:-${defaults[camouflage]}}"
+      config[domain]="${config[domain]%%:*}"
     fi
     config[security]="${security}"
     update_config_file
@@ -2703,6 +2758,15 @@ function config_port_menu {
 
 function config_http_port_menu {
   local http_port
+  # The ACME HTTP-01 challenge always needs port 80, and build_config pins the
+  # HTTP port to 80 in this mode. Offering a choice that the next full run would
+  # overwrite anyway (and rejecting the mandatory 80) is worse than doing nothing.
+  if [[ ${config[security]} == 'letsencrypt' ]]; then
+    config[http_port]=80
+    update_config_file
+    message_box "HTTP Port" "The letsencrypt mode always uses port 80 for the ACME HTTP-01 challenge; the HTTP port has been kept at 80."
+    return
+  fi
   while true; do
     http_port=$(ui_input "HTTP Port" "Host port of the local website served by nginx out of ./website.\nIn the letsencrypt mode it also carries the ACME HTTP-01 challenge (always port 80).\n\nEnter \"off\" to leave it unpublished. Default: ${defaults[http_port]}" \
       "${config[http_port]}")
