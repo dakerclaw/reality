@@ -140,6 +140,8 @@ defaults[tgbot_admins]=""
 defaults[hysteria2_up]=""
 defaults[hysteria2_down]=""
 defaults[tuic_congestion]="bbr"
+# Opt-in: put the Docker socket behind a narrow proxy for the Telegram bot.
+defaults[harden_docker]="OFF"
 
 config_items=(
   "core"
@@ -170,6 +172,7 @@ config_items=(
   "tgbot"
   "tgbot_token"
   "tgbot_admins"
+  "harden_docker"
 )
 
 # Fast membership lookup for config_items, used when rewriting the config file.
@@ -197,6 +200,9 @@ regex[tgbot_admins]="^([a-zA-Z][a-zA-Z0-9_]{4,31}|[0-9]{4,15})(,([a-zA-Z][a-zA-Z
 regex[domain_port]="^[a-zA-Z0-9]+([-.][a-zA-Z0-9]+)*\.[a-zA-Z]{2,}(:[1-9][0-9]*)?$"
 regex[file_path]="^[a-zA-Z0-9_/.-]+$"
 regex[url]="^(http|https)://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[0-9]{1,3}(\.[0-9]{1,3}){3})(:[0-9]{1,5})?(/.*)?$"
+# Large CDNs answer probes with their own edge stack and sometimes rate-limit
+# them, which makes them a weaker camouflage than a site you control.
+regex[cdn_camouflage]="(^|\.)(cloudflare|fastly|akamai|akamaiedge|cloudfront|amazonaws|googleapis|googleusercontent|gstatic|microsoft|azureedge|jsdelivr|unpkg|bing)\."
 
 function show_help {
   echo ""
@@ -208,9 +214,11 @@ function show_help {
   echo ""
   echo "  -t, --transport <tcp|http|grpc|ws|tuic|hysteria2|shadowtls> Transport protocol (tcp, http, grpc, ws, tuic, hysteria2, shadowtls, default: ${defaults[transport]})"
   echo "  -d, --domain <domain>     Domain to use as SNI (default: ${defaults[domain]})"
-  echo "      --camouflage <domain[:port]> Remote site the camouflage falls back to in the reality and shadowtls modes."
+  echo "      --camouflage <domain[:port]|self> Remote site the camouflage falls back to in the reality and shadowtls modes."
   echo "                            Unauthenticated probes are relayed to it, so it must be a real site whose certificate"
   echo "                            matches the SNI; the SNI follows it unless --domain is given explicitly (default: ${defaults[camouflage]})"
+  echo "                            \"self\" relays to the local website, which then gets a real certificate for the SNI domain"
+  echo "                            (needs --server <domain> and the ACME HTTP-01 challenge on port 80)"
   echo "      --server <server>     IP address or domain name of server (Must be a valid domain if using letsencrypt security)"
   echo "      --regenerate          Regenerate public and private keys"
   echo "      --default             Restore default configuration"
@@ -233,6 +241,7 @@ function show_help {
   echo "      --enable-tgbot <true|false> Enable Telegram bot for user management"
   echo "      --tgbot-token <token> Token of Telegram bot"
   echo "      --tgbot-admins <usernames|ids> Telegram bot admins: usernames without the leading '@' or numeric user ids (comma separated)"
+  echo "      --harden-docker <true|false> Put the Docker socket behind a narrow proxy for the Telegram bot (default: ${defaults[harden_docker]})"
   echo "      --show-server-config  Print server configuration"
   echo "      --add-user <username> Add new user"
   echo "      --list-users          List all users"
@@ -253,7 +262,7 @@ function show_help {
 
 function parse_args {
   local opts
-  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,hysteria2-up:,hysteria2-down:,tuic-congestion:,open-firewall,check-update,doctor,help -- "$@")
+  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,harden-docker:,hysteria2-up:,hysteria2-down:,tuic-congestion:,open-firewall,check-update,doctor,help -- "$@")
   if [[ $? -ne 0 ]]; then
     return 1
   fi
@@ -286,11 +295,11 @@ function parse_args {
         ;;
       --camouflage)
         args[camouflage]="$2"
-        if ! [[ ${args[camouflage]} =~ ${regex[domain_port]} ]]; then
-          echo "Invalid camouflage site: ${args[camouflage]}"
+        if [[ ${args[camouflage]} != 'self' ]] && ! [[ ${args[camouflage]} =~ ${regex[domain_port]} ]]; then
+          echo "Invalid camouflage site: ${args[camouflage]} (a domain, domain:port, or \"self\")"
           return 1
         fi
-        if [[ ${args[camouflage]} =~ : ]] && (( ${args[camouflage]#*:} > 65535 )); then
+        if [[ ${args[camouflage]} != 'self' && ${args[camouflage]} =~ : ]] && (( ${args[camouflage]#*:} > 65535 )); then
           echo "Camouflage port out of range: ${args[camouflage]#*:}"
           return 1
         fi
@@ -529,6 +538,18 @@ function parse_args {
             ;;
           *)
             echo "Invalid tuic congestion control: ${args[tuic_congestion]} (cubic, new_reno or bbr)"
+            return 1
+            ;;
+        esac
+        ;;
+      --harden-docker)
+        case "$2" in
+          true|false)
+            if [[ $2 == true ]]; then args[harden_docker]=ON; else args[harden_docker]=OFF; fi
+            shift 2
+            ;;
+          *)
+            echo "Invalid harden-docker option: $2"
             return 1
             ;;
         esac
@@ -821,9 +842,9 @@ function build_config {
   # letsencrypt is the only mode that needs port 80, because the ACME HTTP-01
   # challenge is always served there. It is an explicit opt-in, so the HTTP side
   # is pinned to 80 in that mode; every other mode keeps the default HTTP port.
-  if [[ ${config[security]} == 'letsencrypt' ]]; then
+  if [[ ${config[security]} == 'letsencrypt' || ${config[camouflage]} == 'self' ]]; then
     if [[ ${config[http_port]} != '80' ]]; then
-      echo 'Note: letsencrypt needs port 80 for the ACME HTTP-01 challenge; it is used as the HTTP port for this mode.'
+      echo 'Note: the ACME HTTP-01 challenge is served on port 80; it is used as the HTTP port for this mode.'
       config[http_port]=80
     fi
     if port_in_use 80; then
@@ -836,12 +857,12 @@ function build_config {
       done
     fi
     if [[ ${free_80} != 'true' ]]; then
-      echo 'Port 80 must be free if you want to use "letsencrypt" as the security option.'
+      echo 'Port 80 must be free for the ACME HTTP-01 challenge (letsencrypt / --camouflage self).'
       exit 1
     fi
   elif [[ ${config[http_port]} == '80' ]]; then
-    # Without letsencrypt there is no reason to claim port 80.
-    echo "Port 80 is only used by the letsencrypt mode; switching the HTTP port back to ${defaults[http_port]}."
+    # Without an ACME challenge there is no reason to claim port 80.
+    echo "Port 80 is only used by the ACME challenge; switching the HTTP port back to ${defaults[http_port]}."
     config[http_port]="${defaults[http_port]}"
   fi
   # Both ports become docker port mappings on the same address, so they must
@@ -886,14 +907,35 @@ function build_config {
     if [[ -z ${config_file[camouflage]} && -z ${args[camouflage]} && -n ${config_file[domain]} ]]; then
       config[camouflage]="${config[domain]}"
     fi
-    if [[ -n "${args[camouflage]}" && -z "${args[domain]}" ]]; then
-      config[domain]="${config[camouflage]%%:*}"
-    elif [[ -n "${args[domain]}" && -z "${args[camouflage]}" ]]; then
-      config[camouflage]="${config[domain]}"
-    fi
-    if [[ ${config[camouflage]%%:*} != ${config[domain]%%:*} ]]; then
-      echo "Warning: the SNI (${config[domain]%%:*}) differs from the camouflage site (${config[camouflage]%%:*})."
-      echo 'A probe sends the SNI and compares the certificate it gets back against it, so those are expected to be the same domain.'
+    if [[ ${config[camouflage]} == 'self' ]]; then
+      # "Steal yourself": unauthenticated probes are relayed to the local nginx,
+      # which serves a real certificate for the very SNI they sent. That needs a
+      # domain, because the certificate has to be issued for it.
+      if [[ ! ${config[server]} =~ ${regex[domain]} ]]; then
+        echo '--camouflage self needs a domain in --server: a real certificate is issued for it.'
+        exit 1
+      fi
+      if [[ -n ${args[domain]} && ${args[domain]%%:*} != ${config[server]} ]]; then
+        echo "Note: --camouflage self serves the certificate of ${config[server]}; the SNI is set to it and --domain is ignored."
+      fi
+      config[domain]="${config[server]}"
+      config[camouflage]='self'
+    else
+      if [[ -n "${args[camouflage]}" && -z "${args[domain]}" ]]; then
+        config[domain]="${config[camouflage]%%:*}"
+      elif [[ -n "${args[domain]}" && -z "${args[camouflage]}" ]]; then
+        config[camouflage]="${config[domain]}"
+      fi
+      if [[ ${config[camouflage]%%:*} != ${config[domain]%%:*} ]]; then
+        echo "Warning: the SNI (${config[domain]%%:*}) differs from the camouflage site (${config[camouflage]%%:*})."
+        echo 'A probe sends the SNI and compares the certificate it gets back against it, so those are expected to be the same domain.'
+      fi
+      # Only warn when the CDN was picked explicitly: the built-in default is one
+      # of them and must not turn every install into a warning.
+      if [[ -n ${args[camouflage]} && ${config[camouflage]%%:*} =~ ${regex[cdn_camouflage]} ]]; then
+        echo "Note: ${config[camouflage]%%:*} is a large CDN; it may rate-limit probes, answer with a different TLS stack, or rotate certificates."
+        echo '      "--camouflage self" (your own domain, with a real certificate) is the most consistent fallback.'
+      fi
     fi
   fi
 
@@ -1146,6 +1188,16 @@ function engine_owns_tls {
   return 1
 }
 
+# True when an ACME certificate has to be issued: the letsencrypt mode, or the
+# reality / shadowtls "self" camouflage (the local website needs a real
+# certificate for the SNI domain, or a probe sees self-signed material).
+function needs_certbot {
+  if [[ ${config[security]} == 'letsencrypt' && ${config[transport]} != 'shadowtls' ]]; then
+    return 0
+  fi
+  [[ ${config[camouflage]} == 'self' ]]
+}
+
 function generate_docker_compose {
   # The official images are run with an explicit command: the engine binary is
   # addressed directly instead of relying on the image default CMD (the official
@@ -1259,7 +1311,7 @@ ${engine_udp_ports}
     - reality
 ${nginx_service}
 ${haproxy_service}
-$(if [[ ${config[security]} == 'letsencrypt' && ${config[transport]} != 'shadowtls' ]]; then
+$(if needs_certbot; then
 echo "
   certbot:
     build:
@@ -1273,7 +1325,7 @@ echo "
         max-size: 10m
         max-file: "3"
     volumes:
-    - /var/run/docker.sock:/var/run/docker.sock
+    - /var/run/docker.sock:/var/run/docker.sock:ro
     - ./certbot/data:/etc/letsencrypt
     - ./$(dirname "${path[server_pem]#${config_path}/}"):/certificate
     - ./${path[certbot_deployhook]#${config_path}/}:/deployhook.sh
@@ -1288,8 +1340,49 @@ EOF
 }
 
 function generate_tgbot_compose {
+  # The bot never talks to Docker itself: it runs reality.sh, which does. It
+  # never needs /etc/docker, and the socket is mounted read-only so the container
+  # cannot replace it. With --harden-docker=true the socket is put behind a
+  # narrow proxy and never handed to the bot at all.
   # Same as generate_docker_compose: a "version:" key is obsolete in Compose v2
   # and only produces a warning.
+  local bot_environment
+  local bot_volumes
+  local proxy_service=''
+  if [[ ${config[harden_docker]} == 'ON' ]]; then
+    bot_environment="      DOCKER_HOST: tcp://socket-proxy:2375"
+    bot_volumes="    - ../:${config_path}"
+    proxy_service='  socket-proxy:
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      EXEC: 1
+      POST: 1
+      BUILD: 1
+      INFO: 1
+      VERSION: 1
+      ALLOW_START: 1
+      ALLOW_STOP: 1
+      ALLOW_RESTARTS: 1
+      LOG_LEVEL: warning
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+    - tgbot'
+  else
+    bot_environment="      DOCKER_HOST: unix:///var/run/docker.sock"
+    bot_volumes="    - /var/run/docker.sock:/var/run/docker.sock:ro
+    - ../:${config_path}"
+  fi
   cat >"${path[tgbot_compose]}" <<EOF
 networks:
   tgbot:
@@ -1310,12 +1403,12 @@ services:
     environment:
       BOT_TOKEN: ${config[tgbot_token]}
       BOT_ADMIN: ${config[tgbot_admins]}
+${bot_environment}
     volumes:
-    - /var/run/docker.sock:/var/run/docker.sock
-    - ../:${config_path}
-    - /etc/docker/:/etc/docker/
+${bot_volumes}
     networks:
     - tgbot
+${proxy_service}
 EOF
 }
 
@@ -1482,6 +1575,13 @@ EOF
 }
 
 function generate_certbot_script {
+  # In the camouflage "self" mode nginx already publishes the HTTP port, so
+  # certbot drops the challenge into the shared website directory instead of
+  # binding port 80 itself (which that stack does not give it).
+  local certbot_authenticator='--standalone'
+  if [[ ${config[camouflage]} == 'self' ]]; then
+    certbot_authenticator='--webroot -w /website'
+  fi
   cat >"${path[certbot_startup]}" << EOF
 #!/bin/sh
 trap exit TERM
@@ -1492,7 +1592,7 @@ awk -F= '{print \$2}' | tr -d : | tr '[:upper:]' '[:lower:]')
   installed_fingerprint=\$(openssl x509 -noout -fingerprint -sha256 -in /certificate/server.pem 2>/dev/null |\
 awk -F= '{print \$2}' | tr -d : | tr '[:upper:]' '[:lower:]')
   if [[ \$fullchain_fingerprint != \$installed_fingerprint ]]; then
-    /deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true)
+    /deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true) $([[ ${config[camouflage]} == 'self' ]] && echo 'nginx' || true)
   fi
 fi
 while true; do
@@ -1509,13 +1609,13 @@ done
 ls -d /website/* | grep -E '^/website/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\$'|xargs rm -f
 while true; do
   certbot certonly -n \\
-    --standalone \\
+    ${certbot_authenticator} \\
     --key-type ecdsa \\
     --elliptic-curve secp256r1 \\
     --agree-tos \\
     --register-unsafely-without-email \\
     -d ${config[server]} \\
-    --deploy-hook "/deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true)"
+    --deploy-hook "/deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true) $([[ ${config[camouflage]} == 'self' ]] && echo 'nginx' || true)"
   sleep 1h &
   wait \$!
 done
@@ -1651,6 +1751,13 @@ function generate_engine_config {
   # deployment input from the SNI, and its optional ":port" suffix defaults to 443.
   local camouflage_host="${config[camouflage]%%:*}"
   local reality_port=443
+  # "self" points the fallback at the local nginx: the certificate a probe sees
+  # then matches the SNI exactly, because nginx serves the real certificate for
+  # the same domain.
+  if [[ ${config[camouflage]} == 'self' ]]; then
+    camouflage_host='nginx'
+    reality_port=443
+  fi
   # hysteria2 relays the bandwidth the client reports unless a rate pair is set,
   # in which case the server shapes with Brutal instead.
   local hysteria2_bandwidth=', "ignore_client_bandwidth": true'
@@ -2096,7 +2203,7 @@ function generate_config {
   if [[ ! -r "${path[server_pem]}" || ! -r "${path[server_crt]}" || ! -r "${path[server_key]}" ]]; then
     generate_selfsigned_certificate
   fi
-  if [[ ${config[security]} == "letsencrypt" && ${config[transport]} != 'shadowtls' ]]; then
+  if needs_certbot; then
     mkdir -p "${config_path}/certbot"
     generate_certbot_deployhook
     generate_certbot_dockerfile
@@ -2724,17 +2831,26 @@ function config_camouflage_menu {
     if [[ $? -ne 0 ]]; then
       break
     fi
-    if [[ ! $camouflage =~ ${regex[domain_port]} ]]; then
-      message_box "Invalid Domain" '"'"${camouflage}"'" is not a valid domain.'
+    if [[ $camouflage != 'self' ]] && [[ ! $camouflage =~ ${regex[domain_port]} ]]; then
+      message_box "Invalid Domain" '"'"${camouflage}"'" is not a valid domain (or "self").'
       continue
     fi
-    if [[ $camouflage =~ : ]] && (( ${camouflage#*:} > 65535 )); then
+    if [[ $camouflage != 'self' && $camouflage =~ : ]] && (( ${camouflage#*:} > 65535 )); then
       message_box "Invalid Port" 'The camouflage port must be between 1 and 65535.'
       continue
     fi
-    config[camouflage]=$camouflage
-    if [[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]]; then
-      config[domain]="${camouflage%%:*}"
+    if [[ $camouflage == 'self' ]]; then
+      if [[ ! ${config[server]} =~ ${regex[domain]} ]]; then
+        message_box "Invalid Configuration" 'The "self" camouflage needs a domain in Server Address: a real certificate is issued for it.'
+        continue
+      fi
+      config[camouflage]='self'
+      config[domain]="${config[server]}"
+    else
+      config[camouflage]=$camouflage
+      if [[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]]; then
+        config[domain]="${camouflage%%:*}"
+      fi
     fi
     update_config_file
     break
@@ -2866,10 +2982,10 @@ function config_http_port_menu {
   # The ACME HTTP-01 challenge always needs port 80, and build_config pins the
   # HTTP port to 80 in this mode. Offering a choice that the next full run would
   # overwrite anyway (and rejecting the mandatory 80) is worse than doing nothing.
-  if [[ ${config[security]} == 'letsencrypt' ]]; then
+  if needs_certbot; then
     config[http_port]=80
     update_config_file
-    message_box "HTTP Port" "The letsencrypt mode always uses port 80 for the ACME HTTP-01 challenge; the HTTP port has been kept at 80."
+    message_box "HTTP Port" "This mode serves the ACME HTTP-01 challenge on port 80 (letsencrypt, or camouflage self); the HTTP port has been kept at 80."
     return
   fi
   while true; do
@@ -2884,7 +3000,7 @@ function config_http_port_menu {
       message_box "Invalid Port" "Port must be an integer between 1 and 65535, or \"off\""
       continue
     elif [[ ${http_port} -eq 80 ]]; then
-      message_box "Port 80" "Port 80 is only bound by the letsencrypt mode. Pick another port (default: ${defaults[http_port]}) or switch the security mode to letsencrypt."
+      message_box "Port 80" "Port 80 is only bound by the ACME challenge (letsencrypt or camouflage self). Pick another port (default: ${defaults[http_port]})."
       continue
     elif [[ ${http_port} -eq ${config[port]} ]]; then
       message_box "Port In Use" "Port ${config[port]} belongs to the proxy; pick another port for the website."
@@ -3846,7 +3962,7 @@ function open_firewall {
   if [[ ${config[http_port]} != 'OFF' ]]; then
     tcp_ports+=("${config[http_port]}")
   fi
-  if [[ ${config[security]} == 'letsencrypt' ]]; then
+  if needs_certbot; then
     tcp_ports+=('80')
   fi
   if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
@@ -3901,7 +4017,7 @@ function doctor {
       problems=$((problems + 1))
     fi
   done
-  if [[ ${config[security]} == 'letsencrypt' && ${config[transport]} != 'shadowtls' ]]; then
+  if needs_certbot; then
     running=$(${docker_cmd} -p "${compose_project}" ps --status running -q certbot 2>/dev/null | head -n 1)
     if [[ -n ${running} ]]; then
       echo 'ok    service certbot is running'
