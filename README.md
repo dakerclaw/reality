@@ -266,6 +266,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `--add-user <username>` | 新增用户 |
 | `--list-users` | 列出全部用户 |
 | `--show-user <username>` | 打印某用户的客户端链接与二维码 |
+| `--format <uri\|clash\|singbox\|v2ray\|json>` | 配合 `--show-user` 选择客户端配置的导出格式（默认 `uri`）：`clash` / `singbox` / `v2ray` 给出可直接粘贴的 outbound 片段，`json` 给出完整的 sing-box 客户端配置。`v2ray` 只覆盖 vless 系列传输 |
 | `--delete-user <username>` | 删除用户 |
 | `--enable-tgbot <true\|false>` | 启用 Telegram 机器人 |
 | `--tgbot-token <token>` | Telegram 机器人 Token |

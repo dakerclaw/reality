@@ -253,6 +253,7 @@ function show_help {
   echo "      --add-user <username> Add new user"
   echo "      --list-users          List all users"
   echo "      --show-user <username> Shows the config and QR code of the user"
+  echo "      --format <uri|clash|singbox|v2ray|json> Output format for --show-user (default: uri)"
   echo "      --delete-user <username> Delete the user"
   echo "      --backup              Backup users and configuration and upload it to ${backup_upload_url} (override with BACKUP_UPLOAD_URL)"
   echo "      --restore <url|file>  Restore backup from URL or file"
@@ -270,7 +271,7 @@ function show_help {
 
 function parse_args {
   local opts
-  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,harden-docker:,ss-port:,hysteria2-up:,hysteria2-down:,tuic-congestion:,open-firewall,check-update,doctor,help -- "$@")
+  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,harden-docker:,ss-port:,format:,hysteria2-up:,hysteria2-down:,tuic-congestion:,open-firewall,check-update,doctor,help -- "$@")
   if [[ $? -ne 0 ]]; then
     return 1
   fi
@@ -558,6 +559,18 @@ function parse_args {
             ;;
           *)
             echo "Invalid harden-docker option: $2"
+            return 1
+            ;;
+        esac
+        ;;
+      --format)
+        case "$2" in
+          uri|clash|singbox|v2ray|json)
+            args[format]="$2"
+            shift 2
+            ;;
+          *)
+            echo "Invalid format: $2 (uri|clash|singbox|v2ray|json)"
             return 1
             ;;
         esac
@@ -2439,6 +2452,201 @@ function print_client_configuration {
       qrencode -t ansiutf8 "${ss_config_ipv6}"
     fi
   fi
+}
+
+# Multi-format client export (--format). The URI form stays the default; the
+# other formats translate the very same server-side parameters into the shape a
+# given client expects, so nothing has to be typed in by hand.
+function client_export_params {
+  client_uuid="${users[${username}]}"
+  client_host="${config[server]}"
+  client_port="${config[port]}"
+  client_sni="${config[domain]%%:*}"
+  client_password=$(echo -n "${username}${client_uuid}" | sha256sum | cut -d ' ' -f 1 | head -c 16)
+  client_insecure="false"
+  if [[ ${config[security]} == 'selfsigned' ]]; then
+    client_insecure="true"
+  fi
+}
+
+function client_singbox_outbound {
+  local bandwidth_object=''
+  local transport_object=''
+  local flow_object=''
+  if [[ ${config[transport]} == 'tuic' ]]; then
+    echo '{"type": "tuic", "tag": "proxy", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "uuid": "'"${client_uuid}"'", "password": "'"${client_password}"'", "congestion_control": "'"${config[tuic_congestion]}"'", "udp_relay_mode": "quic", "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "insecure": '"${client_insecure}"', "alpn": ["h3"]}}'
+  elif [[ ${config[transport]} == 'hysteria2' ]]; then
+    if [[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]]; then
+      bandwidth_object=', "up_mbps": '"${config[hysteria2_up]}"', "down_mbps": '"${config[hysteria2_down]}"''
+    fi
+    echo '{"type": "hysteria2", "tag": "proxy", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "password": "'"${client_password}"'"'"${bandwidth_object}"', "obfs": {"type": "salamander", "password": "'"${config[service_path]}"'"}, "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "insecure": '"${client_insecure}"'}}'
+  elif [[ ${config[transport]} == 'anytls' ]]; then
+    echo '{"type": "anytls", "tag": "proxy", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "password": "'"${client_password}"'", "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "insecure": '"${client_insecure}"', "utls": {"enabled": true, "fingerprint": "chrome"}}}'
+  elif [[ ${config[transport]} == 'shadowtls' ]]; then
+    return 1
+  else
+    if [[ ${config[transport]} == 'ws' ]]; then
+      transport_object=', "transport": {"type": "ws", "path": "/'"${config[service_path]}"'", "headers": {"Host": "'"${client_host}"'"}}'
+    elif [[ ${config[transport]} == 'grpc' ]]; then
+      transport_object=', "transport": {"type": "grpc", "service_name": "'"${config[service_path]}"'"}'
+    elif [[ ${config[transport]} == 'http' ]]; then
+      transport_object=', "transport": {"type": "http", "host": ["'"${client_host}"'"], "path": "/'"${config[service_path]}"'"}'
+    fi
+    if [[ ${config[transport]} == 'tcp' && ${config[security]} == 'reality' ]]; then
+      flow_object=', "flow": "xtls-rprx-vision"'
+    fi
+    if [[ ${config[security]} == 'reality' ]]; then
+      echo '{"type": "vless", "tag": "proxy", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "uuid": "'"${client_uuid}"'", "packet_encoding": "xudp"'"${flow_object}"', "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "utls": {"enabled": true, "fingerprint": "chrome"}, "reality": {"enabled": true, "public_key": "'"${config[public_key]}"'", "short_id": "'"${config[short_id]}"'"}}'"${transport_object}"'}'
+    else
+      echo '{"type": "vless", "tag": "proxy", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "uuid": "'"${client_uuid}"'", "packet_encoding": "xudp"'"${flow_object}"', "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "insecure": '"${client_insecure}"', "utls": {"enabled": true, "fingerprint": "chrome"}}'"${transport_object}"'}'
+    fi
+  fi
+}
+
+function client_v2ray_outbound {
+  local flow_object=''
+  local stream_object=''
+  if [[ ${config[transport]} == 'tcp' ]]; then
+    stream_object='"tcpSettings": {"header": {"type": "none"}}'
+  elif [[ ${config[transport]} == 'ws' ]]; then
+    stream_object='"wsSettings": {"path": "/'"${config[service_path]}"'", "headers": {"Host": "'"${client_host}"'"}}'
+  elif [[ ${config[transport]} == 'grpc' ]]; then
+    stream_object='"grpcSettings": {"serviceName": "'"${config[service_path]}"'"}'
+  elif [[ ${config[transport]} == 'http' ]]; then
+    stream_object='"xhttpSettings": {"host": "'"${client_host}"'", "path": "/'"${config[service_path]}"'"}'
+  else
+    return 1
+  fi
+  if [[ ${config[transport]} == 'tcp' && ${config[security]} == 'reality' ]]; then
+    flow_object=', "flow": "xtls-rprx-vision"'
+  fi
+  if [[ ${config[security]} == 'reality' ]]; then
+    echo '{"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{"address": "'"${client_host}"'", "port": '"${client_port}"', "users": [{"id": "'"${client_uuid}"'", "encryption": "none"'"${flow_object}"'}]}]}, "streamSettings": {"network": "'"$([[ ${config[transport]} == 'http' ]] && echo xhttp || echo "${config[transport]}")"'", "security": "reality", "realitySettings": {"serverName": "'"${client_sni}"'", "fingerprint": "chrome", "publicKey": "'"${config[public_key]}"'", "shortId": "'"${config[short_id]}"'"}, '"${stream_object}"'}}'
+  else
+    echo '{"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{"address": "'"${client_host}"'", "port": '"${client_port}"', "users": [{"id": "'"${client_uuid}"'", "encryption": "none"'"${flow_object}"'}]}]}, "streamSettings": {"network": "'"$([[ ${config[transport]} == 'http' ]] && echo xhttp || echo "${config[transport]}")"'", "security": "tls", "tlsSettings": {"serverName": "'"${client_sni}"'", "allowInsecure": '"${client_insecure}"', "fingerprint": "chrome"}, '"${stream_object}"'}}'
+  fi
+}
+
+function client_clash_proxy {
+  local insecure_yaml='false'
+  local up_down_yaml=''
+  if [[ ${config[security]} == 'selfsigned' ]]; then
+    insecure_yaml='true'
+  fi
+  if [[ ${config[transport]} == 'tuic' ]]; then
+    echo "- name: \"${username}\"
+  type: tuic
+  server: ${client_host}
+  port: ${client_port}
+  uuid: ${client_uuid}
+  password: ${client_password}
+  udp-relay-mode: quic
+  congestion-controller: ${config[tuic_congestion]}
+  sni: ${client_sni}
+  alpn: [h3]
+  skip-cert-verify: ${insecure_yaml}"
+  elif [[ ${config[transport]} == 'hysteria2' ]]; then
+    if [[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]]; then
+      up_down_yaml="
+  up: \"${config[hysteria2_up]} Mbps\"
+  down: \"${config[hysteria2_down]} Mbps\""
+    fi
+    echo "- name: \"${username}\"
+  type: hysteria2
+  server: ${client_host}
+  port: ${client_port}
+  password: ${client_password}
+  obfs: salamander
+  obfs-password: ${config[service_path]}
+  sni: ${client_sni}
+  skip-cert-verify: ${insecure_yaml}${up_down_yaml}"
+  elif [[ ${config[transport]} == 'anytls' ]]; then
+    echo "- name: \"${username}\"
+  type: anytls
+  server: ${client_host}
+  port: ${client_port}
+  password: ${client_password}
+  sni: ${client_sni}
+  skip-cert-verify: ${insecure_yaml}"
+  elif [[ ${config[transport]} == 'shadowtls' ]]; then
+    return 1
+  else
+    local opts_yaml=''
+    local flow_yaml=''
+    if [[ ${config[transport]} == 'ws' ]]; then
+      opts_yaml="
+  ws-opts:
+    path: /${config[service_path]}
+    headers:
+      Host: ${client_host}"
+    elif [[ ${config[transport]} == 'grpc' ]]; then
+      opts_yaml="
+  grpc-opts:
+    grpc-service-name: ${config[service_path]}"
+    fi
+    if [[ ${config[transport]} == 'tcp' && ${config[security]} == 'reality' ]]; then
+      flow_yaml="
+  flow: xtls-rprx-vision"
+    fi
+    echo "- name: \"${username}\"
+  type: vless
+  server: ${client_host}
+  port: ${client_port}
+  uuid: ${client_uuid}
+  network: $([[ ${config[transport]} == 'http' ]] && echo xhttp || echo "${config[transport]}")
+  tls: true
+  servername: ${client_sni}
+  client-fingerprint: chrome${flow_yaml}
+  $([[ ${config[security]} == 'reality' ]] && echo "reality-opts:
+    public-key: ${config[public_key]}
+    short-id: ${config[short_id]}" || echo "skip-cert-verify: ${insecure_yaml}")${opts_yaml}"
+  fi
+}
+
+function print_client_configuration_formatted {
+  local username=$1
+  local outbound
+  client_export_params
+  case ${args[format]} in
+    clash)
+      if [[ ${config[transport]} == 'shadowtls' ]]; then
+        echo 'The clash format cannot express the shadowtls chain; use --format singbox or json.'
+        return 1
+      fi
+      echo "proxies:"
+      client_clash_proxy
+      ;;
+    singbox)
+      if [[ ${config[transport]} == 'shadowtls' ]]; then
+        print_client_configuration "${username}"
+        return 0
+      fi
+      client_singbox_outbound
+      ;;
+    v2ray)
+      if ! client_v2ray_outbound; then
+        echo 'The v2ray format only covers the vless transports (tcp / ws / grpc / http); use --format singbox for this one.'
+        return 1
+      fi
+      ;;
+    json)
+      if [[ ${config[transport]} == 'shadowtls' ]]; then
+        print_client_configuration "${username}"
+        return 0
+      fi
+      outbound=$(client_singbox_outbound)
+      echo '{
+  "log": {"level": "info"},
+  "inbounds": [
+    {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080}
+  ],
+  "outbounds": [
+    '"${outbound}"'
+  ],
+  "route": {"final": "proxy"}
+}'
+      ;;
+  esac
 }
 
 function migrate_legacy_install {
@@ -4371,7 +4579,11 @@ if [[ -n ${args[add_user]} ]]; then
   username="${args[add_user]}"
 fi
 if [[ -n $username ]]; then
-  print_client_configuration "${username}"
+  if [[ -n ${args[format]} && ${args[format]} != 'uri' ]]; then
+    print_client_configuration_formatted "${username}"
+  else
+    print_client_configuration "${username}"
+  fi
 fi
 echo "Command has been executed successfully!"
 exit 0
