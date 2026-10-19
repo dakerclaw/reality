@@ -1696,11 +1696,18 @@ backend default
 # In the passthrough modes haproxy must not terminate TLS, so nginx owns the
 # website certificate. It is self-signed by default; put a real certificate into
 # certificate/server.crt + certificate/server.key to replace it.
+# Both ports are bound on both stacks on purpose. The compose network enables
+# IPv6, and haproxy resolves these server names with getaddrinfo, which hands back
+# the AAAA address first. An IPv4-only listener therefore leaves haproxy's website
+# backend permanently DOWN (ECONNREFUSED), and a probe that offers a non-proxy SNI
+# to the proxy port gets a closed connection instead of the website.
 function generate_nginx_config {
   cat >"${path[nginx_conf]}" <<EOF
 server {
   listen 80 default_server;
+  listen [::]:80 default_server;
   listen 443 ssl default_server;
+  listen [::]:443 ssl default_server;
   http2 on;
   server_name _;
   root /usr/share/nginx/html;
