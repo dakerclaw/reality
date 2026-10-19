@@ -1618,7 +1618,9 @@ defaults
   timeout client-fin 1s
   timeout server-fin 1s
   timeout server 50s
-  timeout tunnel 50s
+  # An idle tunnel is not a dead one: phones in the background and idle ssh
+  # sessions stop sending bytes for minutes, and 50s was cutting them mid-use.
+  timeout tunnel 300s
 frontend proxy
   bind :::443 v4v6
   mode tcp
@@ -1649,7 +1651,7 @@ defaults
   timeout client-fin 1s
   timeout server-fin 1s
   timeout server 50s
-  timeout tunnel 50s
+  timeout tunnel 300s
   timeout http-keep-alive 1s
   timeout queue 15s
 frontend http
@@ -4277,6 +4279,8 @@ net.ipv4.tcp_mem = 25600 51200 102400
 net.ipv4.tcp_rmem = 4096 65536 67108864
 net.ipv4.tcp_wmem = 4096 65536 67108864
 net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+vm.swappiness = 10
 ${bbr_block}
 net.netfilter.nf_conntrack_max=1000000
 EOF
