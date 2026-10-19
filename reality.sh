@@ -134,6 +134,23 @@ defaults[server]=$(curl -fsSL --ipv4 -m 5 https://cloudflare.com/cdn-cgi/trace 2
 defaults[tgbot]=OFF
 defaults[tgbot_token]=""
 defaults[tgbot_admins]=""
+# QUIC transport tuning. hysteria2 ignores the rates while "ignore_client_bandwidth"
+# is true (the client reports its own); giving both switches the server to Brutal
+# shaping at the given rates. tuic v5 picks its congestion controller here.
+defaults[hysteria2_up]=""
+defaults[hysteria2_down]=""
+defaults[tuic_congestion]="bbr"
+# Opt-in: put the Docker socket behind a narrow proxy for the Telegram bot.
+defaults[harden_docker]="OFF"
+# Opt-in Shadowsocks 2022 inbound. It is plain TCP with no TLS to share with the
+# website, so it gets a dedicated port; an empty value leaves it off.
+defaults[ss_port]=""
+defaults[ss_key]=""
+# Opt-in DNS-01 challenge. When a provider is set, certbot uses it instead of
+# the HTTP-01 challenge, so no inbound port is needed and a wildcard can be
+# issued. "dns_credentials" is the host path of the provider credentials file.
+defaults[dns_provider]=""
+defaults[dns_credentials]=""
 
 config_items=(
   "core"
@@ -148,6 +165,9 @@ config_items=(
   "server"
   "port"
   "http_port"
+  "hysteria2_up"
+  "hysteria2_down"
+  "tuic_congestion"
   "safenet"
   "bbr"
   "warp"
@@ -161,6 +181,11 @@ config_items=(
   "tgbot"
   "tgbot_token"
   "tgbot_admins"
+  "harden_docker"
+  "ss_port"
+  "ss_key"
+  "dns_provider"
+  "dns_credentials"
 )
 
 # Fast membership lookup for config_items, used when rewriting the config file.
@@ -188,20 +213,26 @@ regex[tgbot_admins]="^([a-zA-Z][a-zA-Z0-9_]{4,31}|[0-9]{4,15})(,([a-zA-Z][a-zA-Z
 regex[domain_port]="^[a-zA-Z0-9]+([-.][a-zA-Z0-9]+)*\.[a-zA-Z]{2,}(:[1-9][0-9]*)?$"
 regex[file_path]="^[a-zA-Z0-9_/.-]+$"
 regex[url]="^(http|https)://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[0-9]{1,3}(\.[0-9]{1,3}){3})(:[0-9]{1,5})?(/.*)?$"
+# Large CDNs answer probes with their own edge stack and sometimes rate-limit
+# them, which makes them a weaker camouflage than a site you control.
+regex[cdn_camouflage]="(^|\.)(cloudflare|fastly|akamai|akamaiedge|cloudfront|amazonaws|googleapis|googleusercontent|gstatic|microsoft|azureedge|jsdelivr|unpkg|bing)\."
 
 function show_help {
   echo ""
-  echo "Usage: reality.sh [-t|--transport=tcp|http|grpc|ws|tuic|hysteria2|shadowtls] [-d|--domain=<domain>] [--camouflage=<domain[:port]>] [--server=<server>]
+  echo "Usage: reality.sh [-t|--transport=tcp|http|grpc|ws|tuic|hysteria2|shadowtls|anytls] [-d|--domain=<domain>] [--camouflage=<domain[:port]>] [--server=<server>]
   [--regenerate] [--default] [-r|--restart] [--enable-safenet=true|false] [--enable-bbr=true|false] [--port=<port>] [--http-port=<port|off>] [-c|--core=xray|sing-box]
   [--enable-warp=true|false] [--warp-license=<license>] [--security=reality|letsencrypt|selfsigned] [-m|--menu] [--show-server-config]
   [--add-user=<username>] [--lists-users] [--show-user=<username>] [--delete-user=<username>] [--backup] [--restore=<url|file>]
   [--backup-password=<password>] [-u|--uninstall]"
   echo ""
-  echo "  -t, --transport <tcp|http|grpc|ws|tuic|hysteria2|shadowtls> Transport protocol (tcp, http, grpc, ws, tuic, hysteria2, shadowtls, default: ${defaults[transport]})"
+  echo "  -t, --transport <tcp|http|grpc|ws|tuic|hysteria2|shadowtls|anytls> Transport protocol (default: ${defaults[transport]})"
+  echo "                            anytls needs the sing-box core and a real or self-signed certificate (not reality)"
   echo "  -d, --domain <domain>     Domain to use as SNI (default: ${defaults[domain]})"
-  echo "      --camouflage <domain[:port]> Remote site the camouflage falls back to in the reality and shadowtls modes."
+  echo "      --camouflage <domain[:port]|self> Remote site the camouflage falls back to in the reality and shadowtls modes."
   echo "                            Unauthenticated probes are relayed to it, so it must be a real site whose certificate"
   echo "                            matches the SNI; the SNI follows it unless --domain is given explicitly (default: ${defaults[camouflage]})"
+  echo "                            \"self\" relays to the local website, which then gets a real certificate for the SNI domain"
+  echo "                            (needs --server <domain> and the ACME HTTP-01 challenge on port 80)"
   echo "      --server <server>     IP address or domain name of server (Must be a valid domain if using letsencrypt security)"
   echo "      --regenerate          Regenerate public and private keys"
   echo "      --default             Restore default configuration"
@@ -224,21 +255,32 @@ function show_help {
   echo "      --enable-tgbot <true|false> Enable Telegram bot for user management"
   echo "      --tgbot-token <token> Token of Telegram bot"
   echo "      --tgbot-admins <usernames|ids> Telegram bot admins: usernames without the leading '@' or numeric user ids (comma separated)"
+  echo "      --harden-docker <true|false> Put the Docker socket behind a narrow proxy for the Telegram bot (default: ${defaults[harden_docker]})"
   echo "      --show-server-config  Print server configuration"
   echo "      --add-user <username> Add new user"
   echo "      --list-users          List all users"
   echo "      --show-user <username> Shows the config and QR code of the user"
+  echo "      --format <uri|clash|singbox|v2ray|json> Output format for --show-user (default: uri)"
   echo "      --delete-user <username> Delete the user"
   echo "      --backup              Backup users and configuration and upload it to ${backup_upload_url} (override with BACKUP_UPLOAD_URL)"
   echo "      --restore <url|file>  Restore backup from URL or file"
   echo "      --backup-password <password> Create/Restore password protected backup file"
+  echo "      --hysteria2-up <mbps>  Server-side uplink for the hysteria2 transport (Brutal); needs --hysteria2-down"
+  echo "      --hysteria2-down <mbps> Server-side downlink for the hysteria2 transport; the pair switches off client-reported bandwidth"
+  echo "      --ss-port <port|off>  Publish an additional Shadowsocks 2022 (aes-128-gcm) inbound on its own port (sing-box only, off by default)"
+  echo "      --dns-provider <cloudflare> Use a DNS-01 challenge instead of HTTP-01: no port 80 needed, wildcard included"
+  echo "      --dns-credentials <path>    Host path of the DNS provider credentials file (e.g. an ini with the Cloudflare API token)"
+  echo "      --tuic-congestion <cubic|new_reno|bbr> Congestion control of the tuic transport (default: bbr)"
+  echo "      --open-firewall       Open the proxy and website ports in the host firewall (ufw / firewalld); otherwise print them"
+  echo "      --check-update        Compare the pinned image tags with the newest upstream tags and exit"
+  echo "      --doctor              Run a health check of the running stack and exit"
   echo "  -h, --help                Display this help message"
   return 0
 }
 
 function parse_args {
   local opts
-  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,help -- "$@")
+  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,harden-docker:,ss-port:,format:,dns-provider:,dns-credentials:,hysteria2-up:,hysteria2-down:,tuic-congestion:,open-firewall,check-update,doctor,help -- "$@")
   if [[ $? -ne 0 ]]; then
     return 1
   fi
@@ -248,7 +290,7 @@ function parse_args {
       -t|--transport)
         args[transport]="$2"
         case ${args[transport]} in
-          tcp|http|grpc|ws|tuic|hysteria2|shadowtls)
+          tcp|http|grpc|ws|tuic|hysteria2|shadowtls|anytls)
             shift 2
             ;;
           *)
@@ -271,11 +313,11 @@ function parse_args {
         ;;
       --camouflage)
         args[camouflage]="$2"
-        if ! [[ ${args[camouflage]} =~ ${regex[domain_port]} ]]; then
-          echo "Invalid camouflage site: ${args[camouflage]}"
+        if [[ ${args[camouflage]} != 'self' ]] && ! [[ ${args[camouflage]} =~ ${regex[domain_port]} ]]; then
+          echo "Invalid camouflage site: ${args[camouflage]} (a domain, domain:port, or \"self\")"
           return 1
         fi
-        if [[ ${args[camouflage]} =~ : ]] && (( ${args[camouflage]#*:} > 65535 )); then
+        if [[ ${args[camouflage]} != 'self' && ${args[camouflage]} =~ : ]] && (( ${args[camouflage]#*:} > 65535 )); then
           echo "Camouflage port out of range: ${args[camouflage]#*:}"
           return 1
         fi
@@ -489,6 +531,108 @@ function parse_args {
       --backup-password)
         args[backup_password]="$2"
         shift 2
+        ;;
+      --hysteria2-up)
+        args[hysteria2_up]="$2"
+        if ! [[ ${args[hysteria2_up]} =~ ^[0-9]+$ ]] || (( args[hysteria2_up] < 1 )); then
+          echo "Invalid hysteria2 uplink: ${args[hysteria2_up]} (a positive integer, Mbps)"
+          return 1
+        fi
+        shift 2
+        ;;
+      --hysteria2-down)
+        args[hysteria2_down]="$2"
+        if ! [[ ${args[hysteria2_down]} =~ ^[0-9]+$ ]] || (( args[hysteria2_down] < 1 )); then
+          echo "Invalid hysteria2 downlink: ${args[hysteria2_down]} (a positive integer, Mbps)"
+          return 1
+        fi
+        shift 2
+        ;;
+      --tuic-congestion)
+        args[tuic_congestion]="$2"
+        case ${args[tuic_congestion]} in
+          cubic|new_reno|bbr)
+            shift 2
+            ;;
+          *)
+            echo "Invalid tuic congestion control: ${args[tuic_congestion]} (cubic, new_reno or bbr)"
+            return 1
+            ;;
+        esac
+        ;;
+      --harden-docker)
+        case "$2" in
+          true|false)
+            if [[ $2 == true ]]; then args[harden_docker]=ON; else args[harden_docker]=OFF; fi
+            shift 2
+            ;;
+          *)
+            echo "Invalid harden-docker option: $2"
+            return 1
+            ;;
+        esac
+        ;;
+      --format)
+        case "$2" in
+          uri|clash|singbox|v2ray|json)
+            args[format]="$2"
+            shift 2
+            ;;
+          *)
+            echo "Invalid format: $2 (uri|clash|singbox|v2ray|json)"
+            return 1
+            ;;
+        esac
+        ;;
+      --dns-provider)
+        case "${2,,}" in
+          off)
+            args[dns_provider]="off"
+            ;;
+          cloudflare)
+            args[dns_provider]="$2"
+            ;;
+          *)
+            echo "Invalid DNS provider: $2 (supported providers: cloudflare)"
+            return 1
+            ;;
+        esac
+        shift 2
+        ;;
+      --dns-credentials)
+        if [[ ${2,,} == 'off' ]]; then
+          args[dns_credentials]="off"
+        else
+          args[dns_credentials]="$2"
+        fi
+        shift 2
+        ;;
+      --ss-port)
+        case "${2,,}" in
+          ''|off)
+            args[ss_port]="off"
+            ;;
+          *)
+            if [[ ! $2 =~ ${regex[port]} ]] || (( $2 < 1 || $2 > 65535 )); then
+              echo "Invalid Shadowsocks port: $2"
+              return 1
+            fi
+            args[ss_port]="$2"
+            ;;
+        esac
+        shift 2
+        ;;
+      --open-firewall)
+        args[open_firewall]=true
+        shift
+        ;;
+      --check-update)
+        args[check_update]=true
+        shift
+        ;;
+      --doctor)
+        args[doctor]=true
+        shift
         ;;
       -h|--help)
         args[help]=true
@@ -747,12 +891,80 @@ function build_config {
     echo 'You cannot use "shadowtls" transport with "xray" core. Use other transports or change core to sing-box'
     exit 1
   fi
+  if [[ ${config[transport]} == 'anytls' && ${config[core]} == 'xray' ]]; then
+    echo 'You cannot use "anytls" transport with "xray" core. Use other transports or change core to sing-box'
+    exit 1
+  fi
+  if [[ ${config[transport]} == 'anytls' && ${config[security]} == 'reality' ]]; then
+    echo 'You cannot use "anytls" transport with "reality" TLS certificate. Use other transports or change TLS certificate to letsencrypt or selfsigned'
+    exit 1
+  fi
+  # Shadowsocks 2022 is a second, plain inbound on a port of its own: it carries
+  # no TLS, so it cannot share the SNI-routed proxy port with the website.
+  if [[ ${config[ss_port],,} == 'off' ]]; then
+    config[ss_port]=""
+  fi
+  if [[ -n ${config[ss_port]} ]]; then
+    if [[ ! ${config[ss_port]} =~ ${regex[port]} ]] || (( config[ss_port] < 1 || config[ss_port] > 65535 )); then
+      echo "Invalid Shadowsocks port: ${config[ss_port]}"
+      exit 1
+    fi
+    if [[ ${config[ss_port]} == ${config[port]} || ${config[ss_port]} == ${config[http_port]} || ${config[ss_port]} == '80' ]]; then
+      echo "The Shadowsocks port (${config[ss_port]}) must differ from the proxy port, the HTTP port and 80."
+      exit 1
+    fi
+    if [[ ${config[core]} != 'sing-box' ]]; then
+      echo 'Shadowsocks 2022 is only generated for the sing-box core; use sing-box or drop --ss-port.'
+      exit 1
+    fi
+    if [[ -z ${config[ss_key]} ]]; then
+      config[ss_key]=$(openssl rand -base64 16)
+    fi
+  fi
+  # DNS-01 replaces the HTTP-01 challenge: no inbound port is needed and a
+  # wildcard certificate becomes possible.
+  if [[ ${config[dns_provider],,} == 'off' ]]; then
+    config[dns_provider]=""
+  fi
+  if [[ ${config[dns_credentials],,} == 'off' ]]; then
+    config[dns_credentials]=""
+  fi
+  if [[ -n ${config[dns_provider]} ]]; then
+    if [[ ${config[dns_provider]} != 'cloudflare' ]]; then
+      echo "Unsupported DNS provider: ${config[dns_provider]} (supported providers: cloudflare)"
+      exit 1
+    fi
+    if ! needs_certbot; then
+      echo 'A DNS provider is only used while a certificate is issued (letsencrypt, or camouflage self).'
+      exit 1
+    fi
+    if [[ -z ${config[dns_credentials]} || ! -r ${config[dns_credentials]} ]]; then
+      echo "The DNS credentials file is missing or unreadable: ${config[dns_credentials]:-<empty>}"
+      exit 1
+    fi
+  fi
+  # The bandwidth pair only means something for hysteria2; a lone value is dropped
+  # with a note instead of failing an install that merely switched transport.
+  if [[ ${config[transport]} == 'hysteria2' && ( -n ${config[hysteria2_up]} || -n ${config[hysteria2_down]} ) ]]; then
+    if [[ -z ${config[hysteria2_up]} || -z ${config[hysteria2_down]} ]]; then
+      echo 'Note: both --hysteria2-up and --hysteria2-down are needed to shape bandwidth; ignoring the one that was given.'
+      config[hysteria2_up]=""
+      config[hysteria2_down]=""
+    fi
+  fi
+  # A stale value in the config file must not reach the engine as-is.
+  if [[ ${config[transport]} == 'tuic' ]]; then
+    case ${config[tuic_congestion]} in
+      cubic|new_reno|bbr) ;;
+      *) config[tuic_congestion]='bbr' ;;
+    esac
+  fi
   # letsencrypt is the only mode that needs port 80, because the ACME HTTP-01
   # challenge is always served there. It is an explicit opt-in, so the HTTP side
   # is pinned to 80 in that mode; every other mode keeps the default HTTP port.
-  if [[ ${config[security]} == 'letsencrypt' ]]; then
+  if [[ -z ${config[dns_provider]} && ( ${config[security]} == 'letsencrypt' || ${config[camouflage]} == 'self' ) ]]; then
     if [[ ${config[http_port]} != '80' ]]; then
-      echo 'Note: letsencrypt needs port 80 for the ACME HTTP-01 challenge; it is used as the HTTP port for this mode.'
+      echo 'Note: the ACME HTTP-01 challenge is served on port 80; it is used as the HTTP port for this mode.'
       config[http_port]=80
     fi
     if port_in_use 80; then
@@ -765,12 +977,12 @@ function build_config {
       done
     fi
     if [[ ${free_80} != 'true' ]]; then
-      echo 'Port 80 must be free if you want to use "letsencrypt" as the security option.'
+      echo 'Port 80 must be free for the ACME HTTP-01 challenge (letsencrypt / --camouflage self).'
       exit 1
     fi
   elif [[ ${config[http_port]} == '80' ]]; then
-    # Without letsencrypt there is no reason to claim port 80.
-    echo "Port 80 is only used by the letsencrypt mode; switching the HTTP port back to ${defaults[http_port]}."
+    # Without an ACME challenge there is no reason to claim port 80.
+    echo "Port 80 is only used by the ACME challenge; switching the HTTP port back to ${defaults[http_port]}."
     config[http_port]="${defaults[http_port]}"
   fi
   # Both ports become docker port mappings on the same address, so they must
@@ -815,14 +1027,35 @@ function build_config {
     if [[ -z ${config_file[camouflage]} && -z ${args[camouflage]} && -n ${config_file[domain]} ]]; then
       config[camouflage]="${config[domain]}"
     fi
-    if [[ -n "${args[camouflage]}" && -z "${args[domain]}" ]]; then
-      config[domain]="${config[camouflage]%%:*}"
-    elif [[ -n "${args[domain]}" && -z "${args[camouflage]}" ]]; then
-      config[camouflage]="${config[domain]}"
-    fi
-    if [[ ${config[camouflage]%%:*} != ${config[domain]%%:*} ]]; then
-      echo "Warning: the SNI (${config[domain]%%:*}) differs from the camouflage site (${config[camouflage]%%:*})."
-      echo 'A probe sends the SNI and compares the certificate it gets back against it, so those are expected to be the same domain.'
+    if [[ ${config[camouflage]} == 'self' ]]; then
+      # "Steal yourself": unauthenticated probes are relayed to the local nginx,
+      # which serves a real certificate for the very SNI they sent. That needs a
+      # domain, because the certificate has to be issued for it.
+      if [[ ! ${config[server]} =~ ${regex[domain]} ]]; then
+        echo '--camouflage self needs a domain in --server: a real certificate is issued for it.'
+        exit 1
+      fi
+      if [[ -n ${args[domain]} && ${args[domain]%%:*} != ${config[server]} ]]; then
+        echo "Note: --camouflage self serves the certificate of ${config[server]}; the SNI is set to it and --domain is ignored."
+      fi
+      config[domain]="${config[server]}"
+      config[camouflage]='self'
+    else
+      if [[ -n "${args[camouflage]}" && -z "${args[domain]}" ]]; then
+        config[domain]="${config[camouflage]%%:*}"
+      elif [[ -n "${args[domain]}" && -z "${args[camouflage]}" ]]; then
+        config[camouflage]="${config[domain]}"
+      fi
+      if [[ ${config[camouflage]%%:*} != ${config[domain]%%:*} ]]; then
+        echo "Warning: the SNI (${config[domain]%%:*}) differs from the camouflage site (${config[camouflage]%%:*})."
+        echo 'A probe sends the SNI and compares the certificate it gets back against it, so those are expected to be the same domain.'
+      fi
+      # Only warn when the CDN was picked explicitly: the built-in default is one
+      # of them and must not turn every install into a warning.
+      if [[ -n ${args[camouflage]} && ${config[camouflage]%%:*} =~ ${regex[cdn_camouflage]} ]]; then
+        echo "Note: ${config[camouflage]%%:*} is a large CDN; it may rate-limit probes, answer with a different TLS stack, or rotate certificates."
+        echo '      "--camouflage self" (your own domain, with a real certificate) is the most consistent fallback.'
+      fi
     fi
   fi
 
@@ -1072,7 +1305,29 @@ function engine_owns_tls {
   if [[ ${config[transport]} == 'tcp' && ${config[security]} == 'selfsigned' ]]; then
     return 0
   fi
+  # AnyTLS always terminates TLS in the engine (it has its own protocol framing),
+  # so the SNI split applies here too.
+  if [[ ${config[transport]} == 'anytls' ]]; then
+    return 0
+  fi
   return 1
+}
+
+# Shadowsocks 2022 wants per-user keys that are the base64 of a key of a fixed
+# length (16 bytes for aes-128-gcm). Deriving them from the user id keeps them
+# stable across regenerations, so existing clients stay valid.
+function ss2022_user_key {
+  printf '%s' "${1}${2}" | openssl dgst -sha256 -binary | head -c 16 | base64
+}
+
+# True when an ACME certificate has to be issued: the letsencrypt mode, or the
+# reality / shadowtls "self" camouflage (the local website needs a real
+# certificate for the SNI domain, or a probe sees self-signed material).
+function needs_certbot {
+  if [[ ${config[security]} == 'letsencrypt' && ${config[transport]} != 'shadowtls' ]]; then
+    return 0
+  fi
+  [[ ${config[camouflage]} == 'self' ]]
 }
 
 function generate_docker_compose {
@@ -1084,7 +1339,7 @@ function generate_docker_compose {
   # Fragments that differ between the passthrough modes (reality / shadowtls)
   # and the terminating ones (letsencrypt / selfsigned). Built here, with plain
   # if statements, so the heredoc below stays readable.
-  local engine_udp_ports=''
+  local engine_ports=''
   local nginx_ports=''
   local nginx_expose=''
   local nginx_tls_volumes=''
@@ -1113,14 +1368,29 @@ function generate_docker_compose {
     haproxy_cert_volume="    - ./${path[server_pem]#${config_path}/}:/usr/local/etc/haproxy/server.pem"
   fi
   if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
-    engine_udp_ports="    ports:
+    engine_ports="
     - ${config[port]}:443/udp"
+  fi
+  # Shadowsocks 2022 is plain TCP/UDP on a port of its own; it never goes through
+  # haproxy, because it carries no TLS and therefore no SNI to split on.
+  if [[ -n ${config[ss_port]} ]]; then
+    engine_ports="${engine_ports}
+    - ${config[ss_port]}:${config[ss_port]}/tcp
+    - ${config[ss_port]}:${config[ss_port]}/udp"
+  fi
+  if [[ -n ${engine_ports} ]]; then
+    engine_ports="    ports:${engine_ports}"
   fi
   nginx_service="  nginx:
     image: ${image[nginx]}
 ${nginx_ports}
 ${nginx_expose}
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     volumes:
     - ./website:/usr/share/nginx/html
 ${nginx_tls_volumes}
@@ -1132,6 +1402,11 @@ ${nginx_tls_volumes}
     - ${config[port]}:443
 ${haproxy_http_port}
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     volumes:
     - ./${path[haproxy]#${config_path}/}:/usr/local/etc/haproxy/haproxy.cfg
 ${haproxy_cert_volume}
@@ -1159,21 +1434,26 @@ services:
   engine:
     image: ${image[${config[core]}]}
     command: ${engine_command}
-${engine_udp_ports}
+${engine_ports}
     expose:
     - 443
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     environment:
       TZ: Etc/UTC
     volumes:
     - ./${path[engine]#${config_path}/}:/etc/${config[core]}/config.json
-    $([[ ${config[security]} != 'reality' ]] && { [[ ${config[transport]} == 'http' ]] || [[ ${config[transport]} == 'tcp' ]] || [[ ${config[transport]} == 'tuic' ]] || [[ ${config[transport]} == 'hysteria2' ]]; } && echo "- ./${path[server_crt]#${config_path}/}:/etc/${config[core]}/server.crt" || true)
-    $([[ ${config[security]} != 'reality' ]] && { [[ ${config[transport]} == 'http' ]] || [[ ${config[transport]} == 'tcp' ]] || [[ ${config[transport]} == 'tuic' ]] || [[ ${config[transport]} == 'hysteria2' ]]; } && echo "- ./${path[server_key]#${config_path}/}:/etc/${config[core]}/server.key" || true)
+    $([[ ${config[security]} != 'reality' ]] && { [[ ${config[transport]} == 'http' ]] || [[ ${config[transport]} == 'tcp' ]] || [[ ${config[transport]} == 'tuic' ]] || [[ ${config[transport]} == 'hysteria2' ]] || [[ ${config[transport]} == 'anytls' ]]; } && echo "- ./${path[server_crt]#${config_path}/}:/etc/${config[core]}/server.crt" || true)
+    $([[ ${config[security]} != 'reality' ]] && { [[ ${config[transport]} == 'http' ]] || [[ ${config[transport]} == 'tcp' ]] || [[ ${config[transport]} == 'tuic' ]] || [[ ${config[transport]} == 'hysteria2' ]] || [[ ${config[transport]} == 'anytls' ]]; } && echo "- ./${path[server_key]#${config_path}/}:/etc/${config[core]}/server.key" || true)
     networks:
     - reality
 ${nginx_service}
 ${haproxy_service}
-$(if [[ ${config[security]} == 'letsencrypt' && ${config[transport]} != 'shadowtls' ]]; then
+$(if needs_certbot; then
 echo "
   certbot:
     build:
@@ -1181,13 +1461,19 @@ echo "
     expose:
     - 80
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     volumes:
-    - /var/run/docker.sock:/var/run/docker.sock
+    - /var/run/docker.sock:/var/run/docker.sock:ro
     - ./certbot/data:/etc/letsencrypt
     - ./$(dirname "${path[server_pem]#${config_path}/}"):/certificate
     - ./${path[certbot_deployhook]#${config_path}/}:/deployhook.sh
     - ./${path[certbot_startup]#${config_path}/}:/startup.sh
     - ./website:/website
+    $([[ -n ${config[dns_credentials]} ]] && echo "- ${config[dns_credentials]}:/credentials.ini:ro" || true)
     networks:
     - reality
     entrypoint: /bin/sh
@@ -1197,8 +1483,49 @@ EOF
 }
 
 function generate_tgbot_compose {
+  # The bot never talks to Docker itself: it runs reality.sh, which does. It
+  # never needs /etc/docker, and the socket is mounted read-only so the container
+  # cannot replace it. With --harden-docker=true the socket is put behind a
+  # narrow proxy and never handed to the bot at all.
   # Same as generate_docker_compose: a "version:" key is obsolete in Compose v2
   # and only produces a warning.
+  local bot_environment
+  local bot_volumes
+  local proxy_service=''
+  if [[ ${config[harden_docker]} == 'ON' ]]; then
+    bot_environment="      DOCKER_HOST: tcp://socket-proxy:2375"
+    bot_volumes="    - ../:${config_path}"
+    proxy_service='  socket-proxy:
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      EXEC: 1
+      POST: 1
+      BUILD: 1
+      INFO: 1
+      VERSION: 1
+      ALLOW_START: 1
+      ALLOW_STOP: 1
+      ALLOW_RESTARTS: 1
+      LOG_LEVEL: warning
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+    - tgbot'
+  else
+    bot_environment="      DOCKER_HOST: unix:///var/run/docker.sock"
+    bot_volumes="    - /var/run/docker.sock:/var/run/docker.sock:ro
+    - ../:${config_path}"
+  fi
   cat >"${path[tgbot_compose]}" <<EOF
 networks:
   tgbot:
@@ -1211,15 +1538,20 @@ services:
   tgbot:
     build: ./
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     environment:
       BOT_TOKEN: ${config[tgbot_token]}
       BOT_ADMIN: ${config[tgbot_admins]}
+${bot_environment}
     volumes:
-    - /var/run/docker.sock:/var/run/docker.sock
-    - ../:${config_path}
-    - /etc/docker/:/etc/docker/
+${bot_volumes}
     networks:
     - tgbot
+${proxy_service}
 EOF
 }
 
@@ -1386,6 +1718,21 @@ EOF
 }
 
 function generate_certbot_script {
+  # In the camouflage "self" mode nginx already publishes the HTTP port, so
+  # certbot drops the challenge into the shared website directory instead of
+  # binding port 80 itself (which that stack does not give it).
+  local certbot_authenticator='--standalone'
+  if engine_owns_tls; then
+    certbot_authenticator='--webroot -w /website'
+  fi
+  # A DNS-01 provider replaces the HTTP-01 challenge entirely: port 80 is never
+  # touched, and a wildcard certificate becomes possible.
+  local certbot_names="    -d ${config[server]} \\"
+  if [[ -n ${config[dns_provider]} ]]; then
+    certbot_authenticator="--dns-${config[dns_provider]} --dns-${config[dns_provider]}-credentials /credentials.ini --dns-${config[dns_provider]}-propagation-seconds 30"
+    certbot_names="${certbot_names}
+    -d '*.${config[server]}' \\"
+  fi
   cat >"${path[certbot_startup]}" << EOF
 #!/bin/sh
 trap exit TERM
@@ -1396,9 +1743,12 @@ awk -F= '{print \$2}' | tr -d : | tr '[:upper:]' '[:lower:]')
   installed_fingerprint=\$(openssl x509 -noout -fingerprint -sha256 -in /certificate/server.pem 2>/dev/null |\
 awk -F= '{print \$2}' | tr -d : | tr '[:upper:]' '[:lower:]')
   if [[ \$fullchain_fingerprint != \$installed_fingerprint ]]; then
-    /deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true)
+    /deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true) $(engine_owns_tls && echo 'nginx' || true)
   fi
 fi
+# The HTTP reachability probe only guards the HTTP-01 challenge; a DNS-01 setup
+# never needs an inbound connection at all.
+if [ -z "${config[dns_provider]}" ]; then
 while true; do
   ls -d /website/* | grep -E '^/website/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\$'|xargs rm -f
   uuid=\$(uuidgen)
@@ -1411,15 +1761,16 @@ while true; do
   sleep 5
 done
 ls -d /website/* | grep -E '^/website/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\$'|xargs rm -f
+fi
 while true; do
   certbot certonly -n \\
-    --standalone \\
+    ${certbot_authenticator} \\
     --key-type ecdsa \\
     --elliptic-curve secp256r1 \\
     --agree-tos \\
     --register-unsafely-without-email \\
-    -d ${config[server]} \\
-    --deploy-hook "/deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true)"
+${certbot_names}
+    --deploy-hook "/deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true) $(engine_owns_tls && echo 'nginx' || true)"
   sleep 1h &
   wait \$!
 done
@@ -1447,9 +1798,16 @@ EOF
 }
 
 function generate_certbot_dockerfile {
+  # The DNS-01 provider rides in as a certbot plugin; the HTTP-01 modes need no
+  # extra package at all.
+  local dns_plugin=''
+  if [[ -n ${config[dns_provider]} ]]; then
+    dns_plugin="
+RUN pip install --no-cache-dir certbot-dns-${config[dns_provider]}"
+  fi
   cat >"${path[certbot_dockerfile]}" << EOF
 FROM ${image[certbot]}
-RUN apk add --no-cache docker-cli-compose curl uuidgen
+RUN apk add --no-cache docker-cli-compose curl uuidgen${dns_plugin}
 EOF
 }
 
@@ -1551,10 +1909,24 @@ function generate_engine_config {
   local reality_object=""
   local tls_object=""
   local warp_object=""
+  local ss_users_object=""
   # The camouflage site is what unauthenticated probes reach; it is a separate
   # deployment input from the SNI, and its optional ":port" suffix defaults to 443.
   local camouflage_host="${config[camouflage]%%:*}"
   local reality_port=443
+  # "self" points the fallback at the local nginx: the certificate a probe sees
+  # then matches the SNI exactly, because nginx serves the real certificate for
+  # the same domain.
+  if [[ ${config[camouflage]} == 'self' ]]; then
+    camouflage_host='nginx'
+    reality_port=443
+  fi
+  # hysteria2 relays the bandwidth the client reports unless a rate pair is set,
+  # in which case the server shapes with Brutal instead.
+  local hysteria2_bandwidth=', "ignore_client_bandwidth": true'
+  if [[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]]; then
+    hysteria2_bandwidth=', "ignore_client_bandwidth": false, "up_mbps": '"${config[hysteria2_up]}"', "down_mbps": '"${config[hysteria2_down]}"''
+  fi
   local temp_file
   if [[ ${config[transport]} == 'tuic' ]]; then
     type='tuic'
@@ -1562,6 +1934,8 @@ function generate_engine_config {
     type='hysteria2'
   elif [[ ${config[transport]} == 'shadowtls' ]]; then
     type='shadowtls'
+  elif [[ ${config[transport]} == 'anytls' ]]; then
+    type='anytls'
   else
     type='vless'
   fi
@@ -1623,12 +1997,18 @@ function generate_engine_config {
       fi
       if [[ ${config[transport]} == 'tuic' ]]; then
         users_object=${users_object}'{"uuid": "'"${users[${user}]}"'", "password": "'"$(echo -n "${user}${users[${user}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)"'", "name": "'"${user}"'"}'
-      elif [[ ${config[transport]} == 'hysteria2' ]]; then
+      elif [[ ${config[transport]} == 'hysteria2' || ${config[transport]} == 'anytls' ]]; then
         users_object=${users_object}'{"password": "'"$(echo -n "${user}${users[${user}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)"'", "name": "'"${user}"'"}'
       elif [[ ${config[transport]} == 'shadowtls' ]]; then
         users_object=${users_object}'{"password": "'"${users[${user}]}"'", "name": "'"${user}"'"}'
       else
         users_object=${users_object}'{"uuid": "'"${users[${user}]}"'", "flow": "'"$([[ ${config[transport]} == 'tcp' ]] && echo 'xtls-rprx-vision' || true)"'", "name": "'"${user}"'"}'
+      fi
+      if [[ -n ${config[ss_port]} ]]; then
+        if [ -n "$ss_users_object" ]; then
+          ss_users_object="${ss_users_object},"$'\n'
+        fi
+        ss_users_object=${ss_users_object}'{"name": "'"${user}"'", "password": "'"$(ss2022_user_key "${user}" "${users[${user}]}")"'"}'
       fi
     done
     # Remote rule-sets are fetched through an explicitly declared HTTP client.
@@ -1663,7 +2043,7 @@ function generate_engine_config {
       "users": [${users_object}],
       $(if [[ ${config[security]} == 'reality' && ${config[transport]} != 'shadowtls' ]]; then
         echo "${reality_object}"
-      elif [[ ${config[transport]} == 'http' || ${config[transport]} == 'tcp' || ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
+      elif [[ ${config[transport]} == 'http' || ${config[transport]} == 'tcp' || ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' || ${config[transport]} == 'anytls' ]]; then
         echo "${tls_object}"
       elif [[ ${config[transport]} == 'shadowtls' ]]; then
         :
@@ -1680,10 +2060,10 @@ function generate_engine_config {
       echo ',"transport": {"type": "ws", "headers": {"Host": "'"${config[server]}"'"}, "path": "/'"${config[service_path]}"'"}'
       fi
       if [[ ${config[transport]} == tuic ]]; then
-      echo ',"congestion_control": "bbr", "auth_timeout": "3s", "zero_rtt_handshake": false, "heartbeat": "10s"'
+      echo ',"congestion_control": "'"${config[tuic_congestion]}"'", "auth_timeout": "3s", "zero_rtt_handshake": false, "heartbeat": "10s"'
       fi
       if [[ ${config[transport]} == hysteria2 ]]; then
-      echo ',"obfs": {"type": "salamander", "password": "'"${config[service_path]}"'"}, "ignore_client_bandwidth": true, "masquerade": "https://'"${config[server]}:${config[port]}"'"'
+      echo ',"obfs": {"type": "salamander", "password": "'"${config[service_path]}"'"}'"${hysteria2_bandwidth}"', "masquerade": "https://'"${config[server]}:${config[port]}"'"'
       fi
       if [[ ${config[transport]} == shadowtls ]]; then
       echo '"version": 3, "strict_mode": false, "detour": "shadowsocks", "handshake": {"server": "'"${camouflage_host}"'", "server_port": '"${reality_port}"'}'
@@ -1699,6 +2079,17 @@ function generate_engine_config {
       "method": "chacha20-ietf-poly1305",
       "password": "'"${config[private_key]}"'",
       "users": ['"${users_object}"']
+    }'
+    fi )
+    $(if [[ -n ${config[ss_port]} ]]; then
+    echo ', {
+      "type": "shadowsocks",
+      "tag": "ss",
+      "listen": "::",
+      "listen_port": '"${config[ss_port]}"',
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "'"${config[ss_key]}"'",
+      "users": ['"${ss_users_object}"']
     }'
     fi )
   ],
@@ -1994,7 +2385,7 @@ function generate_config {
   if [[ ! -r "${path[server_pem]}" || ! -r "${path[server_crt]}" || ! -r "${path[server_key]}" ]]; then
     generate_selfsigned_certificate
   fi
-  if [[ ${config[security]} == "letsencrypt" && ${config[transport]} != 'shadowtls' ]]; then
+  if needs_certbot; then
     mkdir -p "${config_path}/certbot"
     generate_certbot_deployhook
     generate_certbot_dockerfile
@@ -2032,13 +2423,15 @@ function print_client_configuration {
   local client_config
   local ipv6
   local client_config_ipv6
+  local ss_config=''
+  local ss_config_ipv6=''
   if [[ ${config[transport]} == 'tuic' ]]; then
     client_config="tuic://"
     client_config="${client_config}${users[${username}]}"
     client_config="${client_config}:$(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)"
     client_config="${client_config}@${config[server]}"
     client_config="${client_config}:${config[port]}"
-    client_config="${client_config}/?congestion_control=bbr&udp_relay_mode=quic"
+    client_config="${client_config}/?congestion_control=${config[tuic_congestion]}&udp_relay_mode=quic"
     client_config="${client_config}$([[ ${config[security]} == 'selfsigned' ]] && echo "&allow_insecure=1" || true)"
     client_config="${client_config}#${username}"
   elif [[ ${config[transport]} == 'hysteria2' ]]; then
@@ -2047,6 +2440,15 @@ function print_client_configuration {
     client_config="${client_config}@${config[server]}"
     client_config="${client_config}:${config[port]}"
     client_config="${client_config}/?obfs=salamander&obfs-password=${config[service_path]}"
+    client_config="${client_config}$([[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]] && echo "&up=${config[hysteria2_up]}&down=${config[hysteria2_down]}" || true)"
+    client_config="${client_config}$([[ ${config[security]} == 'selfsigned' ]] && echo "&insecure=1" || true)"
+    client_config="${client_config}#${username}"
+  elif [[ ${config[transport]} == 'anytls' ]]; then
+    client_config="anytls://"
+    client_config="${client_config}$(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)"
+    client_config="${client_config}@${config[server]}"
+    client_config="${client_config}:${config[port]}"
+    client_config="${client_config}/?sni=${config[domain]%%:*}"
     client_config="${client_config}$([[ ${config[security]} == 'selfsigned' ]] && echo "&insecure=1" || true)"
     client_config="${client_config}#${username}"
   elif [[ ${config[transport]} == 'shadowtls' ]]; then
@@ -2073,6 +2475,9 @@ function print_client_configuration {
     client_config="${client_config}$([[ ${config[transport]} == 'grpc' ]] && echo "&serviceName=${config[service_path]}" || true)"
     client_config="${client_config}#${username}"
   fi
+  if [[ -n ${config[ss_port]} ]]; then
+    ss_config="ss://$(printf '%s' "2022-blake3-aes-128-gcm:$(ss2022_user_key "${username}" "${users[${username}]}")" | base64 | tr -d '\n')@${config[server]}:${config[ss_port]}#${username}-ss"
+  fi
   echo ""
   echo "=================================================="
   echo "Client configuration:"
@@ -2082,12 +2487,26 @@ function print_client_configuration {
   echo "Or you can scan the QR code:"
   echo ""
   qrencode -t ansiutf8 "${client_config}"
+  if [[ -n ${ss_config} ]]; then
+    echo ""
+    echo "==================Shadowsocks 2022======================"
+    echo "Client configuration:"
+    echo ""
+    echo "${ss_config}"
+    echo ""
+    echo "Or you can scan the QR code:"
+    echo ""
+    qrencode -t ansiutf8 "${ss_config}"
+  fi
   ipv6=$(get_ipv6)
   if [[ -n $ipv6 ]]; then
     if [[ ${config[transport]} != 'shadowtls' ]]; then
       client_config_ipv6=$(echo "$client_config" | sed "s/@${config[server]//./\\.}:/@[${ipv6}]:/" | sed "s/#${username}/#${username}-ipv6/")
     else
       client_config_ipv6=$(echo "$client_config" | sed "s/\"server\":\"${config[server]//./\\.}\"/\"server\":\"${ipv6}\"/")
+    fi
+    if [[ -n ${ss_config} ]]; then
+      ss_config_ipv6=$(echo "$ss_config" | sed "s/@${config[server]//./\\.}:/@[${ipv6}]:/" | sed "s/#${username}-ss/#${username}-ss-ipv6/")
     fi
     echo ""
     echo "==================IPv6 Config======================"
@@ -2098,7 +2517,210 @@ function print_client_configuration {
     echo "Or you can scan the QR code:"
     echo ""
     qrencode -t ansiutf8 "${client_config_ipv6}"
+    if [[ -n ${ss_config_ipv6} ]]; then
+      echo ""
+      echo "Client configuration (Shadowsocks 2022):"
+      echo ""
+      echo "${ss_config_ipv6}"
+      echo ""
+      qrencode -t ansiutf8 "${ss_config_ipv6}"
+    fi
   fi
+}
+
+# Multi-format client export (--format). The URI form stays the default; the
+# other formats translate the very same server-side parameters into the shape a
+# given client expects, so nothing has to be typed in by hand.
+function client_export_params {
+  client_uuid="${users[${username}]}"
+  client_host="${config[server]}"
+  client_port="${config[port]}"
+  client_sni="${config[domain]%%:*}"
+  client_password=$(echo -n "${username}${client_uuid}" | sha256sum | cut -d ' ' -f 1 | head -c 16)
+  client_insecure="false"
+  if [[ ${config[security]} == 'selfsigned' ]]; then
+    client_insecure="true"
+  fi
+}
+
+function client_singbox_outbound {
+  local bandwidth_object=''
+  local transport_object=''
+  local flow_object=''
+  if [[ ${config[transport]} == 'tuic' ]]; then
+    echo '{"type": "tuic", "tag": "proxy", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "uuid": "'"${client_uuid}"'", "password": "'"${client_password}"'", "congestion_control": "'"${config[tuic_congestion]}"'", "udp_relay_mode": "quic", "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "insecure": '"${client_insecure}"', "alpn": ["h3"]}}'
+  elif [[ ${config[transport]} == 'hysteria2' ]]; then
+    if [[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]]; then
+      bandwidth_object=', "up_mbps": '"${config[hysteria2_up]}"', "down_mbps": '"${config[hysteria2_down]}"''
+    fi
+    echo '{"type": "hysteria2", "tag": "proxy", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "password": "'"${client_password}"'"'"${bandwidth_object}"', "obfs": {"type": "salamander", "password": "'"${config[service_path]}"'"}, "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "insecure": '"${client_insecure}"'}}'
+  elif [[ ${config[transport]} == 'anytls' ]]; then
+    echo '{"type": "anytls", "tag": "proxy", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "password": "'"${client_password}"'", "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "insecure": '"${client_insecure}"', "utls": {"enabled": true, "fingerprint": "chrome"}}}'
+  elif [[ ${config[transport]} == 'shadowtls' ]]; then
+    return 1
+  else
+    if [[ ${config[transport]} == 'ws' ]]; then
+      transport_object=', "transport": {"type": "ws", "path": "/'"${config[service_path]}"'", "headers": {"Host": "'"${client_host}"'"}}'
+    elif [[ ${config[transport]} == 'grpc' ]]; then
+      transport_object=', "transport": {"type": "grpc", "service_name": "'"${config[service_path]}"'"}'
+    elif [[ ${config[transport]} == 'http' ]]; then
+      transport_object=', "transport": {"type": "http", "host": ["'"${client_host}"'"], "path": "/'"${config[service_path]}"'"}'
+    fi
+    if [[ ${config[transport]} == 'tcp' && ${config[security]} == 'reality' ]]; then
+      flow_object=', "flow": "xtls-rprx-vision"'
+    fi
+    if [[ ${config[security]} == 'reality' ]]; then
+      echo '{"type": "vless", "tag": "proxy", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "uuid": "'"${client_uuid}"'", "packet_encoding": "xudp"'"${flow_object}"', "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "utls": {"enabled": true, "fingerprint": "chrome"}, "reality": {"enabled": true, "public_key": "'"${config[public_key]}"'", "short_id": "'"${config[short_id]}"'"}}'"${transport_object}"'}'
+    else
+      echo '{"type": "vless", "tag": "proxy", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "uuid": "'"${client_uuid}"'", "packet_encoding": "xudp"'"${flow_object}"', "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "insecure": '"${client_insecure}"', "utls": {"enabled": true, "fingerprint": "chrome"}}'"${transport_object}"'}'
+    fi
+  fi
+}
+
+function client_v2ray_outbound {
+  local flow_object=''
+  local stream_object=''
+  if [[ ${config[transport]} == 'tcp' ]]; then
+    stream_object='"tcpSettings": {"header": {"type": "none"}}'
+  elif [[ ${config[transport]} == 'ws' ]]; then
+    stream_object='"wsSettings": {"path": "/'"${config[service_path]}"'", "headers": {"Host": "'"${client_host}"'"}}'
+  elif [[ ${config[transport]} == 'grpc' ]]; then
+    stream_object='"grpcSettings": {"serviceName": "'"${config[service_path]}"'"}'
+  elif [[ ${config[transport]} == 'http' ]]; then
+    stream_object='"xhttpSettings": {"host": "'"${client_host}"'", "path": "/'"${config[service_path]}"'"}'
+  else
+    return 1
+  fi
+  if [[ ${config[transport]} == 'tcp' && ${config[security]} == 'reality' ]]; then
+    flow_object=', "flow": "xtls-rprx-vision"'
+  fi
+  if [[ ${config[security]} == 'reality' ]]; then
+    echo '{"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{"address": "'"${client_host}"'", "port": '"${client_port}"', "users": [{"id": "'"${client_uuid}"'", "encryption": "none"'"${flow_object}"'}]}]}, "streamSettings": {"network": "'"$([[ ${config[transport]} == 'http' ]] && echo xhttp || echo "${config[transport]}")"'", "security": "reality", "realitySettings": {"serverName": "'"${client_sni}"'", "fingerprint": "chrome", "publicKey": "'"${config[public_key]}"'", "shortId": "'"${config[short_id]}"'"}, '"${stream_object}"'}}'
+  else
+    echo '{"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{"address": "'"${client_host}"'", "port": '"${client_port}"', "users": [{"id": "'"${client_uuid}"'", "encryption": "none"'"${flow_object}"'}]}]}, "streamSettings": {"network": "'"$([[ ${config[transport]} == 'http' ]] && echo xhttp || echo "${config[transport]}")"'", "security": "tls", "tlsSettings": {"serverName": "'"${client_sni}"'", "allowInsecure": '"${client_insecure}"', "fingerprint": "chrome"}, '"${stream_object}"'}}'
+  fi
+}
+
+function client_clash_proxy {
+  local insecure_yaml='false'
+  local up_down_yaml=''
+  if [[ ${config[security]} == 'selfsigned' ]]; then
+    insecure_yaml='true'
+  fi
+  if [[ ${config[transport]} == 'tuic' ]]; then
+    echo "- name: \"${username}\"
+  type: tuic
+  server: ${client_host}
+  port: ${client_port}
+  uuid: ${client_uuid}
+  password: ${client_password}
+  udp-relay-mode: quic
+  congestion-controller: ${config[tuic_congestion]}
+  sni: ${client_sni}
+  alpn: [h3]
+  skip-cert-verify: ${insecure_yaml}"
+  elif [[ ${config[transport]} == 'hysteria2' ]]; then
+    if [[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]]; then
+      up_down_yaml="
+  up: \"${config[hysteria2_up]} Mbps\"
+  down: \"${config[hysteria2_down]} Mbps\""
+    fi
+    echo "- name: \"${username}\"
+  type: hysteria2
+  server: ${client_host}
+  port: ${client_port}
+  password: ${client_password}
+  obfs: salamander
+  obfs-password: ${config[service_path]}
+  sni: ${client_sni}
+  skip-cert-verify: ${insecure_yaml}${up_down_yaml}"
+  elif [[ ${config[transport]} == 'anytls' ]]; then
+    echo "- name: \"${username}\"
+  type: anytls
+  server: ${client_host}
+  port: ${client_port}
+  password: ${client_password}
+  sni: ${client_sni}
+  skip-cert-verify: ${insecure_yaml}"
+  elif [[ ${config[transport]} == 'shadowtls' ]]; then
+    return 1
+  else
+    local opts_yaml=''
+    local flow_yaml=''
+    if [[ ${config[transport]} == 'ws' ]]; then
+      opts_yaml="
+  ws-opts:
+    path: /${config[service_path]}
+    headers:
+      Host: ${client_host}"
+    elif [[ ${config[transport]} == 'grpc' ]]; then
+      opts_yaml="
+  grpc-opts:
+    grpc-service-name: ${config[service_path]}"
+    fi
+    if [[ ${config[transport]} == 'tcp' && ${config[security]} == 'reality' ]]; then
+      flow_yaml="
+  flow: xtls-rprx-vision"
+    fi
+    echo "- name: \"${username}\"
+  type: vless
+  server: ${client_host}
+  port: ${client_port}
+  uuid: ${client_uuid}
+  network: $([[ ${config[transport]} == 'http' ]] && echo xhttp || echo "${config[transport]}")
+  tls: true
+  servername: ${client_sni}
+  client-fingerprint: chrome${flow_yaml}
+  $([[ ${config[security]} == 'reality' ]] && echo "reality-opts:
+    public-key: ${config[public_key]}
+    short-id: ${config[short_id]}" || echo "skip-cert-verify: ${insecure_yaml}")${opts_yaml}"
+  fi
+}
+
+function print_client_configuration_formatted {
+  local username=$1
+  local outbound
+  client_export_params
+  case ${args[format]} in
+    clash)
+      if [[ ${config[transport]} == 'shadowtls' ]]; then
+        echo 'The clash format cannot express the shadowtls chain; use --format singbox or json.'
+        return 1
+      fi
+      echo "proxies:"
+      client_clash_proxy
+      ;;
+    singbox)
+      if [[ ${config[transport]} == 'shadowtls' ]]; then
+        print_client_configuration "${username}"
+        return 0
+      fi
+      client_singbox_outbound
+      ;;
+    v2ray)
+      if ! client_v2ray_outbound; then
+        echo 'The v2ray format only covers the vless transports (tcp / ws / grpc / http); use --format singbox for this one.'
+        return 1
+      fi
+      ;;
+    json)
+      if [[ ${config[transport]} == 'shadowtls' ]]; then
+        print_client_configuration "${username}"
+        return 0
+      fi
+      outbound=$(client_singbox_outbound)
+      echo '{
+  "log": {"level": "info"},
+  "inbounds": [
+    {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080}
+  ],
+  "outbounds": [
+    '"${outbound}"'
+  ],
+  "route": {"final": "proxy"}
+}'
+      ;;
+  esac
 }
 
 function migrate_legacy_install {
@@ -2286,7 +2908,7 @@ Port: ${config[port]}
 UUID: ${users[$username]}
 Password: $(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)
 UDP Relay Mode: quic
-Congestion Control: bbr
+Congestion Control: ${config[tuic_congestion]}
       " | tr -s '\n')
     elif [[ ${config[transport]} == 'hysteria2' ]]; then
       user_config=$(echo "
@@ -2297,6 +2919,18 @@ Port: ${config[port]}
 Password: $(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)
 OBFS Type: salamander
 OBFS Password: ${config[service_path]}
+$([[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]] && echo "Up: ${config[hysteria2_up]} Mbps" || true)
+$([[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]] && echo "Down: ${config[hysteria2_down]} Mbps" || true)
+      " | tr -s '\n')
+    elif [[ ${config[transport]} == 'anytls' ]]; then
+      user_config=$(echo "
+Protocol: anytls
+Remarks: ${username}
+Address: ${config[server]}
+Port: ${config[port]}
+Password: $(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)
+SNI: ${config[domain]%%:*}
+$([[ ${config[security]} == 'selfsigned' ]] && echo "Allow Insecure: true" || true)
       " | tr -s '\n')
     elif [[ ${config[transport]} == 'shadowtls' ]]; then
       user_config=$(echo "
@@ -2340,6 +2974,15 @@ $([[ ${config[security]} == 'selfsigned' ]] && echo "Allow Insecure: true" || tr
 $([[ ${config[security]} == 'reality' ]] && echo "PublicKey: ${config[public_key]}" || true)
 $([[ ${config[security]} == 'reality' ]] && echo "ShortId: ${config[short_id]}" || true)
       " | tr -s '\n')
+    fi
+    if [[ -n ${config[ss_port]} ]]; then
+      user_config="${user_config}
+Shadowsocks 2022 (extra inbound)
+Address: ${config[server]}
+Port: ${config[ss_port]}
+Method: 2022-blake3-aes-128-gcm
+Password: $(ss2022_user_key "${username}" "${users[${username}]}")
+"
     fi
     if ui_yesno "${username} details" "${user_config}\n\nShow the QR code and the client link?"; then
       print_client_configuration "${username}"
@@ -2574,7 +3217,8 @@ function config_transport_menu {
       "ws" "ws" \
       "tuic" "tuic" \
       "hysteria2" "hysteria2" \
-      "shadowtls" "shadowtls")
+      "shadowtls" "shadowtls" \
+      "anytls" "anytls")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -2602,6 +3246,14 @@ function config_transport_menu {
       message_box 'Invalid Configuration' 'You cannot use "shadowtls" transport with "xray" core. Use other transports or change core to "sing-box"'
       continue
     fi
+    if [[ ${transport} == 'anytls' && ${config[core]} == 'xray' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "anytls" transport with "xray" core. Use other transports or change core to "sing-box"'
+      continue
+    fi
+    if [[ ${transport} == 'anytls' && ${config[security]} == 'reality' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "anytls" transport with "reality" TLS certificate. Use other transports or change TLS certificate to "letsencrypt" or "selfsigned"'
+      continue
+    fi
     if [[ ${config[transport]} != 'shadowtls' && ${transport} == 'shadowtls' && ${config[security]} != 'reality' ]]; then
       config[domain]="${defaults[domain]}"
     fi
@@ -2619,17 +3271,26 @@ function config_camouflage_menu {
     if [[ $? -ne 0 ]]; then
       break
     fi
-    if [[ ! $camouflage =~ ${regex[domain_port]} ]]; then
-      message_box "Invalid Domain" '"'"${camouflage}"'" is not a valid domain.'
+    if [[ $camouflage != 'self' ]] && [[ ! $camouflage =~ ${regex[domain_port]} ]]; then
+      message_box "Invalid Domain" '"'"${camouflage}"'" is not a valid domain (or "self").'
       continue
     fi
-    if [[ $camouflage =~ : ]] && (( ${camouflage#*:} > 65535 )); then
+    if [[ $camouflage != 'self' && $camouflage =~ : ]] && (( ${camouflage#*:} > 65535 )); then
       message_box "Invalid Port" 'The camouflage port must be between 1 and 65535.'
       continue
     fi
-    config[camouflage]=$camouflage
-    if [[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]]; then
-      config[domain]="${camouflage%%:*}"
+    if [[ $camouflage == 'self' ]]; then
+      if [[ ! ${config[server]} =~ ${regex[domain]} ]]; then
+        message_box "Invalid Configuration" 'The "self" camouflage needs a domain in Server Address: a real certificate is issued for it.'
+        continue
+      fi
+      config[camouflage]='self'
+      config[domain]="${config[server]}"
+    else
+      config[camouflage]=$camouflage
+      if [[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]]; then
+        config[domain]="${camouflage%%:*}"
+      fi
     fi
     update_config_file
     break
@@ -2761,10 +3422,10 @@ function config_http_port_menu {
   # The ACME HTTP-01 challenge always needs port 80, and build_config pins the
   # HTTP port to 80 in this mode. Offering a choice that the next full run would
   # overwrite anyway (and rejecting the mandatory 80) is worse than doing nothing.
-  if [[ ${config[security]} == 'letsencrypt' ]]; then
+  if needs_certbot; then
     config[http_port]=80
     update_config_file
-    message_box "HTTP Port" "The letsencrypt mode always uses port 80 for the ACME HTTP-01 challenge; the HTTP port has been kept at 80."
+    message_box "HTTP Port" "This mode serves the ACME HTTP-01 challenge on port 80 (letsencrypt, or camouflage self); the HTTP port has been kept at 80."
     return
   fi
   while true; do
@@ -2779,7 +3440,7 @@ function config_http_port_menu {
       message_box "Invalid Port" "Port must be an integer between 1 and 65535, or \"off\""
       continue
     elif [[ ${http_port} -eq 80 ]]; then
-      message_box "Port 80" "Port 80 is only bound by the letsencrypt mode. Pick another port (default: ${defaults[http_port]}) or switch the security mode to letsencrypt."
+      message_box "Port 80" "Port 80 is only bound by the ACME challenge (letsencrypt or camouflage self). Pick another port (default: ${defaults[http_port]})."
       continue
     elif [[ ${http_port} -eq ${config[port]} ]]; then
       message_box "Port In Use" "Port ${config[port]} belongs to the proxy; pick another port for the website."
@@ -3661,6 +4322,214 @@ function configure_docker {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Actions that are not part of the install flow.
+# ---------------------------------------------------------------------------
+
+# Newest tag of a pinned image, restricted to the same "shape" as the pinned one
+# (same optional "v" prefix and suffix such as "-alpine"), so that a version is
+# compared like for like. Returns non-zero when the registry cannot be reached.
+function latest_image_tag {
+  local ref=$1
+  local repo="${ref%:*}"
+  local tags
+  local pattern
+  case "${ref}" in
+    ghcr.io/xtls/xray-core:*)    pattern='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    ghcr.io/sagernet/sing-box:*) pattern='^v[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    nginx:*)                     pattern='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    certbot/certbot:*)           pattern='^v[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    haproxy:*)                   pattern='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    python:*)                    pattern='^[0-9]+\.[0-9]+-alpine$' ;;
+    *)                           return 1 ;;
+  esac
+  if [[ ${repo} == ghcr.io/* ]]; then
+    local ghcr_repo="${repo#ghcr.io/}"
+    local token
+    token=$(curl -fsSL -m 15 "https://ghcr.io/token?scope=repository:${ghcr_repo}:pull&service=ghcr.io" | jq -r '.token // empty' 2>/dev/null) || return 1
+    if [[ -z ${token} ]]; then
+      return 1
+    fi
+    tags=$(curl -fsSL -m 15 -H "Authorization: Bearer ${token}" "https://ghcr.io/v2/${ghcr_repo}/tags/list" | jq -r '.tags[]? // empty' 2>/dev/null) || return 1
+  else
+    local hub_repo="${repo}"
+    if [[ ${hub_repo} != */* ]]; then
+      hub_repo="library/${hub_repo}"
+    fi
+    tags=$(curl -fsSL -m 20 "https://hub.docker.com/v2/repositories/${hub_repo}/tags?page_size=100" | jq -r '.results[]?.name // empty' 2>/dev/null) || return 1
+  fi
+  if [[ -z ${tags} ]]; then
+    return 1
+  fi
+  printf '%s\n' "${tags}" | grep -E "${pattern}" | sort -V | tail -n 1
+}
+
+function check_update {
+  if ! command -v jq >/dev/null 2>&1; then
+    echo 'The update check needs jq and curl; install them and try again.'
+    return 1
+  fi
+  echo "Pinned images vs. their upstream registries:"
+  local ref pinned latest
+  local outdated=0
+  for ref in "${image[xray]}" "${image[sing-box]}" "${image[nginx]}" "${image[certbot]}" "${image[haproxy]}" "${image[python]}"; do
+    pinned="${ref##*:}"
+    if latest=$(latest_image_tag "${ref}"); then
+      if [[ ${latest} == "${pinned}" ]]; then
+        printf '  ok   %-42s %s\n' "${ref}" "up to date"
+      else
+        printf '  !    %-42s pinned %s, newest %s\n' "${ref}" "${pinned}" "${latest}"
+        outdated=$((outdated + 1))
+      fi
+    else
+      printf '  ?    %-42s registry not reachable\n' "${ref}"
+    fi
+  done
+  if [[ ${outdated} -eq 0 ]]; then
+    echo 'All pinned images are current.'
+  else
+    echo "${outdated} image(s) have a newer tag upstream; update the image[] pins after reading the changelog."
+  fi
+}
+
+# Open the ports the stack publishes in the host firewall. ufw and firewalld are
+# handled directly; anything else (or none) just prints the list, because a wrong
+# nftables rule is worse than no rule at all.
+function open_firewall {
+  local tcp_ports=("${config[port]}")
+  local udp_ports=()
+  local port
+  if [[ ${config[http_port]} != 'OFF' ]]; then
+    tcp_ports+=("${config[http_port]}")
+  fi
+  if needs_certbot && [[ -z ${config[dns_provider]} ]]; then
+    tcp_ports+=('80')
+  fi
+  if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
+    udp_ports+=("${config[port]}")
+  fi
+  if [[ -n ${config[ss_port]} ]]; then
+    tcp_ports+=("${config[ss_port]}")
+    udp_ports+=("${config[ss_port]}")
+  fi
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    for port in "${tcp_ports[@]}"; do ufw allow "${port}/tcp" >/dev/null 2>&1 || true; done
+    for port in "${udp_ports[@]}"; do ufw allow "${port}/udp" >/dev/null 2>&1 || true; done
+    echo "Opened in ufw: ${tcp_ports[*]}/tcp"
+    if [[ ${#udp_ports[@]} -gt 0 ]]; then
+      echo "Opened in ufw: ${udp_ports[*]}/udp"
+    fi
+    return 0
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+    for port in "${tcp_ports[@]}"; do firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true; done
+    for port in "${udp_ports[@]}"; do firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1 || true; done
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    echo "Opened in firewalld: ${tcp_ports[*]}/tcp"
+    if [[ ${#udp_ports[@]} -gt 0 ]]; then
+      echo "Opened in firewalld: ${udp_ports[*]}/udp"
+    fi
+    return 0
+  fi
+  echo 'No active ufw/firewalld was detected, so no host rule was changed.'
+  echo "Allow these in your provider's firewall / security group:"
+  echo "  tcp ${tcp_ports[*]}"
+  if [[ ${#udp_ports[@]} -gt 0 ]]; then
+    echo "  udp ${udp_ports[*]}"
+  fi
+  return 0
+}
+
+# A read-only health check of the local stack. It never changes anything.
+function doctor {
+  local -i problems=0
+  local check running
+  echo 'reality doctor'
+  echo '=============='
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    echo 'ok    docker daemon is running'
+  else
+    echo 'FAIL  docker daemon is not running (or docker is not installed)'
+    problems=$((problems + 1))
+  fi
+  for check in engine nginx haproxy; do
+    running=$(${docker_cmd} -p "${compose_project}" ps --status running -q "${check}" 2>/dev/null | head -n 1)
+    if [[ -n ${running} ]]; then
+      echo "ok    service ${check} is running"
+    else
+      echo "FAIL  service ${check} is not running"
+      problems=$((problems + 1))
+    fi
+  done
+  if needs_certbot; then
+    running=$(${docker_cmd} -p "${compose_project}" ps --status running -q certbot 2>/dev/null | head -n 1)
+    if [[ -n ${running} ]]; then
+      echo 'ok    service certbot is running'
+    else
+      echo 'warn  service certbot is not running'
+    fi
+  fi
+  if port_in_use "${config[port]}"; then
+    echo "ok    proxy port ${config[port]} is listening"
+  else
+    echo "FAIL  nothing is listening on the proxy port ${config[port]}"
+    problems=$((problems + 1))
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    check=$(echo | timeout 10 openssl s_client -connect "127.0.0.1:${config[port]}" -servername "${config[domain]%%:*}" -tls1_3 2>/dev/null | grep -c 'TLSv1.3' || true)
+    if [[ ${check} -ge 1 ]]; then
+      echo "ok    TLS 1.3 handshake for SNI ${config[domain]%%:*} on ${config[port]} succeeds"
+    else
+      echo "FAIL  no TLS 1.3 handshake for SNI ${config[domain]%%:*} on ${config[port]}"
+      problems=$((problems + 1))
+    fi
+    if engine_owns_tls; then
+      check=$(echo | timeout 10 openssl s_client -connect "127.0.0.1:${config[port]}" -servername 'doctor.invalid' 2>/dev/null | grep -c 'BEGIN CERTIFICATE' || true)
+      if [[ ${check} -ge 1 ]]; then
+        echo 'ok    a non-proxy SNI still reaches a website certificate'
+      else
+        echo 'warn  a non-proxy SNI did not get a certificate back'
+      fi
+    fi
+  else
+    echo 'warn  openssl is not available; skipping the TLS checks'
+  fi
+  if [[ ${config[http_port]} != 'OFF' ]] && command -v curl >/dev/null 2>&1; then
+    if curl -fsS -m 5 -o /dev/null "http://127.0.0.1:${config[http_port]}/"; then
+      echo "ok    website answers on http://127.0.0.1:${config[http_port]}/"
+    else
+      echo "warn  the website did not answer on http://127.0.0.1:${config[http_port]}/"
+    fi
+  fi
+  if [[ -f ${path[server_pem]} ]] && command -v openssl >/dev/null 2>&1; then
+    check=$(openssl x509 -enddate -noout -in "${path[server_pem]}" 2>/dev/null | cut -d= -f2 || true)
+    if [[ -n ${check} ]]; then
+      echo "info  certificate notAfter: ${check}"
+    fi
+  fi
+  if [[ ${config[server]} =~ ${regex[domain]} ]]; then
+    check=$(getent hosts "${config[server]}" 2>/dev/null | awk '{print $1; exit}' || true)
+    if [[ -n ${check} ]]; then
+      echo "info  ${config[server]} resolves to ${check}"
+    else
+      echo "warn  ${config[server]} does not resolve"
+    fi
+  fi
+  echo
+  echo "Ports to allow in the provider firewall / security group:"
+  echo "  tcp: ${config[port]}$([[ ${config[http_port]} != 'OFF' ]] && echo " ${config[http_port]}" || true)$([[ ${config[security]} == 'letsencrypt' ]] && echo ' 80' || true)"
+  if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
+    echo "  udp: ${config[port]}"
+  fi
+  echo
+  if [[ ${problems} -eq 0 ]]; then
+    echo 'No hard failures found.'
+  else
+    echo "${problems} hard failure(s) found."
+  fi
+  return 0
+}
+
 if ! parse_args "$@"; then
   show_help
   exit 1
@@ -3713,6 +4582,10 @@ if [[ -n ${args[restore]} ]]; then
 fi
 generate_file_list
 install_packages
+if [[ ${args[check_update]} == true ]]; then
+  check_update || true
+  exit 0
+fi
 install_docker
 configure_docker
 upgrade
@@ -3728,6 +4601,16 @@ update_users_file
 RELOAD_DEFERRED=0
 tune_kernel
 flush_reload
+
+# --open-firewall and --doctor are one-shot diagnostics: they run after the
+# configuration is built so they can use the resolved ports and SNI.
+if [[ ${args[open_firewall]} == true ]]; then
+  open_firewall
+fi
+if [[ ${args[doctor]} == true ]]; then
+  doctor
+  exit 0
+fi
 
 if [[ ${args[menu]} == 'true' ]]; then
   set +e
@@ -3770,7 +4653,11 @@ if [[ -n ${args[add_user]} ]]; then
   username="${args[add_user]}"
 fi
 if [[ -n $username ]]; then
-  print_client_configuration "${username}"
+  if [[ -n ${args[format]} && ${args[format]} != 'uri' ]]; then
+    print_client_configuration_formatted "${username}"
+  else
+    print_client_configuration "${username}"
+  fi
 fi
 echo "Command has been executed successfully!"
 exit 0

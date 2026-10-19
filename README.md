@@ -247,9 +247,9 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 
 | 参数 | 说明 |
 | --- | --- |
-| `-t, --transport <tcp\|http\|grpc\|ws\|tuic\|hysteria2\|shadowtls>` | 传输协议（默认 `tcp`） |
+| `-t, --transport <tcp\|http\|grpc\|ws\|tuic\|hysteria2\|shadowtls\|anytls>` | 传输协议（默认 `tcp`）；`anytls` 需要 sing-box 内核与真实 / 自签证书（不能配 `reality`），由引擎自己终止 TLS |
 | `-d, --domain <domain>` | Reality 握手使用的 SNI 域名（默认跟随 `--camouflage`） |
-| `--camouflage <domain[:port]>` | `reality` / `shadowtls` 模式下未通过校验的流量所回落的远端真实站点（默认 `www.fastly.com`，端口默认 `443`） |
+| `--camouflage <domain[:port]\|self>` | `reality` / `shadowtls` 模式下未通过校验的流量所回落的远端真实站点（默认 `www.fastly.com`，端口默认 `443`）；填 `self` 则回落本机网站并为 SNI 域名签发真实证书（需要 `--server` 是域名，且 ACME HTTP-01 使用端口 80） |
 | `--server <server>` | 本机公网 IP 或域名；使用 `letsencrypt` 时必须是域名 |
 | `--port <port>` | 代理端口，同时用于网站 HTTPS（默认 `443`） |
 | `--http-port <port\|off>` | nginx 明文网站的宿主端口（默认 `8080`，`off` 表示不监听该入口） |
@@ -266,16 +266,39 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `--add-user <username>` | 新增用户 |
 | `--list-users` | 列出全部用户 |
 | `--show-user <username>` | 打印某用户的客户端链接与二维码 |
+| `--format <uri\|clash\|singbox\|v2ray\|json>` | 配合 `--show-user` 选择客户端配置的导出格式（默认 `uri`）：`clash` / `singbox` / `v2ray` 给出可直接粘贴的 outbound 片段，`json` 给出完整的 sing-box 客户端配置。`v2ray` 只覆盖 vless 系列传输 |
 | `--delete-user <username>` | 删除用户 |
 | `--enable-tgbot <true\|false>` | 启用 Telegram 机器人 |
 | `--tgbot-token <token>` | Telegram 机器人 Token |
 | `--tgbot-admins <user1,123456789>` | 机器人管理员：Telegram 用户名（不带 `@`）或数字 ID |
+| `--harden-docker <true\|false>` | 把 Docker socket 放进最小权限代理（`tecnativa/docker-socket-proxy`），机器人不再直接拿到 socket；默认 `false`（仅精简挂载，不引入第三方镜像） |
 | `--backup` | 创建并上传备份 |
 | `--restore <url\|file>` | 从备份恢复 |
 | `--backup-password <password>` | 为备份设置密码 |
+| `--hysteria2-up <mbps>` / `--hysteria2-down <mbps>` | hysteria2 服务端上下行（Mbps），两个都填才生效：等价于关闭 `ignore_client_bandwidth`，改由服务端按此速率用 Brutal 整形 |
+| `--tuic-congestion <cubic\|new_reno\|bbr>` | tuic v5 的拥塞控制算法（默认 `bbr`） |
+| `--ss-port <port\|off>` | 额外开放一个 Shadowsocks 2022（`2022-blake3-aes-128-gcm`）入口，自带独立端口（仅 sing-box；默认关闭）。它不参与 SNI 分流，因为纯 TCP 没有 TLS SNI 可分；每个用户会派生一把稳定的独立密钥 |
+| `--dns-provider <cloudflare>` | 改用 DNS-01 校验来签发证书（默认关闭）：不再需要 80 端口入站，并会自动附带一张 `*.你的域名` 泛域名证书 |
+| `--dns-credentials <path>` | DNS 服务商凭据文件的宿主机路径（Cloudflare 为含 `dns_cloudflare_api_token = ...` 的 ini 文件），会以只读方式挂进 certbot 容器 |
+| `--open-firewall` | 在宿主防火墙（ufw / firewalld）放行代理与网站端口；未识别到防火墙时只打印需要在安全组放行的端口 |
+| `--check-update` | 对比钉死的镜像 tag 与上游最新 tag 后退出（只读，不改任何东西） |
+| `--doctor` | 对运行中的服务栈做一次只读体检（容器、端口、SNI 分流、证书、DNS）后退出 |
 | `-m, --menu` | 打开管理菜单 |
 | `-u, --uninstall` | 卸载服务栈并删除 `/opt/reality`；旧版遗留的 `/opt/reality-ezpz` 与内核调优文件也会一并清理 |
 | `-h, --help` | 查看帮助 |
+
+### 伪装目标与「偷自己」
+
+`reality` / `shadowtls` 下，未通过校验的探测流量会被回落到 `--camouflage` 指向的真实站点。探测器用你发出的 SNI 去比对回落站点返回的证书，所以两者必须是同一个域名（`--domain` 与 `--camouflage` 会自动保持一致）。
+
+* **借用大厂域名**（默认 `www.fastly.com`）：省事，但对方可能限速、TLS 指纹与真实站点不同、证书也会轮换。显式把 `--camouflage` 指向某个大厂域名时，安装脚本会明确提醒。
+* **`--camouflage self`（偷自己）**：回落到**本机 nginx**，并由 `certbot` 为 SNI 域名签发**真实证书**。探测者看到的是与你 SNI 完全匹配的真实证书，也不依赖任何第三方站点。代价是必须用域名（`--server <domain>`），且 ACME HTTP-01 需要 80 端口（脚本会自动把 `--http-port` 固定为 80）。证书续期后会自动重启 nginx。
+
+### 运维与体检
+
+* `--doctor`：只读体检（容器是否在跑、端口是否监听、SNI 分流是否正常、证书有效期、域名解析），不改动任何东西。
+* `--check-update`：把钉死的镜像 tag 与上游最新 tag 做「同形态」比较（例如 `vX.Y.Z` 只和 `vX.Y.Z` 比），有新版本不会改变退出码。
+* `--open-firewall`：自动在 ufw / firewalld 放行代理与网站端口；识别不到防火墙时打印需要在云厂商安全组放行的端口。
 
 ---
 
