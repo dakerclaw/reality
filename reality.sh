@@ -1345,6 +1345,7 @@ function generate_docker_compose {
   local nginx_tls_volumes=''
   local haproxy_http_port=''
   local haproxy_cert_volume=''
+  local haproxy_depends=''
   local nginx_service
   local haproxy_service
   if engine_owns_tls; then
@@ -1396,8 +1397,21 @@ ${nginx_expose}
 ${nginx_tls_volumes}
     networks:
     - reality"
+  # haproxy resolves its backend names while it parses the configuration, so the
+  # services it points at must already be registered in Docker's DNS. Without
+  # depends_on a cold start races the resolver: haproxy exits 1 and the proxy
+  # only comes back through the restart policy. The engine and nginx are always
+  # referenced; certbot only exists in the ACME modes.
+  haproxy_depends="    depends_on:
+    - engine
+    - nginx"
+  if needs_certbot; then
+    haproxy_depends="${haproxy_depends}
+    - certbot"
+  fi
   haproxy_service="  haproxy:
     image: ${image[haproxy]}
+${haproxy_depends}
     ports:
     - ${config[port]}:443
 ${haproxy_http_port}
