@@ -4331,6 +4331,12 @@ function configure_docker {
   local docker_config="/etc/docker/daemon.json"
   local config_modified=false
   local temp_file
+  # The bot container runs this script for --list-users / --show-user and has no
+  # /etc/docker of its own. Without the mkdir the redirect below fails and set -e
+  # aborts the whole script, so every bot command dies before it prints anything.
+  if [[ ! -d "${docker_config%/*}" ]]; then
+    mkdir -p "${docker_config%/*}" 2>/dev/null || return 0
+  fi
   temp_file=$(mktemp)
   if [[ ! -f "${docker_config}" ]] || [[ ! -s "${docker_config}" ]]; then
     echo '{"experimental": true, "ip6tables": true}' | jq . > "${docker_config}"
@@ -4349,8 +4355,10 @@ function configure_docker {
     fi
   fi
   rm -f "${temp_file}"
-  if [[ "${config_modified}" = true ]] || ! systemctl is-active --quiet docker; then
-    sudo systemctl restart docker || true
+  # Container images carry no systemctl. Treat "cannot manage docker here" as
+  # "nothing to restart" instead of letting the missing binary print errors.
+  if [[ "${config_modified}" = true ]] || ! systemctl is-active --quiet docker 2>/dev/null; then
+    systemctl restart docker 2>/dev/null || true
   fi
 }
 
