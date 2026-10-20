@@ -111,8 +111,11 @@ defaults[camouflage]=www.fastly.com
 defaults[port]=443
 # Host port of the plain-HTTP side. It serves the local website out of
 # ./website (nginx), and in the letsencrypt mode it also carries the ACME
-# HTTP-01 challenge. "OFF" keeps it unpublished entirely.
-defaults[http_port]=8080
+# HTTP-01 challenge. It stays unpublished ("OFF") unless a port is asked for:
+# the website is already reachable over TLS on the shared 443, and a plain-HTTP
+# listener is one more open port to explain away. Pass --http-port <port> to
+# publish it. "OFF" keeps it unpublished entirely.
+defaults[http_port]=OFF
 defaults[safenet]=OFF
 # BBR is a kernel feature, so "enabling" it means loading tcp_bbr/sch_fq and
 # writing two sysctls - nothing is installed from a package repository. It is
@@ -246,7 +249,7 @@ function show_help {
   echo "                            and is skipped with a warning on kernels that do not offer it (needs 4.9+)"
   echo "      --port <port>         Server port, shared by the proxy and the website (default: ${defaults[port]}; 80 is reserved for letsencrypt)"
   echo "      --http-port <port|off> Host port of the local website served by nginx out of ./website, and the ACME challenge"
-  echo "                            in the letsencrypt mode (default: ${defaults[http_port]}, \"off\" leaves it unpublished)"
+  echo "                            in the letsencrypt mode (default: ${defaults[http_port]} - unpublished; give a port to publish it)"
   echo "      --enable-warp <true|false> Enable or disable Cloudflare warp"
   echo "      --warp-license <warp-license> Add Cloudflare warp+ license"
   echo "  -c  --core <sing-box|xray> Select core (xray, sing-box, default: ${defaults[core]})"
@@ -982,7 +985,7 @@ function build_config {
     fi
   elif [[ ${config[http_port]} == '80' ]]; then
     # Without an ACME challenge there is no reason to claim port 80.
-    echo "Port 80 is only used by the ACME challenge; switching the HTTP port back to ${defaults[http_port]}."
+    echo "Port 80 is only used by the ACME challenge; leaving the HTTP side unpublished."
     config[http_port]="${defaults[http_port]}"
   fi
   # Both ports become docker port mappings on the same address, so they must
@@ -3036,7 +3039,11 @@ function show_server_config {
   server_config=$server_config$'\n'"Domain SNI: ${config[domain]}"
   server_config=$server_config$'\n'"Camouflage Site: ${config[camouflage]}"
   server_config=$server_config$'\n'"Port: ${config[port]}"
-  server_config=$server_config$'\n'"HTTP Port (website): ${config[http_port]}"
+  if [[ ${config[http_port]} == 'OFF' ]]; then
+    server_config=$server_config$'\n'"HTTP Port (website): OFF (unpublished)"
+  else
+    server_config=$server_config$'\n'"HTTP Port (website): ${config[http_port]}"
+  fi
   server_config=$server_config$'\n'"Transport: ${config[transport]}"
   server_config=$server_config$'\n'"Security: ${config[security]}"
   server_config=$server_config$'\n'"Safenet: ${config[safenet]}"

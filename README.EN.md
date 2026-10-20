@@ -13,7 +13,8 @@ It is a hardened fork of [reality-ezpz](https://github.com/aleskxyz/reality-ezpz
 with three design rules on top of the upstream feature set:
 
 1. **One port, `443`, carries both the proxy and the website.** The default setup
-   binds `443` and `8080`. On `443` haproxy only reads the SNI of the TLS
+   binds `443` alone (the plain-HTTP entry point is off unless `--http-port`
+   asks for one). On `443` haproxy only reads the SNI of the TLS
    ClientHello and forwards the stream untouched: connections carrying the
    camouflage SNI go to the engine (REALITY has to inspect the handshake itself,
    so TLS is not terminated there), everything else lands on nginx and your own
@@ -44,7 +45,8 @@ with three design rules on top of the upstream feature set:
 * Optional "safe internet" mode (blocks ads/malware, optionally adult content)
 * Conversational text menu and Telegram bot for user management
 * nginx serves your own site from `./website` on `https://<ip>` (sharing `443`
-  with the proxy) and on the plain-HTTP `--http-port`; in `reality`/`shadowtls`
+  with the proxy); the plain-HTTP `--http-port` entry point is off unless you ask
+  for one; in `reality`/`shadowtls`
   the fallback target stays a remote site, never your own
 * Password-protected backup / restore of users and configuration
 * Kernel tunables, IPv6 support, `tcp`/`http`/`grpc`/`ws` multiplexing behind haproxy
@@ -90,9 +92,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
   --camouflage www.microsoft.com
 
-# pick your own ports, no website at all
+# pick your own proxy port (the website stays on the shared 443)
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
-  --port 2087 --http-port off
+  --port 2087
+
+# publish the plain-HTTP website entry point when you need one
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --http-port 8080
 
 # letsencrypt certificate (this mode is the only one that binds port 80)
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
@@ -109,23 +115,24 @@ bash /opt/reality/reality.sh --menu
 | Listener | Default host port | Controlled by | Notes |
 | --- | --- | --- | --- |
 | Proxy + website (HTTPS) | `443/tcp` (and `/udp` for tuic/hysteria2) | `--port` | Two jobs on one port, split by SNI in haproxy; `80` is refused |
-| Website (plain HTTP) | `8080/tcp` | `--http-port` | Served by nginx out of `./website`; `off` leaves this entry point unpublished (the `443` site stays up) |
+| Website (plain HTTP) | off (unpublished) | `--http-port` | Served by nginx out of `./website`; listens only when a port is given (the `443` site stays up either way) |
 | ACME challenge | `80/tcp` | forced | **Only** in `--security=letsencrypt` mode |
 
 Behaviour worth knowing:
 
-* A default installation publishes `443/tcp` and `8080/tcp` and nothing else.
+* A default installation publishes `443/tcp` and nothing else.
   On `443` haproxy makes a single SNI decision: the camouflage SNI is passed to
   the engine byte for byte, everything else (a browser opening `https://<ip>`,
   any other host name) goes to nginx. In the default (`reality`) mode that site
   uses a self-signed certificate, so the first visit warns about it — expected.
 * The proxy port and the website port must differ: `--port 443 --http-port 443`
   is refused.
-* `--http-port off` only removes the plain-HTTP listener; `https://<ip>` keeps
-  working because it shares `443` with the proxy, so the nginx container stays.
+* `--http-port off` leaves the plain-HTTP listener off (it is the default);
+  `https://<ip>` keeps working because it shares `443` with the proxy, so the
+  nginx container stays.
 * Selecting `--security letsencrypt` switches the HTTP port to `80` and says so,
   because the ACME HTTP-01 challenge has no other port. Switching back to
-  `reality`/`selfsigned` resets it to `8080` automatically.
+  `reality`/`selfsigned` returns to the default, i.e. unpublished.
 * `selfsigned` + `tcp` uses the same SNI split as `reality` (the engine owns TLS,
   the website uses the self-signed certificate). With the `http`/`grpc`/`ws`
   transports haproxy terminates TLS itself and routes by path, so the website is
@@ -133,7 +140,8 @@ Behaviour worth knowing:
   still gets a browser warning).
 * `letsencrypt` + `tcp` is the one exception: a browser and a proxy client send
   the very same SNI, so nothing can tell them apart — `443` stays with the proxy
-  and the website is only reachable on `--http-port`.
+  and the website is only reachable on `--http-port` (unpublished by default;
+  pass a port to enable it).
 * Upgrading from an older release migrates a stored `port=8443` (the old factory
   default) to `443` and says so; any other custom port is left alone.
 
@@ -146,10 +154,10 @@ Two different jobs, deliberately kept apart:
 | | What it is | Where it lives |
 | --- | --- | --- |
 | **Camouflage** | What an unauthenticated probe sees on the proxy port. In `reality` the engine forwards the TLS handshake to a real remote site instead of answering it itself; in `shadowtls` the handshake server is that site. | `--camouflage <domain[:port]>`, a real remote site, set automatically at deployment |
-| **Website** | A normal site of your own, served by nginx from `./website`, reachable as `https://<ip>` (sharing the proxy's `443`) and over plain HTTP on `--http-port`. | drop files into `./website`; ports via `--port` / `--http-port` |
+| **Website** | A normal site of your own, served by nginx from `./website`, reachable as `https://<ip>` (sharing the proxy's `443`); the plain-HTTP `--http-port` entry needs an explicit port. | drop files into `./website`; ports via `--port` / `--http-port` |
 
 ```bash
-# camouflage = www.microsoft.com, proxy and site share 443, plain HTTP on 8080
+# camouflage = www.microsoft.com, proxy and site share 443 (plain HTTP off)
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
   --camouflage www.microsoft.com
 
@@ -285,7 +293,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `--camouflage <domain[:port]>` | Remote site unauthenticated probes are relayed to, in the `reality`/`shadowtls` modes (default `www.fastly.com`; port defaults to `443`) |
 | `--server <server>` | Public IP or domain of this machine; a domain is required for `letsencrypt` |
 | `--port <port>` | Proxy port, also used by the website over HTTPS (default `443`) |
-| `--http-port <port\|off>` | Host port of the plain-HTTP website served by nginx (default `8080`, `off` = that entry point unpublished) |
+| `--http-port <port\|off>` | Host port of the plain-HTTP website served by nginx (default `off` = unpublished; pass a port to publish it) |
 | `-c, --core <xray\|sing-box>` | Engine (default `sing-box`) |
 | `--security <reality\|letsencrypt\|selfsigned>` | TLS mode (default `reality`) |
 | `--enable-safenet <true\|false>` | Block ads/malware, plus adult content on sing-box |
@@ -485,7 +493,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 
 Re-running the installer keeps the existing configuration; missing keys (for
 example `http_port` or the new `camouflage`) are added automatically, and the
-script copy inside the configuration directory is refreshed too.
+script copy inside the configuration directory is refreshed too. Note that the
+`http_port` factory value is now "unpublished": an old config that never wrote
+the key gets `off`, while an instance that named a port keeps it — an upgrade
+never closes an entry point behind your back.
 
 ## Uninstall
 
