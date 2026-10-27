@@ -58,10 +58,10 @@ MENU="Select an option:"
 #             urllib3 that cannot even be imported on Python 3.12+.
 image[xray]="ghcr.io/xtls/xray-core:26.10.21"
 image[sing-box]="ghcr.io/sagernet/sing-box:v1.14.4"
-image[nginx]="nginx:1.30.5"
+image[nginx]="nginx:1.30.6"
 image[certbot]="certbot/certbot:v5.8.0"
-image[haproxy]="haproxy:3.4.4"
-image[python]="python:3.14-alpine"
+image[haproxy]="haproxy:3.4.7"
+image[python]="python:3.15.2-alpine"
 
 # Upstream project coordinates. The bot script and the update helper are pulled
 # from this repository instead of a third-party fork.
@@ -1869,6 +1869,10 @@ EOF
 }
 
 function generate_tgbot_dockerfile {
+  local previous=''
+  if [[ -r ${path[tgbot_dockerfile]} ]]; then
+    previous=$(cat "${path[tgbot_dockerfile]}")
+  fi
   cat >"${path[tgbot_dockerfile]}" << EOF
 FROM ${image[python]}
 WORKDIR ${config_path}/tgbot
@@ -1876,6 +1880,12 @@ RUN apk add --no-cache docker-cli-compose curl bash libqrencode-tools sudo opens
 RUN pip install --no-cache-dir python-telegram-bot==22.8 "qrcode[pil]==8.2"
 CMD [ "python", "./tgbot.py" ]
 EOF
+  # A new base image (or package line) only lands after a rebuild. Without
+  # this flag a plain rerun keeps the old image, and the bot silently stays
+  # on the previous Python even though the pin moved on.
+  if [[ ${previous} != "$(cat "${path[tgbot_dockerfile]}")" ]]; then
+    tgbot_dockerfile_changed=true
+  fi
 }
 
 function download_tgbot_script {
@@ -3758,6 +3768,7 @@ function restart_docker_compose {
 function restart_tgbot_compose {
   ${docker_cmd} --project-directory "${config_path}/tgbot" -p ${tgbot_project} down --remove-orphans --timeout 2 || true
   ${docker_cmd} --project-directory "${config_path}/tgbot" -p ${tgbot_project} up --build -d --remove-orphans
+  tgbot_dockerfile_changed=false
 }
 
 function restart_container {
@@ -4415,7 +4426,7 @@ function latest_image_tag {
     nginx:*)                     pattern='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
     certbot/certbot:*)           pattern='^v[0-9]+\.[0-9]+\.[0-9]+$' ;;
     haproxy:*)                   pattern='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
-    python:*)                    pattern='^[0-9]+\.[0-9]+-alpine$' ;;
+    python:*)                    pattern='^[0-9]+\.[0-9]+\.[0-9]+-alpine$' ;;
     *)                           return 1 ;;
   esac
   # nginx.org names the stable branch on its download page. The Docker Hub tag
@@ -4748,8 +4759,12 @@ fi
 if [[ -z "$(${docker_cmd} ls | grep "${path[compose]}" | grep running || true)" ]]; then
   restart_docker_compose
 fi
-if [[ -z "$(${docker_cmd} ls | grep "${path[tgbot_compose]}" | grep running || true)" && ${config[tgbot]} == 'ON' ]]; then
-  restart_tgbot_compose
+if [[ ${config[tgbot]} == 'ON' ]]; then
+  if [[ ${tgbot_dockerfile_changed:-false} == true ]]; then
+    restart_tgbot_compose
+  elif [[ -z "$(${docker_cmd} ls | grep "${path[tgbot_compose]}" | grep running || true)" ]]; then
+    restart_tgbot_compose
+  fi
 fi
 if [[ ${args[server-config]} == true ]]; then
   show_server_config
