@@ -45,8 +45,8 @@ MENU="Select an option:"
 # floating tag, so two servers installed on different days run the same code.
 # How to re-check (all of these need no credentials):
 #   xray      https://api.github.com/repos/XTLS/Xray-core/releases/latest
-#             Everything from v26.4 on is flagged "prerelease" upstream, so the
-#             latest *stable* release is still v26.3.27 while newer tags exist.
+#             (the 26.9.x tags are flagged "prerelease" upstream; 26.10.21 is
+#             the current stable tag, shipped as an emergency CA-trust update)
 #   sing-box  https://api.github.com/repos/SagerNet/sing-box/releases/latest
 #   nginx     https://nginx.org/en/download.html          (the "Stable version"
 #             line; the odd-numbered minor branch is mainline)
@@ -56,8 +56,8 @@ MENU="Select an option:"
 #             The bot image is on the newest Python because tgbot.py targets
 #             python-telegram-bot 22.x (asyncio). 13.x vendors a six-based
 #             urllib3 that cannot even be imported on Python 3.12+.
-image[xray]="ghcr.io/xtls/xray-core:26.3.27"
-image[sing-box]="ghcr.io/sagernet/sing-box:v1.14.1"
+image[xray]="ghcr.io/xtls/xray-core:26.10.21"
+image[sing-box]="ghcr.io/sagernet/sing-box:v1.14.4"
 image[nginx]="nginx:1.30.5"
 image[certbot]="certbot/certbot:v5.8.0"
 image[haproxy]="haproxy:3.4.4"
@@ -132,6 +132,9 @@ defaults[warp_client_id]=""
 defaults[warp_interface_ipv4]=""
 defaults[warp_interface_ipv6]=""
 defaults[core]=sing-box
+# Optional tag override for the selected core (--core-version). Empty means
+# the tested pin from the image[] block above is used.
+defaults[core_version]=""
 defaults[security]=reality
 defaults[server]=$(curl -fsSL --ipv4 -m 5 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -m1 '^ip=' | cut -d '=' -f2 || true)
 defaults[tgbot]=OFF
@@ -157,6 +160,7 @@ defaults[dns_credentials]=""
 
 config_items=(
   "core"
+  "core_version"
   "security"
   "service_path"
   "public_key"
@@ -253,6 +257,7 @@ function show_help {
   echo "      --enable-warp <true|false> Enable or disable Cloudflare warp"
   echo "      --warp-license <warp-license> Add Cloudflare warp+ license"
   echo "  -c  --core <sing-box|xray> Select core (xray, sing-box, default: ${defaults[core]})"
+  echo "      --core-version <tag> Use this image tag for the selected core instead of the tested pin ('pinned' clears the override)"
   echo "      --security <reality|letsencrypt|selfsigned> Select type of TLS encryption (reality, letsencrypt, selfsigned, default: ${defaults[security]})" 
   echo "  -m  --menu                Open the management menu"
   echo "      --enable-tgbot <true|false> Enable Telegram bot for user management"
@@ -283,7 +288,7 @@ function show_help {
 
 function parse_args {
   local opts
-  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,harden-docker:,ss-port:,format:,dns-provider:,dns-credentials:,hysteria2-up:,hysteria2-down:,tuic-congestion:,open-firewall,check-update,doctor,help -- "$@")
+  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,core-version:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,harden-docker:,ss-port:,format:,dns-provider:,dns-credentials:,hysteria2-up:,hysteria2-down:,tuic-congestion:,open-firewall,check-update,doctor,help -- "$@")
   if [[ $? -ne 0 ]]; then
     return 1
   fi
@@ -438,6 +443,16 @@ function parse_args {
             return 1
             ;;
         esac
+        ;;
+      --core-version)
+        args[core_version]="$2"
+        # A Docker tag: no spaces, no shell metacharacters, no second colon.
+        if [[ ! ${args[core_version],,} =~ ^(pinned|default|none)$ && \
+              ! ${args[core_version]} =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+          echo "Invalid core version: ${args[core_version]}"
+          return 1
+        fi
+        shift 2
         ;;
       --security)
         args[security]="$2"
@@ -837,6 +852,16 @@ function build_config {
   local free_80=true
   if [[ ${args[regenerate]} == true ]]; then
     generate_keys
+  fi
+  # "pinned"/"default"/"none" drops the override again.
+  if [[ ${args[core_version],,} =~ ^(pinned|default|none)$ ]]; then
+    args[core_version]=""
+    config_file[core_version]=""
+  fi
+  # A tag belongs to one engine: switching cores without naming a version drops
+  # the inherited one, otherwise an xray tag would be applied to sing-box.
+  if [[ -n ${args[core]} && ${args[core]} != ${config_file[core]} && -z ${args[core_version]} ]]; then
+    config_file[core_version]=""
   fi
   for item in "${config_items[@]}"; do
     if [[ -n ${args["${item}"]} ]]; then
@@ -1339,6 +1364,12 @@ function generate_docker_compose {
   # xray image defaults to "-confdir /usr/local/etc/xray/", which would ignore
   # the mounted configuration).
   local engine_command
+  # --core-version moves the engine to another upstream tag without touching
+  # the pins; an empty value keeps the tested one.
+  local engine_image="${image[${config[core]}]}"
+  if [[ -n ${config[core_version]} ]]; then
+    engine_image="${engine_image%:*}:${config[core_version]}"
+  fi
   # Fragments that differ between the passthrough modes (reality / shadowtls)
   # and the terminating ones (letsencrypt / selfsigned). Built here, with plain
   # if statements, so the heredoc below stays readable.
@@ -1449,7 +1480,7 @@ networks:
       - subnet: fc11::1:0/112
 services:
   engine:
-    image: ${image[${config[core]}]}
+    image: ${engine_image}
     command: ${engine_command}
 ${engine_ports}
     expose:
@@ -3194,6 +3225,10 @@ function config_core_menu {
       message_box 'Invalid Configuration' 'You cannot use "xray" core with "shadowtls" transport. Change core to "sing-box" or use other transports'
       continue
     fi
+    if [[ ${core} != ${config[core]} ]]; then
+      # a pinned tag belongs to the engine it was chosen for
+      config[core_version]=""
+    fi
     config[core]=$core
     update_config_file
     break
@@ -4425,6 +4460,9 @@ function check_update {
       printf '  ?    %-42s registry not reachable\n' "${ref}"
     fi
   done
+  if [[ -n ${config[core_version]} ]]; then
+    echo "  i    ${config[core]} uses the --core-version override ${config[core_version]} from the config, not the pin above."
+  fi
   if [[ ${outdated} -eq 0 ]]; then
     echo 'All pinned images are current.'
   else
