@@ -4418,7 +4418,48 @@ function latest_image_tag {
     python:*)                    pattern='^[0-9]+\.[0-9]+-alpine$' ;;
     *)                           return 1 ;;
   esac
+  # nginx.org names the stable branch on its download page. The Docker Hub tag
+  # API is paginated (1381 nginx tags) and its first page holds a single bare
+  # version (the mainline one), so sorting a page either reported mainline or
+  # came back empty. Ask the project page instead.
+  if [[ ${ref} == nginx:* ]]; then
+    local page stable
+    page=$(curl -fsSL -m 20 https://nginx.org/en/download.html) || return 1
+    stable=$(printf '%s' "${page}" \
+      | sed 's/</\n</g' \
+      | awk '/Stable version/{found=1;next} found' \
+      | grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' \
+      | head -n 1) || true
+    stable="${stable#nginx-}"
+    stable="${stable%.tar.gz}"
+    [[ -n ${stable} ]] || return 1
+    echo "${stable}"
+    return 0
+  fi
   if [[ ${repo} == ghcr.io/* ]]; then
+    # The GHCR tag list is paginated and comes back in lexicographic order, so
+    # sorting one page reports a long-dead tag (a real run claimed xray
+    # "1.8.23"). GitHub's latest-release endpoint is the authoritative stable
+    # tag, so ask it for the two engines and keep the pin's "v" shape.
+    local gh_repo=''
+    case "${repo}" in
+      ghcr.io/xtls/xray-core)    gh_repo='XTLS/Xray-core' ;;
+      ghcr.io/sagernet/sing-box) gh_repo='SagerNet/sing-box' ;;
+    esac
+    if [[ -n ${gh_repo} ]]; then
+      local gh_tag
+      gh_tag=$(curl -fsSL -m 20 -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/${gh_repo}/releases/latest" \
+        | jq -r '.tag_name // empty' 2>/dev/null) || return 1
+      gh_tag="${gh_tag#v}"
+      [[ -n ${gh_tag} ]] || return 1
+      if [[ ${ref##*:} == v* ]]; then
+        echo "v${gh_tag}"
+      else
+        echo "${gh_tag}"
+      fi
+      return 0
+    fi
     local ghcr_repo="${repo#ghcr.io/}"
     local token
     token=$(curl -fsSL -m 15 "https://ghcr.io/token?scope=repository:${ghcr_repo}:pull&service=ghcr.io" | jq -r '.token // empty' 2>/dev/null) || return 1
@@ -4436,7 +4477,10 @@ function latest_image_tag {
   if [[ -z ${tags} ]]; then
     return 1
   fi
-  printf '%s\n' "${tags}" | grep -E "${pattern}" | sort -V | tail -n 1
+  local filtered
+  filtered=$(printf '%s\n' "${tags}" | grep -E "${pattern}")
+  [[ -n ${filtered} ]] || return 1
+  printf '%s\n' "${filtered}" | sort -V | tail -n 1
 }
 
 function check_update {
