@@ -1,0 +1,4799 @@
+#!/bin/bash
+
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+# 
+#   http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+set -e
+declare -A defaults
+declare -A config_file
+declare -A args
+declare -A config
+declare -A users
+declare -A path
+declare -A service
+declare -A md5
+declare -A regex
+declare -A image
+
+config_path="/opt/reality"
+compose_project='reality'
+tgbot_project='tgbot'
+BACKTITLE=Reality
+MENU="Select an option:"
+
+# Every image below comes from the project's own registry or from the official
+# Docker Hub library. No third-party re-published images are used anymore.
+#   xray-core  -> GHCR, published by XTLS (ghcr.io/xtls/xray-core)
+#   sing-box   -> GHCR, published by SagerNet (ghcr.io/sagernet/sing-box)
+#   nginx/certbot/haproxy/python -> official Docker Hub images/library
+#
+# Every tag is pinned to the newest *stable* release of its project, never to a
+# floating tag, so two servers installed on different days run the same code.
+# How to re-check (all of these need no credentials):
+#   xray      https://api.github.com/repos/XTLS/Xray-core/releases/latest
+#             (26.10.31 is the current stable tag per GitHub latest release)
+#   sing-box  https://api.github.com/repos/SagerNet/sing-box/releases/latest
+#   nginx     https://nginx.org/en/download.html          (the "Stable version"
+#             line; the odd-numbered minor branch is mainline)
+#   haproxy   https://hub.docker.com/v2/repositories/library/haproxy/tags
+#   certbot   https://hub.docker.com/v2/repositories/certbot/certbot/tags
+#   python    https://hub.docker.com/v2/repositories/library/python/tags
+#             The bot image is on the newest Python because tgbot.py targets
+#             python-telegram-bot 22.x (asyncio). 13.x vendors a six-based
+#             urllib3 that cannot even be imported on Python 3.12+.
+image[xray]="ghcr.io/xtls/xray-core:26.10.31"
+image[sing-box]="ghcr.io/sagernet/sing-box:v1.14.4"
+image[nginx]="nginx:1.30.6"
+image[certbot]="certbot/certbot:v5.9.0"
+image[haproxy]="haproxy:3.4.7"
+image[python]="python:3.15.2-alpine"
+
+# Upstream project coordinates. The bot script and the update helper are pulled
+# from this repository instead of a third-party fork.
+repo_owner='dakerclaw'
+repo_name='reality'
+repo_branch='main'
+
+# The --backup option hands the encrypted archive to a public paste service.
+# It is the only non-project network dependency left; point it elsewhere (or to
+# your own endpoint) with BACKUP_UPLOAD_URL=<url> in the environment.
+backup_upload_url="${BACKUP_UPLOAD_URL:-https://temp.sh/upload}"
+
+# DNS/private destinations the tunnel must never reach. These ranges are
+# inlined instead of downloading a third-party "geoip-private" rule set.
+private_ip_cidr='["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.0.0.0/24","192.0.2.0/24","192.168.0.0/16","198.18.0.0/15","198.51.100.0/24","203.0.113.0/24","224.0.0.0/4","240.0.0.0/4","::1/128","fc00::/7","fe80::/10"]'
+
+# One rule data file (the "bypass" list) has no upstream counterpart, so it is
+# still fetched from a community repository. Override it to self-host:
+#   RULESET_BASE_URL=https://example.com/rules ./reality.sh
+ruleset_base_url="${RULESET_BASE_URL:-https://raw.githubusercontent.com/aleskxyz/sing-box-rules/refs/heads/rule-set}"
+
+defaults[transport]=tcp
+# The SNI the client sends and the server accepts. In the reality and shadowtls
+# modes it must be a real, reachable site - see defaults[camouflage] below.
+defaults[domain]=www.fastly.com
+# The remote site the camouflage falls back to: probes that do not authenticate
+# are relayed to it (Reality dest / shadowtls handshake target), so it is what an
+# active probe sees on the proxy port. Supplied at deployment time, optional
+# ":port" suffix, port 443 by default. It is kept in sync with the SNI because
+# the certificate this site returns has to match the SNI the probe sent.
+#
+# REALITY's documented minimum for a target site is TLS 1.3 + H2, so qualify a
+# candidate before relying on it (both should answer, the second with h2):
+#   openssl s_client -connect <host>:443 -servername <host> -tls1_3 </dev/null | grep Protocol
+#   openssl s_client -connect <host>:443 -servername <host> -alpn h2 </dev/null | grep ALPN
+# The shipped default meets both: TLS 1.3 with X25519, ALPN h2, a leaf whose CN
+# is the SNI itself, and a chain that roots in Certainly Root R1, which Mozilla,
+# Chrome, Apple and Oracle all carry.
+defaults[camouflage]=www.fastly.com
+# 443 is the default: the proxy and the local website share that one port.
+# haproxy peeks at the SNI of the incoming ClientHello and forwards it without
+# touching it, so the proxy handshake still reaches the engine byte for byte:
+# connections whose SNI is the proxy SNI go to the engine, everything else - a
+# browser opening https://<ip>, or any other host name - ends up in nginx,
+# which terminates TLS and serves ./website. See generate_haproxy_config.
+# Port 80 stays free: it is only bound by the letsencrypt mode.
+defaults[port]=443
+# Host port of the plain-HTTP side. It serves the local website out of
+# ./website (nginx), and in the letsencrypt mode it also carries the ACME
+# HTTP-01 challenge. It stays unpublished ("OFF") unless a port is asked for:
+# the website is already reachable over TLS on the shared 443, and a plain-HTTP
+# listener is one more open port to explain away. Pass --http-port <port> to
+# publish it. "OFF" keeps it unpublished entirely.
+defaults[http_port]=OFF
+defaults[safenet]=OFF
+# BBR is a kernel feature, so "enabling" it means loading tcp_bbr/sch_fq and
+# writing two sysctls - nothing is installed from a package repository. It is
+# switched on by default and falls back to leaving the kernel as it is when the
+# running kernel does not offer bbr (older than 4.9, or a container that cannot
+# load its host's modules).
+defaults[bbr]=ON
+defaults[warp]=OFF
+defaults[warp_license]=""
+defaults[warp_private_key]=""
+defaults[warp_token]=""
+defaults[warp_id]=""
+defaults[warp_client_id]=""
+defaults[warp_interface_ipv4]=""
+defaults[warp_interface_ipv6]=""
+defaults[core]=sing-box
+# Optional tag override for the selected core (--core-version). Empty means
+# the tested pin from the image[] block above is used.
+defaults[core_version]=""
+defaults[security]=reality
+defaults[server]=$(curl -fsSL --ipv4 -m 5 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -m1 '^ip=' | cut -d '=' -f2 || true)
+defaults[tgbot]=OFF
+defaults[tgbot_token]=""
+defaults[tgbot_admins]=""
+# QUIC transport tuning. hysteria2 ignores the rates while "ignore_client_bandwidth"
+# is true (the client reports its own); giving both switches the server to Brutal
+# shaping at the given rates. tuic v5 picks its congestion controller here.
+defaults[hysteria2_up]=""
+defaults[hysteria2_down]=""
+defaults[tuic_congestion]="bbr"
+# Opt-in: put the Docker socket behind a narrow proxy for the Telegram bot.
+defaults[harden_docker]="OFF"
+# Opt-in Shadowsocks 2022 inbound. It is plain TCP with no TLS to share with the
+# website, so it gets a dedicated port; an empty value leaves it off.
+defaults[ss_port]=""
+defaults[ss_key]=""
+# Opt-in DNS-01 challenge. When a provider is set, certbot uses it instead of
+# the HTTP-01 challenge, so no inbound port is needed and a wildcard can be
+# issued. "dns_credentials" is the host path of the provider credentials file.
+defaults[dns_provider]=""
+defaults[dns_credentials]=""
+
+config_items=(
+  "core"
+  "core_version"
+  "security"
+  "service_path"
+  "public_key"
+  "private_key"
+  "short_id"
+  "transport"
+  "domain"
+  "camouflage"
+  "server"
+  "port"
+  "http_port"
+  "hysteria2_up"
+  "hysteria2_down"
+  "tuic_congestion"
+  "safenet"
+  "bbr"
+  "warp"
+  "warp_license"
+  "warp_private_key"
+  "warp_token"
+  "warp_id"
+  "warp_client_id"
+  "warp_interface_ipv4"
+  "warp_interface_ipv6"
+  "tgbot"
+  "tgbot_token"
+  "tgbot_admins"
+  "harden_docker"
+  "ss_port"
+  "ss_key"
+  "dns_provider"
+  "dns_credentials"
+)
+
+# Fast membership lookup for config_items, used when rewriting the config file.
+declare -A config_item_lookup
+for _config_item in "${config_items[@]}"; do
+  config_item_lookup["${_config_item}"]=1
+done
+unset _config_item
+
+# When RELOAD_DEFERRED is 1, configuration writes only mark the config as dirty
+# and the expensive regeneration/restart is postponed to a single flush_reload.
+RELOAD_DEFERRED=0
+RELOAD_PENDING=0
+
+regex[domain]="^[a-zA-Z0-9]+([-.][a-zA-Z0-9]+)*\.[a-zA-Z]{2,}$"
+regex[port]="^[1-9][0-9]*$"
+regex[warp_license]="^[a-zA-Z0-9]{8}-[a-zA-Z0-9]{8}-[a-zA-Z0-9]{8}$"
+regex[username]="^[a-zA-Z0-9]+$"
+regex[ip]="^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$"
+regex[tgbot_token]="^[0-9]{8,10}:[a-zA-Z0-9_-]{35}$"
+# Each admin is either a Telegram username (5-32 chars, letter first) or the
+# numeric id of the account. Telegram usernames can not start with a digit, so
+# an all-digit entry is unambiguously an id.
+regex[tgbot_admins]="^([a-zA-Z][a-zA-Z0-9_]{4,31}|[0-9]{4,15})(,([a-zA-Z][a-zA-Z0-9_]{4,31}|[0-9]{4,15}))*$"
+regex[domain_port]="^[a-zA-Z0-9]+([-.][a-zA-Z0-9]+)*\.[a-zA-Z]{2,}(:[1-9][0-9]*)?$"
+regex[file_path]="^[a-zA-Z0-9_/.-]+$"
+regex[url]="^(http|https)://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[0-9]{1,3}(\.[0-9]{1,3}){3})(:[0-9]{1,5})?(/.*)?$"
+# Large CDNs answer probes with their own edge stack and sometimes rate-limit
+# them, which makes them a weaker camouflage than a site you control.
+regex[cdn_camouflage]="(^|\.)(cloudflare|fastly|akamai|akamaiedge|cloudfront|amazonaws|googleapis|googleusercontent|gstatic|microsoft|azureedge|jsdelivr|unpkg|bing)\."
+
+function show_help {
+  echo ""
+  echo "Usage: reality.sh [-t|--transport=tcp|http|grpc|ws|tuic|hysteria2|shadowtls|anytls] [-d|--domain=<domain>] [--camouflage=<domain[:port]>] [--server=<server>]
+  [--regenerate] [--default] [-r|--restart] [--enable-safenet=true|false] [--enable-bbr=true|false] [--port=<port>] [--http-port=<port|off>] [-c|--core=xray|sing-box]
+  [--enable-warp=true|false] [--warp-license=<license>] [--security=reality|letsencrypt|selfsigned] [-m|--menu] [--show-server-config]
+  [--add-user=<username>] [--lists-users] [--show-user=<username>] [--delete-user=<username>] [--backup] [--restore=<url|file>]
+  [--backup-password=<password>] [-u|--uninstall]"
+  echo ""
+  echo "  -t, --transport <tcp|http|grpc|ws|tuic|hysteria2|shadowtls|anytls> Transport protocol (default: ${defaults[transport]})"
+  echo "                            anytls needs the sing-box core and a real or self-signed certificate (not reality)"
+  echo "  -d, --domain <domain>     Domain to use as SNI (default: ${defaults[domain]})"
+  echo "      --camouflage <domain[:port]|self> Remote site the camouflage falls back to in the reality and shadowtls modes."
+  echo "                            Unauthenticated probes are relayed to it, so it must be a real site whose certificate"
+  echo "                            matches the SNI; the SNI follows it unless --domain is given explicitly (default: ${defaults[camouflage]})"
+  echo "                            \"self\" relays to the local website, which then gets a real certificate for the SNI domain"
+  echo "                            (needs --server <domain> and the ACME HTTP-01 challenge on port 80)"
+  echo "      --server <server>     IP address or domain name of server (Must be a valid domain if using letsencrypt security)"
+  echo "      --regenerate          Regenerate public and private keys"
+  echo "      --default             Restore default configuration"
+  echo "  -r  --restart             Restart services"
+  echo "  -u, --uninstall           Uninstall reality"
+  echo "                            Removes the stack and /opt/reality, plus an installation left by an older"
+  echo "                            release under /opt/reality-ezpz and the kernel tuning drop-in. Docker is kept."
+  echo "      --enable-safenet <true|false> Enable or disable safenet (blocking malware and adult content)"
+  echo "      --enable-bbr <true|false> Enable or disable the BBR congestion control (default: ${defaults[bbr]})"
+  echo "                            BBR is a kernel feature: this loads tcp_bbr/sch_fq and writes the matching sysctls,"
+  echo "                            and is skipped with a warning on kernels that do not offer it (needs 4.9+)"
+  echo "      --port <port>         Server port, shared by the proxy and the website (default: ${defaults[port]}; 80 is reserved for letsencrypt)"
+  echo "      --http-port <port|off> Host port of the local website served by nginx out of ./website, and the ACME challenge"
+  echo "                            in the letsencrypt mode (default: ${defaults[http_port]} - unpublished; give a port to publish it)"
+  echo "      --enable-warp <true|false> Enable or disable Cloudflare warp"
+  echo "      --warp-license <warp-license> Add Cloudflare warp+ license"
+  echo "  -c  --core <sing-box|xray> Select core (xray, sing-box, default: ${defaults[core]})"
+  echo "      --core-version <tag> Use this image tag for the selected core instead of the tested pin ('pinned' clears the override)"
+  echo "      --security <reality|letsencrypt|selfsigned> Select type of TLS encryption (reality, letsencrypt, selfsigned, default: ${defaults[security]})" 
+  echo "  -m  --menu                Open the management menu"
+  echo "      --enable-tgbot <true|false> Enable Telegram bot for user management"
+  echo "      --tgbot-token <token> Token of Telegram bot"
+  echo "      --tgbot-admins <usernames|ids> Telegram bot admins: usernames without the leading '@' or numeric user ids (comma separated)"
+  echo "      --harden-docker <true|false> Put the Docker socket behind a narrow proxy for the Telegram bot (default: ${defaults[harden_docker]})"
+  echo "      --show-server-config  Print server configuration"
+  echo "      --add-user <username> Add new user"
+  echo "      --list-users          List all users"
+  echo "      --show-user <username> Shows the config and QR code of the user"
+  echo "      --format <uri|clash|singbox|v2ray|json> Output format for --show-user (default: uri)"
+  echo "      --delete-user <username> Delete the user"
+  echo "      --backup              Backup users and configuration and upload it to ${backup_upload_url} (override with BACKUP_UPLOAD_URL)"
+  echo "      --restore <url|file>  Restore backup from URL or file"
+  echo "      --backup-password <password> Create/Restore password protected backup file"
+  echo "      --hysteria2-up <mbps>  Server-side uplink for the hysteria2 transport (Brutal); needs --hysteria2-down"
+  echo "      --hysteria2-down <mbps> Server-side downlink for the hysteria2 transport; the pair switches off client-reported bandwidth"
+  echo "      --ss-port <port|off>  Publish an additional Shadowsocks 2022 (aes-128-gcm) inbound on its own port (sing-box only, off by default)"
+  echo "      --dns-provider <cloudflare> Use a DNS-01 challenge instead of HTTP-01: no port 80 needed, wildcard included"
+  echo "      --dns-credentials <path>    Host path of the DNS provider credentials file (e.g. an ini with the Cloudflare API token)"
+  echo "      --tuic-congestion <cubic|new_reno|bbr> Congestion control of the tuic transport (default: bbr)"
+  echo "      --open-firewall       Open the proxy and website ports in the host firewall (ufw / firewalld); otherwise print them"
+  echo "      --check-update        Compare the pinned image tags with the newest upstream tags and exit"
+  echo "      --doctor              Run a health check of the running stack and exit"
+  echo "  -h, --help                Display this help message"
+  return 0
+}
+
+function parse_args {
+  local opts
+  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,core-version:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,harden-docker:,ss-port:,format:,dns-provider:,dns-credentials:,hysteria2-up:,hysteria2-down:,tuic-congestion:,open-firewall,check-update,doctor,help -- "$@")
+  if [[ $? -ne 0 ]]; then
+    return 1
+  fi
+  eval set -- "$opts"
+  while true; do
+    case $1 in
+      -t|--transport)
+        args[transport]="$2"
+        case ${args[transport]} in
+          tcp|http|grpc|ws|tuic|hysteria2|shadowtls|anytls)
+            shift 2
+            ;;
+          *)
+            echo "Invalid transport protocol: ${args[transport]}"
+            return 1
+            ;;
+        esac
+        ;;
+      -d|--domain)
+        args[domain]="$2"
+        if ! [[ ${args[domain]} =~ ${regex[domain_port]} ]]; then
+          echo "Invalid domain: ${args[domain]}"
+          return 1
+        fi
+        if [[ ${args[domain]} =~ : ]] && (( ${args[domain]#*:} > 65535 )); then
+          echo "Domain port out of range: ${args[domain]#*:}"
+          return 1
+        fi
+        shift 2
+        ;;
+      --camouflage)
+        args[camouflage]="$2"
+        if [[ ${args[camouflage]} != 'self' ]] && ! [[ ${args[camouflage]} =~ ${regex[domain_port]} ]]; then
+          echo "Invalid camouflage site: ${args[camouflage]} (a domain, domain:port, or \"self\")"
+          return 1
+        fi
+        if [[ ${args[camouflage]} != 'self' && ${args[camouflage]} =~ : ]] && (( ${args[camouflage]#*:} > 65535 )); then
+          echo "Camouflage port out of range: ${args[camouflage]#*:}"
+          return 1
+        fi
+        shift 2
+        ;;
+      --server)
+        args[server]="$2"
+        if ! [[ ${args[server]} =~ ${regex[domain]} || ${args[server]} =~ ${regex[ip]} ]]; then
+          echo "Invalid server: ${args[server]}"
+          return 1
+        fi
+        shift 2
+        ;;
+      --regenerate)
+        args[regenerate]=true
+        shift
+        ;;
+      --default)
+        args[default]=true
+        shift
+        ;;
+      -r|--restart)
+        args[restart]=true
+        shift
+        ;;
+      -u|--uninstall)
+        args[uninstall]=true
+        shift
+        ;;
+      --enable-safenet)
+        case "$2" in
+          true|false)
+            if [[ $2 == true ]]; then args[safenet]=ON; else args[safenet]=OFF; fi
+            shift 2
+            ;;
+          *)
+            echo "Invalid safenet option: $2"
+            return 1
+            ;;
+        esac
+        ;;
+      --enable-bbr)
+        case "$2" in
+          true|false)
+            if [[ $2 == true ]]; then args[bbr]=ON; else args[bbr]=OFF; fi
+            shift 2
+            ;;
+          *)
+            echo "Invalid bbr option: $2"
+            return 1
+            ;;
+        esac
+        ;;
+      --enable-warp)
+        case "$2" in
+          true|false)
+            if [[ $2 == true ]]; then args[warp]=ON; else args[warp]=OFF; fi
+            shift 2
+            ;;
+          *)
+            echo "Invalid warp option: $2"
+            return 1
+            ;;
+        esac
+        ;;
+      --port)
+        args[port]="$2"
+        if ! [[ ${args[port]} =~ ${regex[port]} ]]; then
+          echo "Invalid port number: ${args[port]}"
+          return 1
+        elif ((args[port] < 1 || args[port] > 65535)); then
+          echo "Port number out of range: ${args[port]}"
+          return 1
+        fi
+        if [[ ${args[port]} -eq 80 ]]; then
+          echo "Invalid port number: 80 is reserved for the letsencrypt ACME challenge. Use another port (default: ${defaults[port]})."
+          return 1
+        fi
+        shift 2
+        ;;
+      --http-port)
+        case "$2" in
+          [Oo][Ff][Ff]|off)
+            args[http_port]='OFF'
+            ;;
+          *)
+            args[http_port]="$2"
+            if ! [[ ${args[http_port]} =~ ${regex[port]} ]] || ((args[http_port] < 1 || args[http_port] > 65535)); then
+              echo "Invalid HTTP port number: ${args[http_port]} (use \"off\" to leave it unpublished)"
+              return 1
+            fi
+            if [[ ${args[http_port]} -eq 80 ]]; then
+              echo "Note: port 80 is only required for letsencrypt (ACME HTTP-01)."
+            fi
+            ;;
+        esac
+        shift 2
+        ;;
+      --warp-license)
+        args[warp_license]="$2"
+        if ! [[ ${args[warp_license]} =~ ${regex[warp_license]} ]]; then
+          echo "Invalid warp license: ${args[warp_license]}"
+          return 1
+        fi
+        shift 2
+        ;;
+      -c|--core)
+        args[core]="$2"
+        case ${args[core]} in
+          xray|sing-box)
+            shift 2
+            ;;
+          *)
+            echo "Invalid core: ${args[core]}"
+            return 1
+            ;;
+        esac
+        ;;
+      --core-version)
+        args[core_version]="$2"
+        # A Docker tag: no spaces, no shell metacharacters, no second colon.
+        if [[ ! ${args[core_version],,} =~ ^(pinned|default|none)$ && \
+              ! ${args[core_version]} =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+          echo "Invalid core version: ${args[core_version]}"
+          return 1
+        fi
+        shift 2
+        ;;
+      --security)
+        args[security]="$2"
+        case ${args[security]} in
+          reality|letsencrypt|selfsigned)
+            shift 2
+            ;;
+          *)
+            echo "Invalid TLS security option: ${args[security]}"
+            return 1
+            ;;
+        esac
+        ;;
+      -m|--menu)
+        args[menu]=true
+        shift
+        ;;
+      --enable-tgbot)
+        case "$2" in
+          true|false)
+            if [[ $2 == true ]]; then args[tgbot]=ON; else args[tgbot]=OFF; fi
+            shift 2
+            ;;
+          *)
+            echo "Invalid enable-tgbot option: $2"
+            return 1
+            ;;
+        esac
+        ;;
+      --tgbot-token)
+        args[tgbot_token]="$2"
+        if [[ ! ${args[tgbot_token]} =~ ${regex[tgbot_token]} ]]; then
+          echo "Invalid Telegram Bot Token: ${args[tgbot_token]}"
+          return 1
+        fi 
+        if ! curl -sSfL -m 3 "https://api.telegram.org/bot${args[tgbot_token]}/getMe" >/dev/null 2>&1; then
+          echo "Invalid Telegram Bot Token: Telegram Bot Token is incorrect. Check it again."
+          return 1
+        fi
+        shift 2
+        ;;
+      --tgbot-admins)
+        args[tgbot_admins]="$2"
+        if [[ ! ${args[tgbot_admins]} =~ ${regex[tgbot_admins]} || ${args[tgbot_admins]} =~ .+_$ || ${args[tgbot_admins]} =~ .+_,.+ ]]; then
+          echo -e "Invalid Telegram Bot Admins: ${args[tgbot_admins]}\nEvery admin must be a Telegram username without the leading '@' character or a numeric user id, separated by ',' with no extra space."
+          return 1
+        fi
+        shift 2
+        ;;
+      --show-server-config)
+        args[server-config]=true
+        shift
+        ;;
+      --add-user)
+        args[add_user]="$2"
+        if ! [[ ${args[add_user]} =~ ${regex[username]} ]]; then
+          echo -e "Invalid username: ${args[add_user]}\nUsername can only contains A-Z, a-z and 0-9"
+          return 1
+        fi
+        shift 2
+        ;;
+      --list-users)
+        args[list_users]=true
+        shift
+        ;;
+      --show-user)
+        args[show_config]="$2"
+        if ! [[ ${args[show_config]} =~ ${regex[username]} ]]; then
+          echo "Invalid username: ${args[show_config]}"
+          return 1
+        fi
+        shift 2
+        ;;
+      --delete-user)
+        args[delete_user]="$2"
+        if ! [[ ${args[delete_user]} =~ ${regex[username]} ]]; then
+          echo "Invalid username: ${args[delete_user]}"
+          return 1
+        fi
+        shift 2
+        ;;
+      --backup)
+        args[backup]=true
+        shift
+        ;;
+      --restore)
+        args[restore]="$2"
+        if [[ ! ${args[restore]} =~ ${regex[file_path]} ]] && [[ ! ${args[restore]} =~ ${regex[url]} ]]; then
+          echo "Invalid: Backup file path or URL is not valid."
+          return 1
+        fi
+        shift 2
+        ;;
+      --backup-password)
+        args[backup_password]="$2"
+        shift 2
+        ;;
+      --hysteria2-up)
+        args[hysteria2_up]="$2"
+        if ! [[ ${args[hysteria2_up]} =~ ^[0-9]+$ ]] || (( args[hysteria2_up] < 1 )); then
+          echo "Invalid hysteria2 uplink: ${args[hysteria2_up]} (a positive integer, Mbps)"
+          return 1
+        fi
+        shift 2
+        ;;
+      --hysteria2-down)
+        args[hysteria2_down]="$2"
+        if ! [[ ${args[hysteria2_down]} =~ ^[0-9]+$ ]] || (( args[hysteria2_down] < 1 )); then
+          echo "Invalid hysteria2 downlink: ${args[hysteria2_down]} (a positive integer, Mbps)"
+          return 1
+        fi
+        shift 2
+        ;;
+      --tuic-congestion)
+        args[tuic_congestion]="$2"
+        case ${args[tuic_congestion]} in
+          cubic|new_reno|bbr)
+            shift 2
+            ;;
+          *)
+            echo "Invalid tuic congestion control: ${args[tuic_congestion]} (cubic, new_reno or bbr)"
+            return 1
+            ;;
+        esac
+        ;;
+      --harden-docker)
+        case "$2" in
+          true|false)
+            if [[ $2 == true ]]; then args[harden_docker]=ON; else args[harden_docker]=OFF; fi
+            shift 2
+            ;;
+          *)
+            echo "Invalid harden-docker option: $2"
+            return 1
+            ;;
+        esac
+        ;;
+      --format)
+        case "$2" in
+          uri|clash|singbox|v2ray|json)
+            args[format]="$2"
+            shift 2
+            ;;
+          *)
+            echo "Invalid format: $2 (uri|clash|singbox|v2ray|json)"
+            return 1
+            ;;
+        esac
+        ;;
+      --dns-provider)
+        case "${2,,}" in
+          off)
+            args[dns_provider]="off"
+            ;;
+          cloudflare)
+            args[dns_provider]="$2"
+            ;;
+          *)
+            echo "Invalid DNS provider: $2 (supported providers: cloudflare)"
+            return 1
+            ;;
+        esac
+        shift 2
+        ;;
+      --dns-credentials)
+        if [[ ${2,,} == 'off' ]]; then
+          args[dns_credentials]="off"
+        else
+          args[dns_credentials]="$2"
+        fi
+        shift 2
+        ;;
+      --ss-port)
+        case "${2,,}" in
+          ''|off)
+            args[ss_port]="off"
+            ;;
+          *)
+            if [[ ! $2 =~ ${regex[port]} ]] || (( $2 < 1 || $2 > 65535 )); then
+              echo "Invalid Shadowsocks port: $2"
+              return 1
+            fi
+            args[ss_port]="$2"
+            ;;
+        esac
+        shift 2
+        ;;
+      --open-firewall)
+        args[open_firewall]=true
+        shift
+        ;;
+      --check-update)
+        args[check_update]=true
+        shift
+        ;;
+      --doctor)
+        args[doctor]=true
+        shift
+        ;;
+      -h|--help)
+        args[help]=true
+        shift
+        break
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        echo "Unknown option: $1"
+        return 1
+        ;;
+    esac
+  done
+
+  if [[ -n ${args[warp_license]} ]]; then
+    args[warp]=ON
+  fi
+}
+
+function backup {
+  local backup_name
+  local backup_password="$1"
+  local backup_file_url
+  local exit_code
+  backup_name="reality-backup-$(date +%Y-%m-%d_%H-%M-%S).zip"
+  cd "${config_path}"
+  if [ -z "${backup_password}" ]; then
+    zip -r "/tmp/${backup_name}" . > /dev/null
+  else
+    zip -P "${backup_password}" -r "/tmp/${backup_name}" . > /dev/null
+  fi
+  if ! backup_file_url=$(curl -fsS -m 30 -F "file=@/tmp/${backup_name}" "${backup_upload_url}"); then
+    rm -f "/tmp/${backup_name}"
+    echo "Error in uploading backup file" >&2
+    return 1
+  fi
+  rm -f "/tmp/${backup_name}"
+  echo "${backup_file_url}"
+}
+
+function restore {
+  local backup_file="$1"
+  local backup_password="$2"
+  local temp_file
+  local unzip_output
+  local unzip_exit_code
+  local current_state
+  temp_file=$(mktemp)
+  if [[ ! -r ${backup_file} ]]; then
+    # The default uploader (temp.sh) returns a link that has to be POSTed back.
+    # Any other endpoint is assumed to be a plain file server, so a failed GET
+    # is retried as a POST to keep self-hosted endpoints working.
+    if [[ "${backup_file}" =~ ^https?://temp\.sh/ ]]; then
+      if ! curl -fSsL -m 30 -X POST "${backup_file}" -o "${temp_file}"; then
+        echo "Cannot download or find backup file" >&2
+        return 1
+      fi
+    else
+      if ! curl -fSsL -m 30 "${backup_file}" -o "${temp_file}"; then
+        if ! curl -fSsL -m 30 -X POST "${backup_file}" -o "${temp_file}"; then
+          echo "Cannot download or find backup file" >&2
+          return 1
+        fi
+      fi
+    fi
+    backup_file="${temp_file}"
+  fi
+  current_state=$(set +o)
+  set +e
+  if [[ -z "${backup_password}" ]]; then
+    unzip_output=$(unzip -P "" -t "${backup_file}" 2>&1)
+  else
+    unzip_output=$(unzip -P "${backup_password}" -t "${backup_file}" 2>&1)
+  fi
+  unzip_exit_code=$?
+  eval "$current_state"
+  if [[ ${unzip_exit_code} -eq 0 ]]; then
+    if ! echo "${unzip_output}" | grep -q 'config'; then
+      echo "The provided file is not a reality backup file." >&2
+      rm -f "${temp_file}"
+      return 1
+    fi
+  else
+    if echo "${unzip_output}" | grep -q 'incorrect password'; then
+      echo "The provided password for backup file is incorrect." >&2
+    else
+      echo "An error occurred during zip file verification: ${unzip_output}" >&2
+    fi
+    rm -f "${temp_file}"
+    return 1
+  fi
+  rm -rf "${config_path}"
+  mkdir -p "${config_path}"
+  set +e
+  if [[ -z "${backup_password}" ]]; then
+    unzip_output=$(unzip -d "${config_path}" "${backup_file}" 2>&1)
+  else
+    unzip_output=$(unzip -P "${backup_password}" -d "${config_path}" "${backup_file}" 2>&1)
+  fi
+  unzip_exit_code=$?
+  eval "$current_state"
+  if [[ ${unzip_exit_code} -ne 0 ]]; then
+    echo "Error in backup restore: ${unzip_output}" >&2
+    rm -f "${temp_file}"
+    return 1
+  fi
+  rm -f "${temp_file}"
+  return
+}
+
+function parse_config_file {
+  if [[ ! -r "${path[config]}" ]]; then
+    generate_keys
+    return 0
+  fi
+  while IFS= read -r line; do
+    if [[ "${line}" =~ ^\s*# ]] || [[ "${line}" =~ ^\s*$ ]]; then
+      continue
+    fi
+    key=$(echo "$line" | cut -d "=" -f 1)
+    value=$(echo "$line" | cut -d "=" -f 2-)
+    config_file["${key}"]="${value}"
+  done < "${path[config]}"
+  if [[ -z "${config_file[public_key]}" || \
+        -z "${config_file[private_key]}" || \
+        -z "${config_file[short_id]}" || \
+        -z "${config_file[service_path]}" ]]; then
+    generate_keys
+  fi
+  return 0
+}
+
+function parse_users_file {
+  mkdir -p "$config_path"
+  touch "${path[users]}"
+  while read -r line; do
+    if [[ "${line}" =~ ^\s*# ]] || [[ "${line}" =~ ^\s*$ ]]; then
+      continue
+    fi
+    IFS="=" read -r key value <<< "${line}"
+    users["${key}"]="${value}"
+  done < "${path[users]}"
+  if [[ -n ${args[add_user]} ]]; then
+    if [[ -z "${users["${args[add_user]}"]}" ]]; then
+      users["${args[add_user]}"]=$(cat /proc/sys/kernel/random/uuid)
+    else
+      echo 'User "'"${args[add_user]}"'" already exists.'
+    fi
+  fi
+  if [[ -n ${args[delete_user]} ]]; then
+    if [[ -n "${users["${args[delete_user]}"]}" ]]; then
+      if [[ ${#users[@]} -eq 1 ]]; then
+        echo -e "You cannot delete the only user.\nAt least one user is needed.\nCreate a new user, then delete this one."
+        exit 1
+      fi
+      unset users["${args[delete_user]}"]
+    else
+      echo "User "${args[delete_user]}" does not exists."
+      exit 1
+    fi
+  fi
+  if [[ ${#users[@]} -eq 0 ]]; then
+    users[Reality]=$(cat /proc/sys/kernel/random/uuid)
+    echo "Reality=${users[Reality]}" >> "${path[users]}"
+    return 0
+  fi
+  return 0
+}
+
+function restore_defaults {
+  local defaults_items=("${!defaults[@]}")
+  local keep=false
+  local exclude_list=(
+    "warp_license"
+    "tgbot_token"
+  )
+  if [[ -n ${config[warp_id]} && -n ${config[warp_token]} ]]; then
+    warp_delete_account "${config[warp_id]}" "${config[warp_token]}"
+  fi
+  for item in "${defaults_items[@]}"; do
+    keep=false
+    for i in "${exclude_list[@]}"; do
+      if [[ "${i}" == "${item}" ]]; then
+        keep=true
+        break
+      fi
+    done
+    if [[ ${keep} == true ]]; then
+      continue
+    fi
+    config["${item}"]="${defaults[${item}]}"
+  done
+}
+
+function build_config {
+  local free_80=true
+  if [[ ${args[regenerate]} == true ]]; then
+    generate_keys
+  fi
+  # "pinned"/"default"/"none" drops the override again.
+  if [[ ${args[core_version],,} =~ ^(pinned|default|none)$ ]]; then
+    args[core_version]=""
+    config_file[core_version]=""
+  fi
+  # A tag belongs to one engine: switching cores without naming a version drops
+  # the inherited one, otherwise an xray tag would be applied to sing-box.
+  if [[ -n ${args[core]} && ${args[core]} != ${config_file[core]} && -z ${args[core_version]} ]]; then
+    config_file[core_version]=""
+  fi
+  for item in "${config_items[@]}"; do
+    if [[ -n ${args["${item}"]} ]]; then
+      config["${item}"]="${args[${item}]}"
+    elif [[ -n ${config_file["${item}"]} ]]; then
+      config["${item}"]="${config_file[${item}]}"
+    else
+      config["${item}"]="${defaults[${item}]}"
+    fi
+  done
+  # The address is auto-detected from cloudflare, but that lookup is time boxed
+  # now, so an unreachable network leaves it empty. Fail with a hint instead of
+  # generating a client configuration pointing at an empty address.
+  if [[ -z ${config[server]} ]]; then
+    echo 'Cannot determine the server address automatically. Specify it with "--server <ip-or-domain>".'
+    exit 1
+  fi
+  if [[ ${args[default]} == true ]]; then
+    restore_defaults
+    return 0
+  fi
+  if [[ ${config[tgbot]} == 'ON' && -z ${config[tgbot_token]} ]]; then
+    echo 'To enable Telegram bot, you have to give the token of bot with --tgbot-token option.'
+    exit 1
+  fi
+  if [[ ${config[tgbot]} == 'ON' && -z ${config[tgbot_admins]} ]]; then
+    echo 'To enable Telegram bot, you have to give the list of authorized Telegram admins (usernames without the leading "@", or numeric user ids) with --tgbot-admins option.'
+    exit 1
+  fi
+  if [[ ! ${config[server]} =~ ${regex[domain]} && ${config[security]} == 'letsencrypt' ]]; then
+    echo 'You have to assign a domain to server with "--server <domain>" option if you want to use "letsencrypt" as TLS certificate.'
+    exit 1
+  fi
+  if [[ ${config[transport]} == 'ws' && ${config[security]} == 'reality' ]]; then
+    echo 'You cannot use "ws" transport with "reality" TLS certificate. Use other transports or change TLS certificate to letsencrypt or selfsigned'
+    exit 1
+  fi
+  if [[ ${config[transport]} == 'tuic' && ${config[security]} == 'reality' ]]; then
+    echo 'You cannot use "tuic" transport with "reality" TLS certificate. Use other transports or change TLS certificate to letsencrypt or selfsigned'
+    exit 1
+  fi
+  if [[ ${config[transport]} == 'tuic' && ${config[core]} == 'xray' ]]; then
+    echo 'You cannot use "tuic" transport with "xray" core. Use other transports or change core to sing-box'
+    exit 1
+  fi
+  if [[ ${config[transport]} == 'hysteria2' && ${config[security]} == 'reality' ]]; then
+    echo 'You cannot use "hysteria2" transport with "reality" TLS certificate. Use other transports or change TLS certificate to letsencrypt or selfsigned'
+    exit 1
+  fi
+  if [[ ${config[transport]} == 'hysteria2' && ${config[core]} == 'xray' ]]; then
+    echo 'You cannot use "hysteria2" transport with "xray" core. Use other transports or change core to sing-box'
+    exit 1
+  fi
+  if [[ ${config[transport]} == 'shadowtls' && ${config[core]} == 'xray' ]]; then
+    echo 'You cannot use "shadowtls" transport with "xray" core. Use other transports or change core to sing-box'
+    exit 1
+  fi
+  if [[ ${config[transport]} == 'anytls' && ${config[core]} == 'xray' ]]; then
+    echo 'You cannot use "anytls" transport with "xray" core. Use other transports or change core to sing-box'
+    exit 1
+  fi
+  if [[ ${config[transport]} == 'anytls' && ${config[security]} == 'reality' ]]; then
+    echo 'You cannot use "anytls" transport with "reality" TLS certificate. Use other transports or change TLS certificate to letsencrypt or selfsigned'
+    exit 1
+  fi
+  # Shadowsocks 2022 is a second, plain inbound on a port of its own: it carries
+  # no TLS, so it cannot share the SNI-routed proxy port with the website.
+  if [[ ${config[ss_port],,} == 'off' ]]; then
+    config[ss_port]=""
+  fi
+  if [[ -n ${config[ss_port]} ]]; then
+    if [[ ! ${config[ss_port]} =~ ${regex[port]} ]] || (( config[ss_port] < 1 || config[ss_port] > 65535 )); then
+      echo "Invalid Shadowsocks port: ${config[ss_port]}"
+      exit 1
+    fi
+    if [[ ${config[ss_port]} == ${config[port]} || ${config[ss_port]} == ${config[http_port]} || ${config[ss_port]} == '80' ]]; then
+      echo "The Shadowsocks port (${config[ss_port]}) must differ from the proxy port, the HTTP port and 80."
+      exit 1
+    fi
+    if [[ ${config[core]} != 'sing-box' ]]; then
+      echo 'Shadowsocks 2022 is only generated for the sing-box core; use sing-box or drop --ss-port.'
+      exit 1
+    fi
+    if [[ -z ${config[ss_key]} ]]; then
+      config[ss_key]=$(openssl rand -base64 16)
+    fi
+  fi
+  # DNS-01 replaces the HTTP-01 challenge: no inbound port is needed and a
+  # wildcard certificate becomes possible.
+  if [[ ${config[dns_provider],,} == 'off' ]]; then
+    config[dns_provider]=""
+  fi
+  if [[ ${config[dns_credentials],,} == 'off' ]]; then
+    config[dns_credentials]=""
+  fi
+  if [[ -n ${config[dns_provider]} ]]; then
+    if [[ ${config[dns_provider]} != 'cloudflare' ]]; then
+      echo "Unsupported DNS provider: ${config[dns_provider]} (supported providers: cloudflare)"
+      exit 1
+    fi
+    if ! needs_certbot; then
+      echo 'A DNS provider is only used while a certificate is issued (letsencrypt, or camouflage self).'
+      exit 1
+    fi
+    if [[ -z ${config[dns_credentials]} || ! -r ${config[dns_credentials]} ]]; then
+      echo "The DNS credentials file is missing or unreadable: ${config[dns_credentials]:-<empty>}"
+      exit 1
+    fi
+  fi
+  # The bandwidth pair only means something for hysteria2; a lone value is dropped
+  # with a note instead of failing an install that merely switched transport.
+  if [[ ${config[transport]} == 'hysteria2' && ( -n ${config[hysteria2_up]} || -n ${config[hysteria2_down]} ) ]]; then
+    if [[ -z ${config[hysteria2_up]} || -z ${config[hysteria2_down]} ]]; then
+      echo 'Note: both --hysteria2-up and --hysteria2-down are needed to shape bandwidth; ignoring the one that was given.'
+      config[hysteria2_up]=""
+      config[hysteria2_down]=""
+    fi
+  fi
+  # A stale value in the config file must not reach the engine as-is.
+  if [[ ${config[transport]} == 'tuic' ]]; then
+    case ${config[tuic_congestion]} in
+      cubic|new_reno|bbr) ;;
+      *) config[tuic_congestion]='bbr' ;;
+    esac
+  fi
+  # letsencrypt is the only mode that needs port 80, because the ACME HTTP-01
+  # challenge is always served there. It is an explicit opt-in, so the HTTP side
+  # is pinned to 80 in that mode; every other mode keeps the default HTTP port.
+  if [[ -z ${config[dns_provider]} && ( ${config[security]} == 'letsencrypt' || ${config[camouflage]} == 'self' ) ]]; then
+    if [[ ${config[http_port]} != '80' ]]; then
+      echo 'Note: the ACME HTTP-01 challenge is served on port 80; it is used as the HTTP port for this mode.'
+      config[http_port]=80
+    fi
+    if port_in_use 80; then
+      free_80=false
+      for container in $(${docker_cmd} -p ${compose_project} ps -q); do
+        if docker port "${container}" | grep -q ':80$'; then
+          free_80=true
+          break
+        fi
+      done
+    fi
+    if [[ ${free_80} != 'true' ]]; then
+      echo 'Port 80 must be free for the ACME HTTP-01 challenge (letsencrypt / --camouflage self).'
+      exit 1
+    fi
+  elif [[ ${config[http_port]} == '80' ]]; then
+    # Without an ACME challenge there is no reason to claim port 80.
+    echo "Port 80 is only used by the ACME challenge; leaving the HTTP side unpublished."
+    config[http_port]="${defaults[http_port]}"
+  fi
+  # Both ports become docker port mappings on the same address, so they must
+  # differ - otherwise the second mapping fails and the stack does not start.
+  if [[ ${config[http_port]} != 'OFF' && ${config[http_port]} == ${config[port]} ]]; then
+    echo "The HTTP port (${config[http_port]}) must differ from the proxy port (${config[port]})."
+    exit 1
+  fi
+
+  # An explicit --domain always wins: none of the derivations below may silently
+  # overwrite it. When the SNI is taken from the server address and that address
+  # is a bare IP, a real host name is used instead - a client never puts an IP
+  # into the TLS SNI, so an IP SNI could never match the haproxy split and every
+  # proxy connection would end up on the website instead of the engine.
+  if [[ -n "${args[security]}" && "${args[security]}" == 'reality' && "${config_file[security]}" != 'reality' && "${config_file[transport]}" != 'shadowtls' && -z "${args[domain]}" ]]; then
+    config[domain]="${config[camouflage]}"
+  fi
+  if [[ -n "${args[security]}" && "${args[security]}" != 'reality' && "${config_file[security]}" == 'reality' && "${config_file[transport]}" != 'shadowtls' && -z "${args[domain]}" ]]; then
+    config[domain]="$([[ ${config[server]} =~ ${regex[ip]} ]] && echo "${defaults[domain]}" || echo "${config[server]}")"
+  fi
+
+  if [[ -n "${args[transport]}" && "${args[transport]}" == 'shadowtls' && "${config_file[transport]}" != 'shadowtls' && "${config_file[security]}" != 'reality' && -z "${args[domain]}" ]]; then
+    config[domain]="${config[camouflage]}"
+  fi
+  if [[ -n "${args[transport]}" && "${args[transport]}" != 'shadowtls' && "${config_file[transport]}" == 'shadowtls' && "${config_file[security]}" != 'reality' && -z "${args[domain]}" ]]; then
+    config[domain]="$([[ ${config[server]} =~ ${regex[ip]} ]] && echo "${defaults[domain]}" || echo "${config[server]}")"
+  fi
+
+  if [[ -n "${args[server]}" && "${config[security]}" != 'reality' && "${config[transport]}" != 'shadowtls' && -z "${args[domain]}" ]]; then
+    config[domain]="$([[ ${config[server]} =~ ${regex[ip]} ]] && echo "${defaults[domain]}" || echo "${config[server]}")"
+  fi
+
+  # The camouflage target only exists in the reality and shadowtls modes, where
+  # anything that does not authenticate gets relayed to it. Supplying just one of
+  # --camouflage / --domain keeps the two in sync, because the certificate the
+  # camouflage site returns has to match the SNI a probe sends - a mismatch is
+  # exactly what an active probe looks for.
+  if [[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]]; then
+    # Upgrading from a version where "domain" served as the camouflage target as
+    # well: carry the configured value over instead of silently switching the
+    # fallback to the default site (which would break the SNI/certificate match).
+    if [[ -z ${config_file[camouflage]} && -z ${args[camouflage]} && -n ${config_file[domain]} ]]; then
+      config[camouflage]="${config[domain]}"
+    fi
+    if [[ ${config[camouflage]} == 'self' ]]; then
+      # "Steal yourself": unauthenticated probes are relayed to the local nginx,
+      # which serves a real certificate for the very SNI they sent. That needs a
+      # domain, because the certificate has to be issued for it.
+      if [[ ! ${config[server]} =~ ${regex[domain]} ]]; then
+        echo '--camouflage self needs a domain in --server: a real certificate is issued for it.'
+        exit 1
+      fi
+      if [[ -n ${args[domain]} && ${args[domain]%%:*} != ${config[server]} ]]; then
+        echo "Note: --camouflage self serves the certificate of ${config[server]}; the SNI is set to it and --domain is ignored."
+      fi
+      config[domain]="${config[server]}"
+      config[camouflage]='self'
+    else
+      if [[ -n "${args[camouflage]}" && -z "${args[domain]}" ]]; then
+        config[domain]="${config[camouflage]%%:*}"
+      elif [[ -n "${args[domain]}" && -z "${args[camouflage]}" ]]; then
+        config[camouflage]="${config[domain]}"
+      fi
+      if [[ ${config[camouflage]%%:*} != ${config[domain]%%:*} ]]; then
+        echo "Warning: the SNI (${config[domain]%%:*}) differs from the camouflage site (${config[camouflage]%%:*})."
+        echo 'A probe sends the SNI and compares the certificate it gets back against it, so those are expected to be the same domain.'
+      fi
+      # Only warn when the CDN was picked explicitly: the built-in default is one
+      # of them and must not turn every install into a warning.
+      if [[ -n ${args[camouflage]} && ${config[camouflage]%%:*} =~ ${regex[cdn_camouflage]} ]]; then
+        echo "Note: ${config[camouflage]%%:*} is a large CDN; it may rate-limit probes, answer with a different TLS stack, or rotate certificates."
+        echo '      "--camouflage self" (your own domain, with a real certificate) is the most consistent fallback.'
+      fi
+    fi
+  fi
+
+  # letsencrypt issues the certificate for the server domain, so the SNI has to
+  # be that very domain; any other value would only break the client's
+  # certificate verification (there is no allow_insecure for a public cert).
+  if [[ ${config[security]} == 'letsencrypt' && ${config[transport]} != 'shadowtls' ]]; then
+    if [[ -n "${args[domain]}" && "${args[domain]%%:*}" != "${config[server]}" ]]; then
+      echo "Note: letsencrypt issues the certificate for ${config[server]}; the SNI is set to it and --domain is ignored."
+    fi
+    config[domain]="${config[server]}"
+  fi
+
+  if [[ -n "${args[warp]}" && "${args[warp]}" == 'OFF' && "${config_file[warp]}" == 'ON' ]]; then
+    if [[ -n ${config[warp_id]} && -n ${config[warp_token]} ]]; then
+      warp_delete_account "${config[warp_id]}" "${config[warp_token]}"
+    fi
+  fi
+  if { [[ -n "${args[warp]}" && "${args[warp]}" == 'ON' && "${config_file[warp]}" == 'OFF' ]] || \
+       [[ "${config[warp]}" == 'ON' && ( -z ${config[warp_private_key]} || \
+                                         -z ${config[warp_token]} || \
+                                         -z ${config[warp_id]} || \
+                                         -z ${config[warp_client_id]} || \
+                                         -z ${config[warp_interface_ipv4]} || \
+                                         -z ${config[warp_interface_ipv6]} ) ]]; }; then
+    config[warp]='OFF'
+    warp_create_account || exit 1
+    config[warp]='ON'
+  fi
+  if [[ -n "${args[warp_license]}" && ( -z "${config_file[warp_license]}" || "${args[warp_license]}" != "${config_file[warp_license]}" ) ]]; then
+    if ! warp_add_license "${config[warp_id]}" "${config[warp_token]}" "${args[warp_license]}"; then
+      config[warp_license]=""
+      echo "WARP+ license error! Please check your license and try again."
+      exit 1
+    fi 
+  fi
+}
+
+# Configuration writes mark the state dirty instead of always regenerating and
+# restarting services. While RELOAD_DEFERRED is 1 (during startup) the reload is
+# postponed, so a single flush_reload at the end replaces the repeated reloads.
+function mark_config_dirty {
+  RELOAD_PENDING=1
+  if [[ ${RELOAD_DEFERRED} -ne 1 ]]; then
+    check_reload
+  fi
+}
+
+function flush_reload {
+  if [[ ${RELOAD_PENDING} -eq 1 ]]; then
+    check_reload
+  fi
+}
+
+# Rewrite the config file through a temporary file and move it into place, so a
+# crash can never leave a truncated config behind. Unknown keys are preserved
+# and values are written verbatim (no sed escaping pitfalls).
+function update_config_file {
+  local item
+  local key
+  local line
+  local temp_file
+  local -A handled
+  mkdir -p "${config_path}"
+  touch "${path[config]}"
+  temp_file=$(mktemp "${config_path}/.config.XXXXXX")
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    if [[ ${line} != *=* ]]; then
+      printf '%s\n' "${line}" >> "${temp_file}"
+      continue
+    fi
+    key=${line%%=*}
+    if [[ ${key} =~ ^[a-zA-Z0-9_]+$ && -n ${config_item_lookup[${key}]:-} ]]; then
+      printf '%s=%s\n' "${key}" "${config[${key}]}" >> "${temp_file}"
+      handled["${key}"]=1
+    else
+      printf '%s\n' "${line}" >> "${temp_file}"
+    fi
+  done < "${path[config]}"
+  for item in "${config_items[@]}"; do
+    if [[ -z ${handled[${item}]:-} ]]; then
+      printf '%s=%s\n' "${item}" "${config[${item}]}" >> "${temp_file}"
+    fi
+  done
+  mv -f "${temp_file}" "${path[config]}"
+  mark_config_dirty
+}
+
+function update_users_file {
+  local user
+  local temp_file
+  mkdir -p "${config_path}"
+  temp_file=$(mktemp "${config_path}/.users.XXXXXX")
+  for user in "${!users[@]}"; do
+    printf '%s=%s\n' "${user}" "${users[${user}]}" >> "${temp_file}"
+  done
+  mv -f "${temp_file}" "${path[users]}"
+  mark_config_dirty
+}
+
+function generate_keys {
+  local key_pair
+  key_pair=$(docker run --rm ${image[sing-box]} generate reality-keypair)
+  config_file[public_key]=$(echo "${key_pair}" | grep 'PublicKey' | awk '{print $2}')
+  config_file[private_key]=$(echo "${key_pair}" | grep 'PrivateKey' | awk '{print $2}')
+  config_file[short_id]=$(openssl rand -hex 8)
+  config_file[service_path]=$(openssl rand -hex 4)
+}
+
+# Brings one compose project down, then makes sure its containers are really gone.
+# `docker compose down` alone is not enough: a Compose v1 binary parses the
+# generated, version-less compose file as the legacy format (top-level keys read
+# as service names), and a compose file that was already deleted leaves the daemon
+# nothing to stop - either way the containers survive and keep holding 443/8080.
+# Removing them by project label closes both holes.
+# Uninstall also runs before install_docker has had a chance to resolve docker_cmd,
+# so this detects the compose command itself instead of relying on that variable.
+function remove_compose_project {
+  local directory="$1"
+  local project="$2"
+  local container
+  if docker compose version >/dev/null 2>&1; then
+    docker compose --project-directory "${directory}" -p "${project}" down --remove-orphans --timeout 2 >/dev/null 2>&1 || true
+  elif command -v docker-compose >/dev/null 2>&1; then
+    docker-compose --project-directory "${directory}" -p "${project}" down --remove-orphans --timeout 2 >/dev/null 2>&1 || true
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    for container in $(docker ps -aq --filter "label=com.docker.compose.project=${project}" 2>/dev/null || true); do
+      docker rm -f "${container}" >/dev/null 2>&1 || true
+    done
+  fi
+  return 0
+}
+
+function uninstall {
+  # Releases before this one kept everything in /opt/reality-ezpz and ran their
+  # containers under the compose project "reality-ezpz". Container names derive
+  # from the project name, so a layout that is not torn down here keeps holding
+  # 443/8080 and makes a later reinstall fail.
+  # Both layouts are removed outright rather than migrated: the single caller runs
+  # this before migrate_legacy_install, which would otherwise move the old tree
+  # into config_path and rewrite the kernel tuning drop-in only for all of it to be
+  # deleted right after - and would abort the uninstall if the move failed.
+  # The legacy path is a parameter only so the regression suite can point it at a
+  # scratch directory instead of the real /opt; the single caller omits it.
+  local legacy_config_path="${1:-/opt/reality-ezpz}"
+  local legacy_project='reality-ezpz'
+  local entry
+  for entry in "${config_path}:${compose_project}" "${config_path}/tgbot:${tgbot_project}" \
+    "${legacy_config_path}:${legacy_project}" "${legacy_config_path}/tgbot:${tgbot_project}"; do
+    remove_compose_project "${entry%%:*}" "${entry##*:}"
+  done
+  # The kernel tuning drop-in was renamed along with the project. Leaving either
+  # name behind would keep applying its BBR settings after reality is gone.
+  rm -f '/etc/sysctl.d/99-reality.conf' '/etc/sysctl.d/99-reality-ezpz.conf'
+  rm -rf "${config_path}" "${legacy_config_path}"
+  echo "Reality uninstalled successfully."
+  exit 0
+}
+
+function install_packages {
+  local package
+  local packages=()
+  # The tgbot container ships every tool the script needs, so nothing has to be
+  # installed there.
+  if [[ -n $BOT_TOKEN ]]; then
+    return 0
+  fi
+  # `command -v` is a shell builtin, so this works even on minimal images where
+  # `which` itself is missing. Only missing packages are installed instead of
+  # reinstalling the whole set on every invocation.
+  # xxd is deliberately absent: warp_decode_reserved no longer depends on it.
+  # openssl is required for the self-signed certificate and for the WARP key
+  # pair (X25519, so OpenSSL 1.1.0+).
+  for package in curl openssl qrencode jq zip unzip; do
+    if ! command -v "${package}" >/dev/null 2>&1; then
+      packages+=("${package}")
+    fi
+  done
+  if [[ ${#packages[@]} -eq 0 ]]; then
+    return 0
+  fi
+  if command -v apt >/dev/null 2>&1; then
+    apt update
+    DEBIAN_FRONTEND=noninteractive apt install "${packages[@]}" -y
+    return 0
+  fi
+  if command -v yum >/dev/null 2>&1; then
+    yum makecache
+    yum install epel-release -y || true
+    yum install "${packages[@]}" -y
+    return 0
+  fi
+  echo "OS is not supported!"
+  return 1
+}
+
+function install_docker {
+  if ! command -v docker >/dev/null 2>&1; then
+    curl -fsSL -m 30 https://get.docker.com | bash
+    if ! command -v docker >/dev/null 2>&1; then
+      echo "Docker installation has been failed!" >&2
+      return 1
+    fi
+    systemctl enable --now docker
+    docker_cmd="docker compose"
+    return 0
+  fi
+  if docker compose >/dev/null 2>&1; then
+    docker_cmd="docker compose"
+    return 0
+  fi
+  # Only accept a v2 binary under the legacy "docker-compose" name. Compose v1
+  # parses a version-less compose file as the legacy format, where the top-level
+  # keys are service names, so it cannot read the file generated above - fall
+  # through and install the current release instead.
+  if command -v docker-compose >/dev/null 2>&1 &&
+    [[ $(docker-compose version --short 2>/dev/null) == 2.* ]]; then
+    docker_cmd="docker-compose"
+    return 0
+  fi
+  # The compose binary is ~60MB, so the 30s budget of the old version regularly
+  # timed out on slower links and left a truncated binary behind.
+  if ! curl -fsSL -m 120 "https://github.com/docker/compose/releases/download/v2.28.0/docker-compose-linux-$(uname -m)" -o /usr/local/bin/docker-compose; then
+    echo "Docker compose installation has been failed!" >&2
+    return 1
+  fi
+  chmod +x /usr/local/bin/docker-compose
+  docker_cmd="docker-compose"
+  return 0
+}
+
+# True when the TLS handshake has to reach the engine itself: REALITY and
+# shadowtls always inspect it, and selfsigned + tcp hands TLS to the engine as
+# well. In those modes haproxy may only peek at the SNI, so the website has to
+# terminate TLS in nginx. Everywhere else haproxy terminates TLS itself and
+# routes by path, and the website is just another backend.
+function engine_owns_tls {
+  if [[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]]; then
+    return 0
+  fi
+  # selfsigned + tcp behaves the same way: the engine is the TLS endpoint and
+  # there is no ACME challenge to route, so the SNI split applies as well.
+  # letsencrypt is deliberately excluded: its ACME challenge needs the HTTP
+  # frontend, and a browser sends the very same SNI the proxy clients do, so
+  # there is no SNI that could distinguish the website from the proxy.
+  if [[ ${config[transport]} == 'tcp' && ${config[security]} == 'selfsigned' ]]; then
+    return 0
+  fi
+  # AnyTLS always terminates TLS in the engine (it has its own protocol framing),
+  # so the SNI split applies here too.
+  if [[ ${config[transport]} == 'anytls' ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# Shadowsocks 2022 wants per-user keys that are the base64 of a key of a fixed
+# length (16 bytes for aes-128-gcm). Deriving them from the user id keeps them
+# stable across regenerations, so existing clients stay valid.
+function ss2022_user_key {
+  printf '%s' "${1}${2}" | openssl dgst -sha256 -binary | head -c 16 | base64
+}
+
+# True when an ACME certificate has to be issued: the letsencrypt mode, or the
+# reality / shadowtls "self" camouflage (the local website needs a real
+# certificate for the SNI domain, or a probe sees self-signed material).
+function needs_certbot {
+  if [[ ${config[security]} == 'letsencrypt' && ${config[transport]} != 'shadowtls' ]]; then
+    return 0
+  fi
+  [[ ${config[camouflage]} == 'self' ]]
+}
+
+function generate_docker_compose {
+  # The official images are run with an explicit command: the engine binary is
+  # addressed directly instead of relying on the image default CMD (the official
+  # xray image defaults to "-confdir /usr/local/etc/xray/", which would ignore
+  # the mounted configuration).
+  local engine_command
+  # --core-version moves the engine to another upstream tag without touching
+  # the pins; an empty value keeps the tested one.
+  local engine_image="${image[${config[core]}]}"
+  if [[ -n ${config[core_version]} ]]; then
+    engine_image="${engine_image%:*}:${config[core_version]}"
+  fi
+  # Fragments that differ between the passthrough modes (reality / shadowtls)
+  # and the terminating ones (letsencrypt / selfsigned). Built here, with plain
+  # if statements, so the heredoc below stays readable.
+  local engine_ports=''
+  local nginx_ports=''
+  local nginx_expose=''
+  local nginx_tls_volumes=''
+  local haproxy_http_port=''
+  local haproxy_cert_volume=''
+  local haproxy_depends=''
+  local nginx_service
+  local haproxy_service
+  if engine_owns_tls; then
+    # haproxy only peeks at the ClientHello, so nginx terminates the website
+    # TLS itself and needs the certificate mounted.
+    if [[ ${config[http_port]} != 'OFF' ]]; then
+      nginx_ports="    ports:
+    - ${config[http_port]}:80"
+    fi
+    nginx_expose="    expose:
+    - 443"
+    nginx_tls_volumes="    - ./${path[nginx_conf]#${config_path}/}:/etc/nginx/conf.d/default.conf
+    - ./${path[server_crt]#${config_path}/}:/etc/nginx/certificate/server.crt
+    - ./${path[server_key]#${config_path}/}:/etc/nginx/certificate/server.key"
+  else
+    nginx_expose="    expose:
+    - 80"
+    if [[ ${config[http_port]} != 'OFF' ]]; then
+      haproxy_http_port="    - ${config[http_port]}:8080"
+    fi
+    haproxy_cert_volume="    - ./${path[server_pem]#${config_path}/}:/usr/local/etc/haproxy/server.pem"
+  fi
+  if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
+    engine_ports="
+    - ${config[port]}:443/udp"
+  fi
+  # Shadowsocks 2022 is plain TCP/UDP on a port of its own; it never goes through
+  # haproxy, because it carries no TLS and therefore no SNI to split on.
+  if [[ -n ${config[ss_port]} ]]; then
+    engine_ports="${engine_ports}
+    - ${config[ss_port]}:${config[ss_port]}/tcp
+    - ${config[ss_port]}:${config[ss_port]}/udp"
+  fi
+  if [[ -n ${engine_ports} ]]; then
+    engine_ports="    ports:${engine_ports}"
+  fi
+  nginx_service="  nginx:
+    image: ${image[nginx]}
+${nginx_ports}
+${nginx_expose}
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    volumes:
+    - ./website:/usr/share/nginx/html
+${nginx_tls_volumes}
+    networks:
+    - reality"
+  # haproxy resolves its backend names while it parses the configuration, so the
+  # services it points at must already be registered in Docker's DNS. Without
+  # depends_on a cold start races the resolver: haproxy exits 1 and the proxy
+  # only comes back through the restart policy. The engine and nginx are always
+  # referenced; certbot only exists in the ACME modes.
+  haproxy_depends="    depends_on:
+    - engine
+    - nginx"
+  if needs_certbot; then
+    haproxy_depends="${haproxy_depends}
+    - certbot"
+  fi
+  haproxy_service="  haproxy:
+    image: ${image[haproxy]}
+${haproxy_depends}
+    ports:
+    - ${config[port]}:443
+${haproxy_http_port}
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    volumes:
+    - ./${path[haproxy]#${config_path}/}:/usr/local/etc/haproxy/haproxy.cfg
+${haproxy_cert_volume}
+    networks:
+    - reality"
+  if [[ ${config[core]} == 'xray' ]]; then
+    engine_command='["run", "-c", "/etc/xray/config.json"]'
+  else
+    engine_command='["run", "-c", "/etc/sing-box/config.json"]'
+  fi
+  # No top-level "version:" key: Compose v2 ignores it and prints
+  #   WARN the attribute version is obsolete, it will be ignored
+  # on every command. Do not add it back - see the guard in install_docker,
+  # which keeps this file away from Compose v1 (v1 reads a version-less file
+  # as the legacy format, where the top-level keys are service names).
+  cat >"${path[compose]}" <<EOF
+networks:
+  reality:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+      - subnet: fc11::1:0/112
+services:
+  engine:
+    image: ${engine_image}
+    command: ${engine_command}
+${engine_ports}
+    expose:
+    - 443
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    environment:
+      TZ: Etc/UTC
+    volumes:
+    - ./${path[engine]#${config_path}/}:/etc/${config[core]}/config.json
+    $([[ ${config[security]} != 'reality' ]] && { [[ ${config[transport]} == 'http' ]] || [[ ${config[transport]} == 'tcp' ]] || [[ ${config[transport]} == 'tuic' ]] || [[ ${config[transport]} == 'hysteria2' ]] || [[ ${config[transport]} == 'anytls' ]]; } && echo "- ./${path[server_crt]#${config_path}/}:/etc/${config[core]}/server.crt" || true)
+    $([[ ${config[security]} != 'reality' ]] && { [[ ${config[transport]} == 'http' ]] || [[ ${config[transport]} == 'tcp' ]] || [[ ${config[transport]} == 'tuic' ]] || [[ ${config[transport]} == 'hysteria2' ]] || [[ ${config[transport]} == 'anytls' ]]; } && echo "- ./${path[server_key]#${config_path}/}:/etc/${config[core]}/server.key" || true)
+    networks:
+    - reality
+${nginx_service}
+${haproxy_service}
+$(if needs_certbot; then
+echo "
+  certbot:
+    build:
+      context: ./certbot
+    expose:
+    - 80
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock:ro
+    - ./certbot/data:/etc/letsencrypt
+    - ./$(dirname "${path[server_pem]#${config_path}/}"):/certificate
+    - ./${path[certbot_deployhook]#${config_path}/}:/deployhook.sh
+    - ./${path[certbot_startup]#${config_path}/}:/startup.sh
+    - ./website:/website
+    $([[ -n ${config[dns_credentials]} ]] && echo "- ${config[dns_credentials]}:/credentials.ini:ro" || true)
+    networks:
+    - reality
+    entrypoint: /bin/sh
+    command: /startup.sh"
+fi)
+EOF
+}
+
+function generate_tgbot_compose {
+  # The bot never talks to Docker itself: it runs reality.sh, which does. It
+  # never needs /etc/docker, and the socket is mounted read-only so the container
+  # cannot replace it. With --harden-docker=true the socket is put behind a
+  # narrow proxy and never handed to the bot at all.
+  # Same as generate_docker_compose: a "version:" key is obsolete in Compose v2
+  # and only produces a warning.
+  local bot_environment
+  local bot_volumes
+  local proxy_service=''
+  if [[ ${config[harden_docker]} == 'ON' ]]; then
+    bot_environment="      DOCKER_HOST: tcp://socket-proxy:2375"
+    bot_volumes="    - ../:${config_path}"
+    proxy_service='  socket-proxy:
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      EXEC: 1
+      POST: 1
+      BUILD: 1
+      INFO: 1
+      VERSION: 1
+      ALLOW_START: 1
+      ALLOW_STOP: 1
+      ALLOW_RESTARTS: 1
+      LOG_LEVEL: warning
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+    - tgbot'
+  else
+    bot_environment="      DOCKER_HOST: unix:///var/run/docker.sock"
+    bot_volumes="    - /var/run/docker.sock:/var/run/docker.sock:ro
+    - ../:${config_path}"
+  fi
+  cat >"${path[tgbot_compose]}" <<EOF
+networks:
+  tgbot:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+      - subnet: fc11::2:0/112
+services:
+  tgbot:
+    build: ./
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    environment:
+      BOT_TOKEN: ${config[tgbot_token]}
+      BOT_ADMIN: ${config[tgbot_admins]}
+${bot_environment}
+    volumes:
+${bot_volumes}
+    networks:
+    - tgbot
+${proxy_service}
+EOF
+}
+
+# nginx serves the local website out of ./website. The placeholder page is only
+# written when nothing is there yet, so a site put in place by the operator is
+# never overwritten by an upgrade.
+function generate_website {
+  mkdir -p "${config_path}/website"
+  if [[ -e "${path[website]}" ]]; then
+    return 0
+  fi
+  cat >"${path[website]}" <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Welcome</title>
+<style>
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f5f6f8; color: #23272f; }
+  main { max-width: 640px; margin: 0 auto; padding: 14vh 24px; }
+  h1 { margin: 0 0 12px; font-size: 22px; font-weight: 600; }
+  p { margin: 0 0 10px; line-height: 1.7; color: #4a515c; }
+</style>
+</head>
+<body>
+<main>
+<h1>Welcome</h1>
+<p>This site is up and running.</p>
+<p>Content will appear here shortly.</p>
+</main>
+</body>
+</html>
+EOF
+}
+
+function generate_haproxy_config {
+  # reality / shadowtls: the engine has to see the TLS handshake exactly as the
+  # client sent it (REALITY inspects it itself), so haproxy is a pure TCP front.
+  # It waits for the ClientHello, reads the SNI out of it and forwards the very
+  # same bytes to the engine. Anything that does not carry the proxy SNI - a
+  # browser opening https://<ip>, a probe with any other host name - goes to
+  # nginx, which terminates TLS and serves ./website.
+  if engine_owns_tls; then
+    cat >"${path[haproxy]}" <<EOF
+defaults
+  mode tcp
+  timeout connect 5s
+  timeout client 50s
+  timeout client-fin 1s
+  timeout server-fin 1s
+  timeout server 50s
+  # An idle tunnel is not a dead one: phones in the background and idle ssh
+  # sessions stop sending bytes for minutes, and 50s was cutting them mid-use.
+  timeout tunnel 300s
+frontend proxy
+  bind :::443 v4v6
+  mode tcp
+  # Hold the first bytes back for at most 5s: a real client sends its
+  # ClientHello immediately, this only caps how long a silent connection waits
+  # before the default backend takes it.
+  tcp-request inspect-delay 5s
+  tcp-request content accept if { req_ssl_hello_type 1 }
+  # The SNI the proxy clients send. Nothing else is routed to the engine.
+  use_backend engine if { req_ssl_sni -i ${config[domain]%%:*} }
+  default_backend website
+backend engine
+  mode tcp
+  server engine engine:443 check
+backend website
+  mode tcp
+  server nginx nginx:443 check
+EOF
+    return 0
+  fi
+echo "
+global
+  ssl-default-bind-options ssl-min-ver TLSv1.2
+defaults
+  option http-server-close
+  timeout connect 5s
+  timeout client 50s
+  timeout client-fin 1s
+  timeout server-fin 1s
+  timeout server 50s
+  timeout tunnel 300s
+  timeout http-keep-alive 1s
+  timeout queue 15s
+frontend http
+  mode http
+  bind :::8080 v4v6
+$(if [[ ${config[security]} == 'letsencrypt' ]]; then echo "
+  use_backend certbot if { path_beg /.well-known/acme-challenge }
+  acl letsencrypt-acl path_beg /.well-known/acme-challenge
+  redirect scheme https if !letsencrypt-acl
+"; fi)
+  use_backend default
+frontend tls
+$(if [[ ${config[transport]} != 'tcp' ]]; then echo "
+  bind :::443 v4v6 ssl crt /usr/local/etc/haproxy/server.pem alpn h2,http/1.1
+  mode http
+  http-request set-header Host ${config[server]}
+$(if [[ ${config[security]} == 'letsencrypt' ]]; then echo "
+  use_backend certbot if { path_beg /.well-known/acme-challenge }
+"; fi)
+$(if [[ ${config[transport]} != 'tuic' && ${config[transport]} != 'hysteria2' ]]; then echo "
+  use_backend engine if { path_beg /${config[service_path]} }
+"; fi)
+  use_backend default
+"; else echo "
+  bind :::443 v4v6
+  mode tcp
+  use_backend engine
+"; fi)
+$(if [[ ${config[transport]} != 'tuic' && ${config[transport]} != 'hysteria2' ]]; then echo "
+backend engine
+  retry-on conn-failure empty-response response-timeout
+$(if [[ ${config[transport]} != 'tcp' ]]; then echo "
+  mode http
+"; else echo "
+  mode tcp
+"; fi)
+$(if [[ ${config[transport]} == 'grpc' ]]; then echo "
+  server engine engine:443 check tfo proto h2
+"; elif [[ ${config[transport]} == 'http' && ${config[core]} == 'sing-box' ]]; then echo "
+  server engine engine:443 check tfo proto h2 ssl verify none
+"; elif [[ ${config[transport]} == 'http' && ${config[core]} != 'sing-box' ]]; then echo "
+  server engine engine:443 check tfo ssl verify none
+"; else echo "
+  server engine engine:443 check tfo
+"; fi)
+"; fi)
+$(if [[ ${config[security]} == 'letsencrypt' ]]; then echo "
+backend certbot
+  mode http
+  server certbot certbot:80
+"; fi)
+backend default
+  mode http
+  server nginx nginx:80
+" | grep -vE '^\s*$' > "${path[haproxy]}"
+}
+
+# In the passthrough modes haproxy must not terminate TLS, so nginx owns the
+# website certificate. It is self-signed by default; put a real certificate into
+# certificate/server.crt + certificate/server.key to replace it.
+# Both ports are bound on both stacks on purpose. The compose network enables
+# IPv6, and haproxy resolves these server names with getaddrinfo, which hands back
+# the AAAA address first. An IPv4-only listener therefore leaves haproxy's website
+# backend permanently DOWN (ECONNREFUSED), and a probe that offers a non-proxy SNI
+# to the proxy port gets a closed connection instead of the website.
+function generate_nginx_config {
+  cat >"${path[nginx_conf]}" <<EOF
+server {
+  listen 80 default_server;
+  listen [::]:80 default_server;
+  listen 443 ssl default_server;
+  listen [::]:443 ssl default_server;
+  http2 on;
+  server_name _;
+  root /usr/share/nginx/html;
+  index index.html;
+  ssl_certificate /etc/nginx/certificate/server.crt;
+  ssl_certificate_key /etc/nginx/certificate/server.key;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  ssl_session_cache shared:SSL:10m;
+  ssl_session_timeout 1h;
+  location / {
+    try_files \$uri \$uri/ =404;
+  }
+}
+EOF
+}
+
+function generate_certbot_script {
+  # In the camouflage "self" mode nginx already publishes the HTTP port, so
+  # certbot drops the challenge into the shared website directory instead of
+  # binding port 80 itself (which that stack does not give it).
+  local certbot_authenticator='--standalone'
+  if engine_owns_tls; then
+    certbot_authenticator='--webroot -w /website'
+  fi
+  # A DNS-01 provider replaces the HTTP-01 challenge entirely: port 80 is never
+  # touched, and a wildcard certificate becomes possible.
+  local certbot_names="    -d ${config[server]} \\"
+  if [[ -n ${config[dns_provider]} ]]; then
+    certbot_authenticator="--dns-${config[dns_provider]} --dns-${config[dns_provider]}-credentials /credentials.ini --dns-${config[dns_provider]}-propagation-seconds 30"
+    certbot_names="${certbot_names}
+    -d '*.${config[server]}' \\"
+  fi
+  cat >"${path[certbot_startup]}" << EOF
+#!/bin/sh
+trap exit TERM
+fullchain_path=/etc/letsencrypt/live/${config[server]}/fullchain.pem
+if [[ -r "\${fullchain_path}" ]]; then
+  fullchain_fingerprint=\$(openssl x509 -noout -fingerprint -sha256 -in "\${fullchain_path}" 2>/dev/null |\
+awk -F= '{print \$2}' | tr -d : | tr '[:upper:]' '[:lower:]')
+  installed_fingerprint=\$(openssl x509 -noout -fingerprint -sha256 -in /certificate/server.pem 2>/dev/null |\
+awk -F= '{print \$2}' | tr -d : | tr '[:upper:]' '[:lower:]')
+  if [[ \$fullchain_fingerprint != \$installed_fingerprint ]]; then
+    /deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true) $(engine_owns_tls && echo 'nginx' || true)
+  fi
+fi
+# The HTTP reachability probe only guards the HTTP-01 challenge; a DNS-01 setup
+# never needs an inbound connection at all.
+if [ -z "${config[dns_provider]}" ]; then
+while true; do
+  ls -d /website/* | grep -E '^/website/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\$'|xargs rm -f
+  uuid=\$(uuidgen)
+  echo "\$uuid" > "/website/\$uuid"
+  response=\$(curl -skL --max-time 3 http://${config[server]}/\$uuid)
+  if echo "\$response" | grep \$uuid >/dev/null; then
+    break
+  fi
+  echo "Domain ${config[server]} is not pointing to the server"
+  sleep 5
+done
+ls -d /website/* | grep -E '^/website/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\$'|xargs rm -f
+fi
+while true; do
+  certbot certonly -n \\
+    ${certbot_authenticator} \\
+    --key-type ecdsa \\
+    --elliptic-curve secp256r1 \\
+    --agree-tos \\
+    --register-unsafely-without-email \\
+${certbot_names}
+    --deploy-hook "/deployhook.sh /certificate ${compose_project} ${config[server]} ${service[server_crt]} $([[ ${config[transport]} != 'tcp' ]] && echo "${service[server_pem]}" || true) $(engine_owns_tls && echo 'nginx' || true)"
+  sleep 1h &
+  wait \$!
+done
+EOF
+}
+
+function generate_certbot_deployhook {
+  cat >"${path[certbot_deployhook]}" << EOF
+#!/bin/sh
+cert_path=\$1
+compose_project=\$2
+domain=\$3
+renewed_path=/etc/letsencrypt/live/\$domain
+cat "\$renewed_path/fullchain.pem" > "\$cert_path/server.crt"
+cat "\$renewed_path/privkey.pem" > "\$cert_path/server.key"
+cat "\$renewed_path/fullchain.pem" "\$renewed_path/privkey.pem" > "\$cert_path/server.pem"
+i=4
+while [ \$i -le \$# ]; do
+  eval service=\\\${\$i}
+  docker compose -p "${compose_project}" restart --timeout 2 "\$service"
+  i=\$((i+1))
+done
+EOF
+  chmod +x "${path[certbot_deployhook]}"
+}
+
+function generate_certbot_dockerfile {
+  # The DNS-01 provider rides in as a certbot plugin; the HTTP-01 modes need no
+  # extra package at all.
+  local dns_plugin=''
+  if [[ -n ${config[dns_provider]} ]]; then
+    dns_plugin="
+RUN pip install --no-cache-dir certbot-dns-${config[dns_provider]}"
+  fi
+  cat >"${path[certbot_dockerfile]}" << EOF
+FROM ${image[certbot]}
+RUN apk add --no-cache docker-cli-compose curl uuidgen${dns_plugin}
+EOF
+}
+
+function generate_tgbot_dockerfile {
+  local previous=''
+  if [[ -r ${path[tgbot_dockerfile]} ]]; then
+    previous=$(cat "${path[tgbot_dockerfile]}")
+  fi
+  cat >"${path[tgbot_dockerfile]}" << EOF
+FROM ${image[python]}
+WORKDIR ${config_path}/tgbot
+RUN apk add --no-cache docker-cli-compose curl bash libqrencode-tools sudo openssl jq zip unzip
+RUN pip install --no-cache-dir python-telegram-bot==22.8 "qrcode[pil]==8.2"
+CMD [ "python", "./tgbot.py" ]
+EOF
+  # A new base image (or package line) only lands after a rebuild. Without
+  # this flag a plain rerun keeps the old image, and the bot silently stays
+  # on the previous Python even though the pin moved on.
+  if [[ ${previous} != "$(cat "${path[tgbot_dockerfile]}")" ]]; then
+    tgbot_dockerfile_changed=true
+  fi
+}
+
+function download_tgbot_script {
+  # Pulled from this project's own repository rather than from a personal fork.
+  # Downloaded into a temporary file first: a failed or truncated download must
+  # never clobber the working copy that a previous run left behind.
+  local url="https://raw.githubusercontent.com/${repo_owner}/${repo_name}/${repo_branch}/tgbot.py"
+  local temp_file
+  temp_file=$(mktemp "${config_path}/tgbot/.tgbot-py.XXXXXX")
+  if ! curl -fsSL -m 30 "${url}" -o "${temp_file}"; then
+    rm -f "${temp_file}"
+    echo "Downloading tgbot.py from ${url} has been failed!" >&2
+    return 1
+  fi
+  if [[ ! -s ${temp_file} ]]; then
+    rm -f "${temp_file}"
+    echo "The tgbot.py downloaded from ${url} is empty!" >&2
+    return 1
+  fi
+  mv -f "${temp_file}" "${path[tgbot_script]}"
+  return 0
+}
+
+function install_local_script_copy {
+  # Keep a copy of this script inside the configuration directory. Operators are
+  # told to manage the server through ${config_path}/reality.sh, and the
+  # Telegram bot container mounts that directory and prefers this local copy over
+  # downloading anything at runtime - so it has to exist whether or not the bot is
+  # enabled. Everything is written to a temporary file and moved into place, so a
+  # failed or truncated copy can never replace a working one.
+  local url="https://raw.githubusercontent.com/${repo_owner}/${repo_name}/${repo_branch}/reality.sh"
+  local target="${config_path}/reality.sh"
+  local temp_file="${config_path}/.reality.sh.$$"
+  local source_file=${BASH_SOURCE[0]:-}
+  # `bash <(curl ...)` and `bash /dev/stdin` leave BASH_SOURCE[0] pointing at a
+  # pipe that this very interpreter has already drained, so copying from it would
+  # silently produce an empty file. Those paths are recognised by name rather than
+  # by `-p`, because the test for a fifo is not portable.
+  case ${source_file} in
+    /dev/fd/*|/dev/stdin|/proc/*/fd/*) source_file='' ;;
+  esac
+  mkdir -p "${config_path}"
+  if [[ -n ${source_file} && -f ${source_file} && -r ${source_file} && ! -p ${source_file} ]]; then
+    # Already running from the installed copy: nothing to do, and rewriting the
+    # file this very process is executing from would be pointless.
+    if [[ "${source_file}" -ef "${target}" ]]; then
+      return 0
+    fi
+    # A copy that is empty or does not parse is worse than none at all: it would
+    # replace a working script with a broken one, so it is validated before use.
+    if cp -f "${source_file}" "${temp_file}" 2>/dev/null \
+      && [[ -s ${temp_file} ]] && bash -n "${temp_file}" 2>/dev/null; then
+      chmod 755 "${temp_file}"
+      mv -f "${temp_file}" "${target}"
+      return 0
+    fi
+    rm -f "${temp_file}"
+  fi
+  if ! curl -fsSL -m 30 "${url}" -o "${temp_file}"; then
+    rm -f "${temp_file}"
+    echo "Could not place reality.sh in ${config_path}: no usable local copy and ${url} is unreachable." >&2
+    return 1
+  fi
+  if [[ ! -s ${temp_file} ]] || ! bash -n "${temp_file}" 2>/dev/null; then
+    rm -f "${temp_file}"
+    echo "The reality.sh downloaded from ${url} is empty or truncated!" >&2
+    return 1
+  fi
+  chmod 755 "${temp_file}"
+  mv -f "${temp_file}" "${target}"
+  return 0
+}
+
+function generate_selfsigned_certificate {
+  openssl ecparam -name prime256v1 -genkey -out "${path[server_key]}"
+  openssl req -new -key "${path[server_key]}" -out /tmp/server.csr -subj "/CN=${config[server]}"
+  openssl x509 -req -days 365 -in /tmp/server.csr -signkey "${path[server_key]}" -out "${path[server_crt]}"
+  cat "${path[server_key]}" "${path[server_crt]}" > "${path[server_pem]}"
+  # The official engine images drop privileges (xray runs as uid 65532), so the
+  # mounted material has to stay world readable even under a strict umask.
+  chmod 644 "${path[server_key]}" "${path[server_crt]}" "${path[server_pem]}"
+  rm -f /tmp/server.csr
+}
+
+function generate_engine_config {
+  local type="vless"
+  local users_object=""
+  local reality_object=""
+  local tls_object=""
+  local warp_object=""
+  local ss_users_object=""
+  # The camouflage site is what unauthenticated probes reach; it is a separate
+  # deployment input from the SNI, and its optional ":port" suffix defaults to 443.
+  local camouflage_host="${config[camouflage]%%:*}"
+  local reality_port=443
+  # "self" points the fallback at the local nginx: the certificate a probe sees
+  # then matches the SNI exactly, because nginx serves the real certificate for
+  # the same domain.
+  if [[ ${config[camouflage]} == 'self' ]]; then
+    camouflage_host='nginx'
+    reality_port=443
+  fi
+  # hysteria2 relays the bandwidth the client reports unless a rate pair is set,
+  # in which case the server shapes with Brutal instead.
+  local hysteria2_bandwidth=', "ignore_client_bandwidth": true'
+  if [[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]]; then
+    hysteria2_bandwidth=', "ignore_client_bandwidth": false, "up_mbps": '"${config[hysteria2_up]}"', "down_mbps": '"${config[hysteria2_down]}"''
+  fi
+  local temp_file
+  if [[ ${config[transport]} == 'tuic' ]]; then
+    type='tuic'
+  elif [[ ${config[transport]} == 'hysteria2' ]]; then
+    type='hysteria2'
+  elif [[ ${config[transport]} == 'shadowtls' ]]; then
+    type='shadowtls'
+  elif [[ ${config[transport]} == 'anytls' ]]; then
+    type='anytls'
+  else
+    type='vless'
+  fi
+  if [[ (${config[security]} == 'reality' || ${config[transport]} == 'shadowtls') && ${config[camouflage]} =~ ":" ]]; then
+    reality_port="${config[camouflage]#*:}"
+  fi
+  if [[ ${config[core]} == 'sing-box' ]]; then
+    reality_object='"tls": {
+      "enabled": true,
+      "server_name": "'"${config[domain]%%:*}"'",
+      "alpn": [],
+      "reality": {
+        "enabled": true,
+        "handshake": {
+          "server": "'"${camouflage_host}"'",
+          "server_port": '"${reality_port}"'
+        },
+        "private_key": "'"${config[private_key]}"'",
+        "short_id": ["'"${config[short_id]}"'"],
+        "max_time_difference": "1m"
+      }
+    }'
+    tls_object='"tls": {
+      "enabled": true,
+      "certificate_path": "/etc/sing-box/server.crt",
+      "key_path": "/etc/sing-box/server.key"
+    }'
+    if [[ ${config[warp]} == 'ON' ]]; then
+      warp_object='{
+        "type": "wireguard",
+        "tag": "warp",
+        "system": false,
+        "name": "wg0",
+        "mtu": 1280,
+        "address": [
+          "'"${config[warp_interface_ipv4]}"'/32",
+          "'"${config[warp_interface_ipv6]}"'/128"
+        ],
+        "private_key": "'"${config[warp_private_key]}"'",
+        "listen_port": 0,
+        "peers": [
+          {
+            "address": "engage.cloudflareclient.com",
+            "port": 2408,
+            "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+            "allowed_ips": [
+              "0.0.0.0/0"
+            ],
+            "persistent_keepalive_interval": 30,
+            "reserved": '"$(warp_decode_reserved "${config[warp_client_id]}")"'
+          }
+        ]
+      }'
+
+    fi
+    for user in "${!users[@]}"; do
+      if [ -n "$users_object" ]; then
+        users_object="${users_object},"$'\n'
+      fi
+      if [[ ${config[transport]} == 'tuic' ]]; then
+        users_object=${users_object}'{"uuid": "'"${users[${user}]}"'", "password": "'"$(echo -n "${user}${users[${user}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)"'", "name": "'"${user}"'"}'
+      elif [[ ${config[transport]} == 'hysteria2' || ${config[transport]} == 'anytls' ]]; then
+        users_object=${users_object}'{"password": "'"$(echo -n "${user}${users[${user}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)"'", "name": "'"${user}"'"}'
+      elif [[ ${config[transport]} == 'shadowtls' ]]; then
+        users_object=${users_object}'{"password": "'"${users[${user}]}"'", "name": "'"${user}"'"}'
+      else
+        users_object=${users_object}'{"uuid": "'"${users[${user}]}"'", "flow": "'"$([[ ${config[transport]} == 'tcp' ]] && echo 'xtls-rprx-vision' || true)"'", "name": "'"${user}"'"}'
+      fi
+      if [[ -n ${config[ss_port]} ]]; then
+        if [ -n "$ss_users_object" ]; then
+          ss_users_object="${ss_users_object},"$'\n'
+        fi
+        ss_users_object=${ss_users_object}'{"name": "'"${user}"'", "password": "'"$(ss2022_user_key "${user}" "${users[${user}]}")"'"}'
+      fi
+    done
+    # Remote rule-sets are fetched through an explicitly declared HTTP client.
+    # Its "detour" key must stay empty: the only candidate is "internet", which
+    # is always a bare direct outbound here (WARP is an endpoint, not an
+    # outbound), and sing-box 1.14 aborts at *startup* on that with
+    #   FATAL start service: ... Get "https://...srs": detour to an empty
+    #   direct outbound makes no sense
+    # Measured against sing-box v1.14.1: declaring the client without a detour
+    # starts cleanly with no warning; the old download_detour key still works
+    # but warns; a detour to "internet" sends the engine into a restart loop;
+    # and omitting the client warns "implicit default HTTP client ... deprecated".
+    # "sing-box check" accepts all four, so this has to be validated with "run".
+    cat >"${path[engine]}" <<EOF
+{
+  "log": {
+    "level": "error",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+    $([[ ${config[safenet]} == ON ]] && echo '{"type": "tcp", "server": "1.1.1.3"}' || echo '{"type": "tcp", "server": "1.1.1.1"}')
+    ],
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "${type}",
+      "tag": "in",	
+      "listen": "::",
+      "listen_port": 443,
+      "users": [${users_object}],
+      $(if [[ ${config[security]} == 'reality' && ${config[transport]} != 'shadowtls' ]]; then
+        echo "${reality_object}"
+      elif [[ ${config[transport]} == 'http' || ${config[transport]} == 'tcp' || ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' || ${config[transport]} == 'anytls' ]]; then
+        echo "${tls_object}"
+      elif [[ ${config[transport]} == 'shadowtls' ]]; then
+        :
+      else
+        echo '"tls":{"enabled": false}'
+      fi)
+      $(if [[ ${config[transport]} == http ]]; then
+      echo ',"transport": {"type": "http", "host": ["'"${config[server]}"'"], "path": "/'"${config[service_path]}"'"}'
+      fi
+      if [[ ${config[transport]} == grpc ]]; then
+      echo ',"transport": {"type": "grpc","service_name": "'"${config[service_path]}"'"}'
+      fi 
+      if [[ ${config[transport]} == ws ]]; then
+      echo ',"transport": {"type": "ws", "headers": {"Host": "'"${config[server]}"'"}, "path": "/'"${config[service_path]}"'"}'
+      fi
+      if [[ ${config[transport]} == tuic ]]; then
+      echo ',"congestion_control": "'"${config[tuic_congestion]}"'", "auth_timeout": "3s", "zero_rtt_handshake": false, "heartbeat": "10s"'
+      fi
+      if [[ ${config[transport]} == hysteria2 ]]; then
+      echo ',"obfs": {"type": "salamander", "password": "'"${config[service_path]}"'"}'"${hysteria2_bandwidth}"', "masquerade": "https://'"${config[server]}:${config[port]}"'"'
+      fi
+      if [[ ${config[transport]} == shadowtls ]]; then
+      echo '"version": 3, "strict_mode": false, "detour": "shadowsocks", "handshake": {"server": "'"${camouflage_host}"'", "server_port": '"${reality_port}"'}'
+      fi
+      )
+    }
+    $(if [[ ${config[transport]} == 'shadowtls' ]]; then
+    echo ', {
+      "type": "shadowsocks",
+      "tag": "shadowsocks",
+      "listen": "127.0.0.1",
+      "listen_port": 8444,
+      "method": "chacha20-ietf-poly1305",
+      "password": "'"${config[private_key]}"'",
+      "users": ['"${users_object}"']
+    }'
+    fi )
+    $(if [[ -n ${config[ss_port]} ]]; then
+    echo ', {
+      "type": "shadowsocks",
+      "tag": "ss",
+      "listen": "::",
+      "listen_port": '"${config[ss_port]}"',
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "'"${config[ss_key]}"'",
+      "users": ['"${ss_users_object}"']
+    }'
+    fi )
+  ],
+  $([[ ${config[warp]} == ON ]] && echo '"endpoints": ['"${warp_object}"'],' || true)
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "internet"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "http_clients": [
+    {
+      "tag": "internet"
+    }
+  ],
+  "route": {
+    "final": "$([[ ${config[warp]} == ON ]] && echo "warp" || echo "internet")",
+    "default_http_client": "internet",
+    "rule_set": [
+      {
+        "tag": "block",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
+        "http_client": "internet"
+      },
+      {
+        "tag": "nsfw",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-porn.srs",
+        "http_client": "internet"
+      },
+      {
+        "tag": "geosite-private",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-private.srs",
+        "http_client": "internet"
+      },
+      {
+        "tag": "bypass",
+        "type": "remote",
+        "format": "binary",
+        "url": "${ruleset_base_url}/bypass.srs",
+        "http_client": "internet"
+      }
+    ],
+    "rules": [
+      {
+        "inbound": "in",
+        "action": "resolve",
+        "strategy": "prefer_ipv4"
+      },
+      {
+        "inbound": "in",
+        "action": "sniff",
+        "timeout": "300ms"
+      },
+    $(if [[ ${config[transport]} == 'shadowtls' ]]; then
+    echo '{
+        "inbound": "shadowsocks",
+        "action": "resolve",
+        "strategy": "prefer_ipv4"
+      },
+      {
+        "inbound": "shadowsocks",
+        "action": "sniff",
+        "timeout": "300ms"
+      },'
+    fi )
+      {
+        "rule_set": [
+          "block",
+          "geosite-private"
+          $([[ ${config[safenet]} == ON ]] && echo ',"nsfw"' || true)
+          $([[ ${config[warp]} == OFF ]] && echo ',"bypass"')
+        ],
+        "action": "reject"
+      },
+      {
+        "ip_cidr": ${private_ip_cidr},
+        "action": "reject"
+      },
+      {
+        "network": "tcp",
+        "port": [
+          25,
+          587,
+          465,
+          2525
+        ],
+        "action": "reject"
+      }
+    ]
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true
+    }
+  }
+}
+EOF
+  fi
+  if [[ ${config[core]} == 'xray' ]]; then
+    reality_object='"security":"reality",
+    "realitySettings":{
+      "show": false,
+      "dest": "'"${camouflage_host}"':'"${reality_port}"'",
+      "xver": 0,
+      "serverNames": ["'"${config[domain]%%:*}"'"],
+      "privateKey": "'"${config[private_key]}"'",
+      "maxTimeDiff": 60000,
+      "shortIds": ["'"${config[short_id]}"'"]
+    }'
+    tls_object='"security": "tls",
+    "tlsSettings": {
+      "certificates": [{
+        "oneTimeLoading": true,
+        "certificateFile": "/etc/xray/server.crt",
+        "keyFile": "/etc/xray/server.key"
+      }]
+    }'
+    if [[ ${config[warp]} == 'ON' ]]; then
+      warp_object='{
+        "protocol": "wireguard",
+        "tag": "warp",
+        "settings": {
+          "secretKey": "'"${config[warp_private_key]}"'",
+          "address": [
+            "'"${config[warp_interface_ipv4]}"'/32",
+            "'"${config[warp_interface_ipv6]}"'/128"
+          ],
+          "peers": [
+            {
+              "endpoint": "engage.cloudflareclient.com:2408",
+              "publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+            }
+          ],
+          "mtu": 1280
+        }
+      },'
+    fi
+    for user in "${!users[@]}"; do
+      if [ -n "$users_object" ]; then
+        users_object="${users_object},"$'\n'
+      fi
+      users_object=${users_object}'{"id": "'"${users[${user}]}"'", "flow": "'"$([[ ${config[transport]} == 'tcp' ]] && echo 'xtls-rprx-vision' || true)"'", "email": "'"${user}"'"}'
+    done
+    cat >"${path[engine]}" <<EOF
+{
+  "log": {
+    "loglevel": "error"
+  },
+  "dns": {
+    "servers": [$([[ ${config[safenet]} == ON ]] && echo '"tcp+local://1.1.1.3","tcp+local://1.0.0.3"' || echo '"tcp+local://1.1.1.1","tcp+local://1.0.0.1"')]
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "tag": "inbound",
+      "settings": {
+        "clients": [${users_object}],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        $([[ ${config[transport]} == 'tcp' ]] && echo '"tcpSettings": {"header": {"type": "none"}},' || true)
+        $([[ ${config[transport]} == 'grpc' ]] && echo '"grpcSettings": {"serviceName": "'"${config[service_path]}"'"},' || true)
+        $([[ ${config[transport]} == 'ws' ]] && echo '"wsSettings": {"headers": {"Host": "'"${config[server]}"'"}, "path": "/'"${config[service_path]}"'"},' || true)
+        $([[ ${config[transport]} == 'http' ]] && echo '"xhttpSettings": {"host":"'"${config[server]}"'", "path": "/'"${config[service_path]}"'"},' || true)
+        $([[ ${config[transport]} == 'http' ]] && echo '"network": "xhttp",' || echo '"network": "'"${config[transport]}"'",' )
+        $(if [[ ${config[security]} == 'reality' ]]; then
+          echo "${reality_object}"
+        elif [[ ${config[transport]} == 'http' || ${config[transport]} == 'tcp' ]]; then
+          echo "${tls_object}"
+        else
+          echo '"security":"none"'
+        fi)
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls"
+        ]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "internet"
+    },
+    $([[ ${config[warp]} == ON ]] && echo "${warp_object}" || true)
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "ip": [
+          $([[ ${config[warp]} == OFF ]] && echo '"geoip:cn", "geoip:ir",')
+          "0.0.0.0/8",
+          "10.0.0.0/8",
+          "100.64.0.0/10",
+          "127.0.0.0/8",
+          "169.254.0.0/16",
+          "172.16.0.0/12",
+          "192.0.0.0/24",
+          "192.0.2.0/24",
+          "192.168.0.0/16",
+          "198.18.0.0/15",
+          "198.51.100.0/24",
+          "203.0.113.0/24",
+          "::1/128",
+          "fc00::/7",
+          "fe80::/10",
+          "geoip:private"
+        ],
+        "outboundTag": "block"
+      },
+      {
+        "type": "field",
+        "port": "25, 587, 465, 2525",
+        "network": "tcp",
+        "outboundTag": "block"
+      },
+      {
+        "type": "field",
+        "protocol": ["bittorrent"],
+        "outboundTag": "block"
+      },
+      {
+        "type": "field",
+        "outboundTag": "block",
+        "domain": [
+          $([[ ${config[safenet]} == ON ]] && echo '"geosite:category-porn",' || true)
+          "geosite:category-ads-all",
+          "domain:pushnotificationws.com",
+          "domain:sunlight-leds.com",
+          "domain:icecyber.org"
+        ]
+      },
+      {
+        "type": "field",
+        "inboundTag": "inbound",
+        "outboundTag": "$([[ ${config[warp]} == ON ]] && echo "warp" || echo "internet")"
+      }
+    ]
+  },
+  "policy": {
+    "levels": {
+      "0": {
+        "handshake": 2,
+        "connIdle": 120
+      }
+    }
+  }
+}
+EOF
+  fi
+  if [[ -r ${config_path}/${config[core]}.patch ]]; then
+    if ! jq empty ${config_path}/${config[core]}.patch; then
+      echo "${config[core]}.patch is not a valid json file. Fix it or remove it!"
+      exit 1
+    fi
+    temp_file=$(mktemp)
+    jq -s add ${path[engine]} ${config_path}/${config[core]}.patch > ${temp_file}
+    mv ${temp_file} ${path[engine]}
+  fi
+}
+
+function generate_config {
+  generate_docker_compose
+  generate_engine_config
+  generate_website
+  generate_haproxy_config
+  mkdir -p "${config_path}/certificate"
+  if engine_owns_tls; then
+    # nginx terminates the website TLS here, so it needs the certificate too.
+    generate_nginx_config
+  fi
+  if [[ ! -r "${path[server_pem]}" || ! -r "${path[server_crt]}" || ! -r "${path[server_key]}" ]]; then
+    generate_selfsigned_certificate
+  fi
+  if needs_certbot; then
+    mkdir -p "${config_path}/certbot"
+    generate_certbot_deployhook
+    generate_certbot_dockerfile
+    generate_certbot_script
+  fi
+  if [[ ${config[tgbot]} == "ON" ]]; then
+    mkdir -p "${config_path}/tgbot"
+    generate_tgbot_compose
+    generate_tgbot_dockerfile
+    # A failed refresh must not abort the whole run: keep the copy from the
+    # previous installation and only warn.
+    if ! download_tgbot_script; then
+      if [[ -s ${path[tgbot_script]} ]]; then
+        echo "Warning: could not refresh tgbot.py, keeping the existing copy." >&2
+      else
+        echo "Warning: could not download tgbot.py, the Telegram bot image cannot be built." >&2
+      fi
+    fi
+  fi
+  # Unconditional, and deliberately outside the bot branch above: this copy is the
+  # entry point the documentation points operators at, and the bot container mount
+  # picks it up as well. Failing to place it is a warning, not an error - the stack
+  # is already configured by the time this runs.
+  if ! install_local_script_copy; then
+    echo "Warning: could not place reality.sh in ${config_path}; save this script to a file and run it again to retry." >&2
+  fi
+}
+
+function get_ipv6 {
+  curl -fsSL -m 3 --ipv6 https://cloudflare.com/cdn-cgi/trace 2> /dev/null | grep ip | cut -d '=' -f2
+}
+
+function print_client_configuration {
+  local username=$1
+  local client_config
+  local ipv6
+  local client_config_ipv6
+  local ss_config=''
+  local ss_config_ipv6=''
+  if [[ ${config[transport]} == 'tuic' ]]; then
+    client_config="tuic://"
+    client_config="${client_config}${users[${username}]}"
+    client_config="${client_config}:$(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)"
+    client_config="${client_config}@${config[server]}"
+    client_config="${client_config}:${config[port]}"
+    client_config="${client_config}/?congestion_control=${config[tuic_congestion]}&udp_relay_mode=quic"
+    client_config="${client_config}$([[ ${config[security]} == 'selfsigned' ]] && echo "&allow_insecure=1" || true)"
+    client_config="${client_config}#${username}"
+  elif [[ ${config[transport]} == 'hysteria2' ]]; then
+    client_config="hy2://"
+    client_config="${client_config}$(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)"
+    client_config="${client_config}@${config[server]}"
+    client_config="${client_config}:${config[port]}"
+    client_config="${client_config}/?obfs=salamander&obfs-password=${config[service_path]}"
+    client_config="${client_config}$([[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]] && echo "&up=${config[hysteria2_up]}&down=${config[hysteria2_down]}" || true)"
+    client_config="${client_config}$([[ ${config[security]} == 'selfsigned' ]] && echo "&insecure=1" || true)"
+    client_config="${client_config}#${username}"
+  elif [[ ${config[transport]} == 'anytls' ]]; then
+    client_config="anytls://"
+    client_config="${client_config}$(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)"
+    client_config="${client_config}@${config[server]}"
+    client_config="${client_config}:${config[port]}"
+    client_config="${client_config}/?sni=${config[domain]%%:*}"
+    client_config="${client_config}$([[ ${config[security]} == 'selfsigned' ]] && echo "&insecure=1" || true)"
+    client_config="${client_config}#${username}"
+  elif [[ ${config[transport]} == 'shadowtls' ]]; then
+    client_config='{"dns":{"independent_cache":true,"rules":[{"domain":["dns.google"],"server":"dns-direct"}],"servers":[{"address":"https://dns.google/dns-query","address_resolver":"dns-direct","strategy":"ipv4_only","tag":"dns-remote"},{"address":"local","address_resolver":"dns-local","detour":"direct","strategy":"ipv4_only","tag":"dns-direct"},{"address":"local","detour":"direct","tag":"dns-local"},{"address":"rcode://success","tag":"dns-block"}]},"inbounds":[{"listen":"127.0.0.1","listen_port":6450,"override_address":"8.8.8.8","override_port":53,"tag":"dns-in","type":"direct"},{"domain_strategy":"","endpoint_independent_nat":true,"inet4_address":["172.19.0.1/28"],"mtu":9000,"sniff":true,"sniff_override_destination":false,"stack":"mixed","tag":"tun-in","auto_route":true,"type":"tun"},{"domain_strategy":"","listen":"127.0.0.1","listen_port":2080,"sniff":true,"sniff_override_destination":false,"tag":"mixed-in","type":"mixed"}],"log":{"level":"warning"},"outbounds":[{"method":"chacha20-ietf-poly1305","password":"'"${users[${username}]}"'","server":"127.0.0.1","server_port":1080,"type":"shadowsocks","udp_over_tcp":true,"domain_strategy":"","tag":"proxy","detour":"shadowtls"},{"password":"'"${users[${username}]}"'","server":"'"${config[server]}"'","server_port":'"${config[port]}"',"tls":{"enabled":true,"insecure":false,"server_name":"'"${config[domain]%%:*}"'","utls":{"enabled":true,"fingerprint":"chrome"}},"version":3,"type":"shadowtls","domain_strategy":"","tag":"shadowtls"},{"tag":"direct","type":"direct"},{"tag":"bypass","type":"direct"},{"tag":"block","type":"block"},{"tag":"dns-out","type":"dns"}],"route":{"auto_detect_interface":true,"rule_set":[],"rules":[{"outbound":"dns-out","port":[53]},{"inbound":["dns-in"],"outbound":"dns-out"},{"ip_cidr":["224.0.0.0/3","ff00::/8"],"outbound":"block","source_ip_cidr":["224.0.0.0/3","ff00::/8"]}]}}'
+  else
+    client_config="vless://"
+    client_config="${client_config}${users[${username}]}"
+    client_config="${client_config}@${config[server]}"
+    client_config="${client_config}:${config[port]}"
+    client_config="${client_config}?security=$([[ ${config[security]} == 'reality' ]] && echo reality || echo tls)"
+    client_config="${client_config}&encryption=none"
+    client_config="${client_config}&alpn=$([[ ${config[transport]} == 'ws' ]] && echo 'http/1.1' || echo 'h2,http/1.1')"
+    client_config="${client_config}&headerType=none"
+    client_config="${client_config}&fp=chrome"
+    client_config="${client_config}$([[ ${config[security]} == 'selfsigned' ]] && echo "&allowInsecure=1" || true)"
+    client_config="${client_config}&type=$([[ ${config[core]} == 'xray' && ${config[transport]} == 'http' ]] && echo 'xhttp' || echo "${config[transport]}")"
+    client_config="${client_config}&flow=$([[ ${config[transport]} == 'tcp' ]] && echo 'xtls-rprx-vision' || true)"
+    client_config="${client_config}&sni=${config[domain]%%:*}"
+    client_config="${client_config}$([[ ${config[transport]} == 'ws' || ${config[transport]} == 'http' ]] && echo "&host=${config[server]}" || true)"
+    client_config="${client_config}$([[ ${config[security]} == 'reality' ]] && echo "&pbk=${config[public_key]}" || true)"
+    client_config="${client_config}$([[ ${config[security]} == 'reality' ]] && echo "&sid=${config[short_id]}" || true)"
+    client_config="${client_config}$([[ ${config[transport]} == 'ws' || ${config[transport]} == 'http' ]] && echo "&path=%2F${config[service_path]}" || true)"
+    client_config="${client_config}$([[ ${config[transport]} == 'grpc' ]] && echo '&mode=gun' || true)"
+    client_config="${client_config}$([[ ${config[transport]} == 'grpc' ]] && echo "&serviceName=${config[service_path]}" || true)"
+    client_config="${client_config}#${username}"
+  fi
+  if [[ -n ${config[ss_port]} ]]; then
+    ss_config="ss://$(printf '%s' "2022-blake3-aes-128-gcm:$(ss2022_user_key "${username}" "${users[${username}]}")" | base64 | tr -d '\n')@${config[server]}:${config[ss_port]}#${username}-ss"
+  fi
+  echo ""
+  echo "=================================================="
+  echo "Client configuration:"
+  echo ""
+  echo "$client_config"
+  echo ""
+  echo "Or you can scan the QR code:"
+  echo ""
+  qrencode -t ansiutf8 "${client_config}"
+  if [[ -n ${ss_config} ]]; then
+    echo ""
+    echo "==================Shadowsocks 2022======================"
+    echo "Client configuration:"
+    echo ""
+    echo "${ss_config}"
+    echo ""
+    echo "Or you can scan the QR code:"
+    echo ""
+    qrencode -t ansiutf8 "${ss_config}"
+  fi
+  ipv6=$(get_ipv6)
+  if [[ -n $ipv6 ]]; then
+    if [[ ${config[transport]} != 'shadowtls' ]]; then
+      client_config_ipv6=$(echo "$client_config" | sed "s/@${config[server]//./\\.}:/@[${ipv6}]:/" | sed "s/#${username}/#${username}-ipv6/")
+    else
+      client_config_ipv6=$(echo "$client_config" | sed "s/\"server\":\"${config[server]//./\\.}\"/\"server\":\"${ipv6}\"/")
+    fi
+    if [[ -n ${ss_config} ]]; then
+      ss_config_ipv6=$(echo "$ss_config" | sed "s/@${config[server]//./\\.}:/@[${ipv6}]:/" | sed "s/#${username}-ss/#${username}-ss-ipv6/")
+    fi
+    echo ""
+    echo "==================IPv6 Config======================"
+    echo "Client configuration:"
+    echo ""
+    echo "$client_config_ipv6"
+    echo ""
+    echo "Or you can scan the QR code:"
+    echo ""
+    qrencode -t ansiutf8 "${client_config_ipv6}"
+    if [[ -n ${ss_config_ipv6} ]]; then
+      echo ""
+      echo "Client configuration (Shadowsocks 2022):"
+      echo ""
+      echo "${ss_config_ipv6}"
+      echo ""
+      qrencode -t ansiutf8 "${ss_config_ipv6}"
+    fi
+  fi
+}
+
+# Multi-format client export (--format). The URI form stays the default; the
+# other formats translate the very same server-side parameters into the shape a
+# given client expects, so nothing has to be typed in by hand.
+function client_export_params {
+  client_uuid="${users[${username}]}"
+  client_host="${config[server]}"
+  client_port="${config[port]}"
+  client_sni="${config[domain]%%:*}"
+  client_password=$(echo -n "${username}${client_uuid}" | sha256sum | cut -d ' ' -f 1 | head -c 16)
+  client_insecure="false"
+  if [[ ${config[security]} == 'selfsigned' ]]; then
+    client_insecure="true"
+  fi
+}
+
+function client_singbox_outbound {
+  local bandwidth_object=''
+  local transport_object=''
+  local flow_object=''
+  if [[ ${config[transport]} == 'tuic' ]]; then
+    echo '{"type": "tuic", "tag": "proxy", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "uuid": "'"${client_uuid}"'", "password": "'"${client_password}"'", "congestion_control": "'"${config[tuic_congestion]}"'", "udp_relay_mode": "quic", "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "insecure": '"${client_insecure}"', "alpn": ["h3"]}}'
+  elif [[ ${config[transport]} == 'hysteria2' ]]; then
+    if [[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]]; then
+      bandwidth_object=', "up_mbps": '"${config[hysteria2_up]}"', "down_mbps": '"${config[hysteria2_down]}"''
+    fi
+    echo '{"type": "hysteria2", "tag": "proxy", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "password": "'"${client_password}"'"'"${bandwidth_object}"', "obfs": {"type": "salamander", "password": "'"${config[service_path]}"'"}, "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "insecure": '"${client_insecure}"'}}'
+  elif [[ ${config[transport]} == 'anytls' ]]; then
+    echo '{"type": "anytls", "tag": "proxy", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "password": "'"${client_password}"'", "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "insecure": '"${client_insecure}"', "utls": {"enabled": true, "fingerprint": "chrome"}}}'
+  elif [[ ${config[transport]} == 'shadowtls' ]]; then
+    return 1
+  else
+    if [[ ${config[transport]} == 'ws' ]]; then
+      transport_object=', "transport": {"type": "ws", "path": "/'"${config[service_path]}"'", "headers": {"Host": "'"${client_host}"'"}}'
+    elif [[ ${config[transport]} == 'grpc' ]]; then
+      transport_object=', "transport": {"type": "grpc", "service_name": "'"${config[service_path]}"'"}'
+    elif [[ ${config[transport]} == 'http' ]]; then
+      transport_object=', "transport": {"type": "http", "host": ["'"${client_host}"'"], "path": "/'"${config[service_path]}"'"}'
+    fi
+    if [[ ${config[transport]} == 'tcp' && ${config[security]} == 'reality' ]]; then
+      flow_object=', "flow": "xtls-rprx-vision"'
+    fi
+    if [[ ${config[security]} == 'reality' ]]; then
+      echo '{"type": "vless", "tag": "proxy", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "uuid": "'"${client_uuid}"'", "packet_encoding": "xudp"'"${flow_object}"', "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "utls": {"enabled": true, "fingerprint": "chrome"}, "reality": {"enabled": true, "public_key": "'"${config[public_key]}"'", "short_id": "'"${config[short_id]}"'"}}'"${transport_object}"'}'
+    else
+      echo '{"type": "vless", "tag": "proxy", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "uuid": "'"${client_uuid}"'", "packet_encoding": "xudp"'"${flow_object}"', "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "insecure": '"${client_insecure}"', "utls": {"enabled": true, "fingerprint": "chrome"}}'"${transport_object}"'}'
+    fi
+  fi
+}
+
+function client_v2ray_outbound {
+  local flow_object=''
+  local stream_object=''
+  if [[ ${config[transport]} == 'tcp' ]]; then
+    stream_object='"tcpSettings": {"header": {"type": "none"}}'
+  elif [[ ${config[transport]} == 'ws' ]]; then
+    stream_object='"wsSettings": {"path": "/'"${config[service_path]}"'", "headers": {"Host": "'"${client_host}"'"}}'
+  elif [[ ${config[transport]} == 'grpc' ]]; then
+    stream_object='"grpcSettings": {"serviceName": "'"${config[service_path]}"'"}'
+  elif [[ ${config[transport]} == 'http' ]]; then
+    stream_object='"xhttpSettings": {"host": "'"${client_host}"'", "path": "/'"${config[service_path]}"'"}'
+  else
+    return 1
+  fi
+  if [[ ${config[transport]} == 'tcp' && ${config[security]} == 'reality' ]]; then
+    flow_object=', "flow": "xtls-rprx-vision"'
+  fi
+  if [[ ${config[security]} == 'reality' ]]; then
+    echo '{"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{"address": "'"${client_host}"'", "port": '"${client_port}"', "users": [{"id": "'"${client_uuid}"'", "encryption": "none"'"${flow_object}"'}]}]}, "streamSettings": {"network": "'"$([[ ${config[transport]} == 'http' ]] && echo xhttp || echo "${config[transport]}")"'", "security": "reality", "realitySettings": {"serverName": "'"${client_sni}"'", "fingerprint": "chrome", "publicKey": "'"${config[public_key]}"'", "shortId": "'"${config[short_id]}"'"}, '"${stream_object}"'}}'
+  else
+    echo '{"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{"address": "'"${client_host}"'", "port": '"${client_port}"', "users": [{"id": "'"${client_uuid}"'", "encryption": "none"'"${flow_object}"'}]}]}, "streamSettings": {"network": "'"$([[ ${config[transport]} == 'http' ]] && echo xhttp || echo "${config[transport]}")"'", "security": "tls", "tlsSettings": {"serverName": "'"${client_sni}"'", "allowInsecure": '"${client_insecure}"', "fingerprint": "chrome"}, '"${stream_object}"'}}'
+  fi
+}
+
+function client_clash_proxy {
+  local insecure_yaml='false'
+  local up_down_yaml=''
+  if [[ ${config[security]} == 'selfsigned' ]]; then
+    insecure_yaml='true'
+  fi
+  if [[ ${config[transport]} == 'tuic' ]]; then
+    echo "- name: \"${username}\"
+  type: tuic
+  server: ${client_host}
+  port: ${client_port}
+  uuid: ${client_uuid}
+  password: ${client_password}
+  udp-relay-mode: quic
+  congestion-controller: ${config[tuic_congestion]}
+  sni: ${client_sni}
+  alpn: [h3]
+  skip-cert-verify: ${insecure_yaml}"
+  elif [[ ${config[transport]} == 'hysteria2' ]]; then
+    if [[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]]; then
+      up_down_yaml="
+  up: \"${config[hysteria2_up]} Mbps\"
+  down: \"${config[hysteria2_down]} Mbps\""
+    fi
+    echo "- name: \"${username}\"
+  type: hysteria2
+  server: ${client_host}
+  port: ${client_port}
+  password: ${client_password}
+  obfs: salamander
+  obfs-password: ${config[service_path]}
+  sni: ${client_sni}
+  skip-cert-verify: ${insecure_yaml}${up_down_yaml}"
+  elif [[ ${config[transport]} == 'anytls' ]]; then
+    echo "- name: \"${username}\"
+  type: anytls
+  server: ${client_host}
+  port: ${client_port}
+  password: ${client_password}
+  sni: ${client_sni}
+  skip-cert-verify: ${insecure_yaml}"
+  elif [[ ${config[transport]} == 'shadowtls' ]]; then
+    return 1
+  else
+    local opts_yaml=''
+    local flow_yaml=''
+    if [[ ${config[transport]} == 'ws' ]]; then
+      opts_yaml="
+  ws-opts:
+    path: /${config[service_path]}
+    headers:
+      Host: ${client_host}"
+    elif [[ ${config[transport]} == 'grpc' ]]; then
+      opts_yaml="
+  grpc-opts:
+    grpc-service-name: ${config[service_path]}"
+    fi
+    if [[ ${config[transport]} == 'tcp' && ${config[security]} == 'reality' ]]; then
+      flow_yaml="
+  flow: xtls-rprx-vision"
+    fi
+    echo "- name: \"${username}\"
+  type: vless
+  server: ${client_host}
+  port: ${client_port}
+  uuid: ${client_uuid}
+  network: $([[ ${config[transport]} == 'http' ]] && echo xhttp || echo "${config[transport]}")
+  tls: true
+  servername: ${client_sni}
+  client-fingerprint: chrome${flow_yaml}
+  $([[ ${config[security]} == 'reality' ]] && echo "reality-opts:
+    public-key: ${config[public_key]}
+    short-id: ${config[short_id]}" || echo "skip-cert-verify: ${insecure_yaml}")${opts_yaml}"
+  fi
+}
+
+function print_client_configuration_formatted {
+  local username=$1
+  local outbound
+  client_export_params
+  case ${args[format]} in
+    clash)
+      if [[ ${config[transport]} == 'shadowtls' ]]; then
+        echo 'The clash format cannot express the shadowtls chain; use --format singbox or json.'
+        return 1
+      fi
+      echo "proxies:"
+      client_clash_proxy
+      ;;
+    singbox)
+      if [[ ${config[transport]} == 'shadowtls' ]]; then
+        print_client_configuration "${username}"
+        return 0
+      fi
+      client_singbox_outbound
+      ;;
+    v2ray)
+      if ! client_v2ray_outbound; then
+        echo 'The v2ray format only covers the vless transports (tcp / ws / grpc / http); use --format singbox for this one.'
+        return 1
+      fi
+      ;;
+    json)
+      if [[ ${config[transport]} == 'shadowtls' ]]; then
+        print_client_configuration "${username}"
+        return 0
+      fi
+      outbound=$(client_singbox_outbound)
+      echo '{
+  "log": {"level": "info"},
+  "inbounds": [
+    {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080}
+  ],
+  "outbounds": [
+    '"${outbound}"'
+  ],
+  "route": {"final": "proxy"}
+}'
+      ;;
+  esac
+}
+
+function migrate_legacy_install {
+  # Releases before this one kept everything in /opt/reality-ezpz. The tree is
+  # moved rather than copied because it holds the Reality key pair, the short id,
+  # the user list and the website; regenerating them would invalidate every
+  # client that is already configured.
+  #
+  # The containers of the old compose project are removed first: their names are
+  # derived from the project name (reality-ezpz-engine-1, ...), so the new
+  # project would otherwise fail to publish 443/8080 while the old ones keep
+  # holding those ports.
+  # The legacy path is a parameter only so the regression suite can point it at a
+  # scratch directory instead of the real /opt; the single caller omits it.
+  local legacy_config_path="${1:-/opt/reality-ezpz}"
+  if [[ ! -e ${legacy_config_path}/config ]]; then
+    return 0
+  fi
+  if [[ -e ${config_path} ]]; then
+    echo "Warning: both ${legacy_config_path} and ${config_path} exist. Keeping ${config_path}; remove the old directory manually to silence this warning." >&2
+    return 0
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    if docker compose >/dev/null 2>&1; then
+      docker compose --project-directory "${legacy_config_path}" -p 'reality-ezpz' down --remove-orphans --timeout 2 >/dev/null 2>&1 || true
+    elif command -v docker-compose >/dev/null 2>&1; then
+      docker-compose --project-directory "${legacy_config_path}" -p 'reality-ezpz' down --remove-orphans --timeout 2 >/dev/null 2>&1 || true
+    fi
+  fi
+  if ! mv "${legacy_config_path}" "${config_path}"; then
+    echo "Could not move ${legacy_config_path} to ${config_path}. Move it by hand (mv ${legacy_config_path} ${config_path}) and run this script again." >&2
+    exit 1
+  fi
+  # The kernel tuning drop-in was renamed as well. Leaving the old one behind
+  # would keep applying its BBR settings even after BBR has been switched off.
+  rm -f '/etc/sysctl.d/99-reality-ezpz.conf'
+  echo "An installation from an older release was found in ${legacy_config_path}: it has been moved to ${config_path}, and its containers are recreated under the new project name."
+  return 0
+}
+
+function upgrade {
+  local uuid
+  local warp_token
+  local warp_id
+  if [[ -e "${HOME}/reality/config" ]]; then
+    ${docker_cmd} --project-directory "${HOME}/reality" down --remove-orphans --timeout 2
+    mv -f "${HOME}/reality" ${config_path}
+  fi
+  uuid=$(grep '^uuid=' "${path[config]}" 2>/dev/null | cut -d= -f2 || true)
+  if [[ -n $uuid ]]; then
+    sed -i '/^uuid=/d' "${path[users]}"
+    echo "Reality=${uuid}" >> "${path[users]}"
+  fi
+  rm -f "${config_path}/xray.conf"
+  rm -f "${config_path}/singbox.conf"
+  if ! ${docker_cmd} ls | grep ${compose_project} >/dev/null && [[ -r ${path[compose]} ]]; then
+    ${docker_cmd} --project-directory ${config_path} down --remove-orphans --timeout 2
+  fi
+  if [[ -r ${path[config]} ]]; then
+    sed -i 's|transport=h2|transport=http|g' "${path[config]}"
+    sed -i 's|core=singbox|core=sing-box|g' "${path[config]}"
+    sed -i 's|security=tls-invalid|security=selfsigned|g' "${path[config]}"
+    sed -i 's|security=tls-valid|security=letsencrypt|g' "${path[config]}"
+    # Boolean settings used to be persisted as true/false in the config file.
+    # Normalise them to ON/OFF, otherwise every `== 'ON'` comparison silently
+    # evaluates to false after an upgrade.
+    sed -i 's|=true$|=ON|; s|=false$|=OFF|' "${path[config]}"
+    # The default proxy port moved from 8443 to 443, because the website now
+    # shares that port. 8443 is the value every previous default install wrote,
+    # so it is migrated once; any other port is a deliberate choice and stays.
+    if grep -qx 'port=8443' "${path[config]}"; then
+      sed -i 's|^port=8443$|port=443|' "${path[config]}"
+      echo 'The default proxy port moved from 8443 to 443 (the website now shares it); port=8443 has been migrated. Pick another port from the menu if you prefer.'
+    fi
+  fi
+  for key in "${!path[@]}"; do
+    if [[ -d "${path[$key]}" ]]; then
+      rm -rf "${path[$key]}"
+    fi
+  done
+  if [[ -d "${config_path}/warp" ]]; then
+    ${docker_cmd} --project-directory ${config_path} -p ${compose_project} down --remove-orphans --timeout 2 || true
+    warp_token=$(cat ${config_path}/warp/reg.json | jq -r '.api_token')
+    warp_id=$(cat ${config_path}/warp/reg.json | jq -r '.registration_id')
+    warp_api "DELETE" "/reg/${warp_id}" "" "${warp_token}" >/dev/null 2>&1 || true
+    rm -rf "${config_path}/warp"
+  fi
+}
+
+function main_menu {
+  local selection
+  while true; do
+    selection=$(ui_menu "Server Management" "$MENU" \
+      "1" "Add New User" \
+      "2" "Delete User" \
+      "3" "View User" \
+      "4" "View Server Config" \
+      "5" "Configuration")
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    case $selection in
+      1 )
+        add_user_menu
+        ;;
+      2 )
+        delete_user_menu
+        ;;
+      3 )
+        view_user_menu
+        ;;
+      4 )
+        view_config_menu
+        ;;
+      5 )
+        configuration_menu
+        ;;
+    esac
+  done
+}
+
+function add_user_menu {
+  local username
+  local message
+  while true; do
+    username=$(ui_input "Add New User" "Enter the username (A-Z, a-z and 0-9 only):")
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    if [[ ! $username =~ ${regex[username]} ]]; then
+      message_box "Invalid Username" "Username can only contains A-Z, a-z and 0-9"
+      continue
+    fi
+    if [[ -n ${users[$username]} ]]; then
+      message_box "Invalid Username" '"'"${username}"'" already exists.'
+      continue
+    fi
+    users[$username]=$(cat /proc/sys/kernel/random/uuid)
+    update_users_file
+    if ! ui_yesno "Add New User" 'User "'"${username}"'" has been created.\n\nShow the client configuration now?' y; then
+      break
+    fi
+    view_user_menu "${username}"
+  done
+}
+
+function delete_user_menu {
+  local username
+  while true; do
+    username=$(list_users_menu "Delete User")
+    if [[ $? -ne 0 ]]; then
+      return 0
+    fi
+    if [[ ${#users[@]} -eq 1 ]]; then
+      message_box "Delete User" "You cannot delete the only user.\nAt least one user is needed.\nCreate a new user, then delete this one."
+      continue
+    fi
+    if ! ui_yesno "Delete User" "Delete the user ${username}?\n\nIts client configuration stops working immediately."; then
+      continue
+    fi
+    unset users["${username}"]
+    update_users_file
+    message_box "Delete User" 'User "'"${username}"'" has been deleted.'
+  done
+}
+
+function view_user_menu {
+  local username
+  local user_config
+  while true; do
+    if [[ $# -gt 0 ]]; then
+      username=$1
+    else
+      username=$(list_users_menu "View User")
+      if [[ $? -ne 0 ]]; then
+        return 0
+      fi
+    fi
+    if [[ ${config[transport]} == 'tuic' ]]; then
+      user_config=$(echo "
+Protocol: tuic
+Remarks: ${username}
+Address: ${config[server]}
+Port: ${config[port]}
+UUID: ${users[$username]}
+Password: $(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)
+UDP Relay Mode: quic
+Congestion Control: ${config[tuic_congestion]}
+      " | tr -s '\n')
+    elif [[ ${config[transport]} == 'hysteria2' ]]; then
+      user_config=$(echo "
+Protocol: hysteria2
+Remarks: ${username}
+Address: ${config[server]}
+Port: ${config[port]}
+Password: $(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)
+OBFS Type: salamander
+OBFS Password: ${config[service_path]}
+$([[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]] && echo "Up: ${config[hysteria2_up]} Mbps" || true)
+$([[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]] && echo "Down: ${config[hysteria2_down]} Mbps" || true)
+      " | tr -s '\n')
+    elif [[ ${config[transport]} == 'anytls' ]]; then
+      user_config=$(echo "
+Protocol: anytls
+Remarks: ${username}
+Address: ${config[server]}
+Port: ${config[port]}
+Password: $(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)
+SNI: ${config[domain]%%:*}
+$([[ ${config[security]} == 'selfsigned' ]] && echo "Allow Insecure: true" || true)
+      " | tr -s '\n')
+    elif [[ ${config[transport]} == 'shadowtls' ]]; then
+      user_config=$(echo "
+=== First item of the chain proxy ===
+Protocol: shadowtls
+Remarks: ${username}-shadowtls
+Address: ${config[server]}
+Port: ${config[port]}
+Password: ${users[$username]}
+Protocol Version: 3
+SNI: ${config[domain]%%:*}
+Fingerprint: chrome
+=== Second item of the chain proxy ===
+Protocol: shadowsocks
+Remarks: ${username}-shadowsocks
+Address: 127.0.0.1
+Port: 1080
+Password: ${users[$username]}
+Encryption Method: chacha20-ietf-poly1305
+UDP over TCP: true
+
+      " | tr -s '\n')
+    else
+      user_config=$(echo "
+Protocol: vless
+Remarks: ${username}
+Address: ${config[server]}
+Port: ${config[port]}
+ID: ${users[$username]}
+Flow: $([[ ${config[transport]} == 'tcp' ]] && echo 'xtls-rprx-vision' || true)
+Network: ${config[transport]}
+$([[ ${config[transport]} == 'ws' || ${config[transport]} == 'http' ]] && echo "Host Header: ${config[server]}" || true)
+$([[ ${config[transport]} == 'ws' || ${config[transport]} == 'http' ]] && echo "Path: /${config[service_path]}" || true)
+$([[ ${config[transport]} == 'grpc' ]] && echo 'gRPC mode: gun' || true)
+$([[ ${config[transport]} == 'grpc' ]] && echo 'gRPC serviceName: '"${config[service_path]}" || true)
+TLS: $([[ ${config[security]} == 'reality' ]] && echo 'reality' || echo 'tls')
+SNI: ${config[domain]%%:*}
+ALPN: $([[ ${config[transport]} == 'ws' ]] && echo 'http/1.1' || echo 'h2,http/1.1')
+Fingerprint: chrome
+$([[ ${config[security]} == 'selfsigned' ]] && echo "Allow Insecure: true" || true)
+$([[ ${config[security]} == 'reality' ]] && echo "PublicKey: ${config[public_key]}" || true)
+$([[ ${config[security]} == 'reality' ]] && echo "ShortId: ${config[short_id]}" || true)
+      " | tr -s '\n')
+    fi
+    if [[ -n ${config[ss_port]} ]]; then
+      user_config="${user_config}
+Shadowsocks 2022 (extra inbound)
+Address: ${config[server]}
+Port: ${config[ss_port]}
+Method: 2022-blake3-aes-128-gcm
+Password: $(ss2022_user_key "${username}" "${users[${username}]}")
+"
+    fi
+    if ui_yesno "${username} details" "${user_config}\n\nShow the QR code and the client link?"; then
+      print_client_configuration "${username}"
+      ui_pause
+    fi
+    if [[ $# -gt 0 ]]; then
+      return 0
+    fi
+  done
+}
+
+function list_users_menu {
+  local title=$1
+  local items=()
+  local name
+  # Sorted, because the associative array itself has no defined order and the
+  # numbers in the list have to stay put between prompts.
+  while IFS= read -r name; do
+    items+=("${name}" "${name}")
+  done < <(printf '%s\n' "${!users[@]}" | sort)
+  ui_menu "${title}" "Select the user:" "${items[@]}"
+}
+
+function show_server_config {
+  local server_config
+  server_config="Core: ${config[core]}"
+  server_config=$server_config$'\n'"Server Address: ${config[server]}"
+  server_config=$server_config$'\n'"Domain SNI: ${config[domain]}"
+  server_config=$server_config$'\n'"Camouflage Site: ${config[camouflage]}"
+  server_config=$server_config$'\n'"Port: ${config[port]}"
+  if [[ ${config[http_port]} == 'OFF' ]]; then
+    server_config=$server_config$'\n'"HTTP Port (website): OFF (unpublished)"
+  else
+    server_config=$server_config$'\n'"HTTP Port (website): ${config[http_port]}"
+  fi
+  server_config=$server_config$'\n'"Transport: ${config[transport]}"
+  server_config=$server_config$'\n'"Security: ${config[security]}"
+  server_config=$server_config$'\n'"Safenet: ${config[safenet]}"
+  server_config=$server_config$'\n'"BBR: $(bbr_summary)"
+  server_config=$server_config$'\n'"WARP: ${config[warp]}"
+  server_config=$server_config$'\n'"WARP License: ${config[warp_license]}"
+  server_config=$server_config$'\n'"Telegram Bot: ${config[tgbot]}"
+  server_config=$server_config$'\n'"Telegram Bot Token: ${config[tgbot_token]}"
+  server_config=$server_config$'\n'"Telegram Bot Admins: ${config[tgbot_admins]}"
+  echo "${server_config}"
+}
+
+function view_config_menu {
+  local server_config
+  server_config=$(show_server_config)
+  message_box "Server Configuration" "${server_config}"
+}
+
+function restart_menu {
+  if ! ui_yesno "Restart Services" "Restart the containers now?"; then
+    return
+  fi
+  restart_docker_compose
+  if [[ ${config[tgbot]} == 'ON' ]]; then
+    restart_tgbot_compose
+  fi
+}
+
+function regenerate_menu {
+  if ! ui_yesno "Regenerate Keys" "Regenerate the keys now?\n\nEvery client has to be given the new configuration afterwards, because the current one stops working."; then
+    return
+  fi
+  generate_keys
+  config[public_key]=${config_file[public_key]}
+  config[private_key]=${config_file[private_key]}
+  config[short_id]=${config_file[short_id]}
+  update_config_file
+  message_box "Regenerate keys" "All keys has been regenerated."
+}
+
+function restore_defaults_menu {
+  if ! ui_yesno "Restore Default Config" "Restore the default configuration?"; then
+    return
+  fi
+  restore_defaults
+  update_config_file
+  message_box "Restore Default Config" "All configurations has been restored to their defaults."
+}
+
+function configuration_menu {
+  local selection
+  while true; do
+    selection=$(ui_menu "Configuration" "$MENU" \
+      "1" "Core" \
+      "2" "Server Address" \
+      "3" "Transport" \
+      "4" "SNI Domain" \
+      "5" "Security" \
+      "6" "Port" \
+      "7" "HTTP Port (website / ACME)" \
+      "8" "Camouflage Site" \
+      "9" "Safe Internet" \
+      "10" "BBR" \
+      "11" "WARP" \
+      "12" "Telegram Bot" \
+      "13" "Restart Services" \
+      "14" "Regenerate Keys" \
+      "15" "Restore Defaults" \
+      "16" "Create Backup" \
+      "17" "Restore Backup")
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    case $selection in
+      1 )
+        config_core_menu
+        ;;
+      2 )
+        config_server_menu
+        ;;
+      3 )
+        config_transport_menu
+        ;;
+      4 )
+        config_sni_domain_menu
+        ;;
+      5 )
+        config_security_menu
+        ;;
+      6 )
+        config_port_menu
+        ;;
+      7 )
+        config_http_port_menu
+        ;;
+      8 )
+        config_camouflage_menu
+        ;;
+      9 )
+        config_safenet_menu
+        ;;
+      10 )
+        config_bbr_menu
+        ;;
+      11 )
+        config_warp_menu
+        ;;
+      12 )
+        config_tgbot_menu
+        ;;
+      13 )
+        restart_menu
+        ;;
+      14 )
+        regenerate_menu
+        ;;
+      15 )
+        restore_defaults_menu
+        ;;
+      16 )
+        backup_menu
+        ;;
+      17 )
+        restore_backup_menu
+        ;;
+    esac
+  done
+}
+
+function config_core_menu {
+  local core
+  while true; do
+    core=$(ui_radiolist "Core" "Select the core engine:" "${config[core]}" \
+      "xray" "xray" \
+      "sing-box" "sing-box")
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    if [[ ${core} == 'xray' && ${config[transport]} == 'tuic' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "xray" core with "tuic" transport. Change core to "sing-box" or use other transports'
+      continue
+    fi
+    if [[ ${core} == 'xray' && ${config[transport]} == 'hysteria2' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "xray" core with "hysteria2" transport. Change core to "sing-box" or use other transports'
+      continue
+    fi
+    if [[ ${core} == 'xray' && ${config[transport]} == 'shadowtls' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "xray" core with "shadowtls" transport. Change core to "sing-box" or use other transports'
+      continue
+    fi
+    if [[ ${core} != ${config[core]} ]]; then
+      # a pinned tag belongs to the engine it was chosen for
+      config[core_version]=""
+    fi
+    config[core]=$core
+    update_config_file
+    break
+  done
+}
+
+function config_server_menu {
+  local server
+  while true; do
+    server=$(ui_input "Server Address" "Enter the IP address or domain name clients connect to:" "${config[server]}")
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    if [[ -z ${server} ]]; then
+      server="${defaults[server]}"
+    fi
+    # An auto-detected address can be empty when the machine is offline. Storing
+    # it would make every client configuration point at nothing until the next
+    # full run aborts with a confusing message, so it is rejected here.
+    if [[ -z ${server} ]]; then
+      message_box 'Invalid Configuration' 'Could not determine the server address automatically. Enter the public IP address or domain name by hand.'
+      continue
+    fi
+    if [[ ! ${server} =~ ${regex[domain]} && ${config[security]} == 'letsencrypt' ]]; then
+      message_box 'Invalid Configuration' 'You have to assign a valid domain to server if you want to use "letsencrypt" certificate.'
+      continue
+    fi
+    config[server]="${server}"
+    if [[ ${config[security]} != 'reality' && ${config[transport]} != 'shadowtls' ]]; then
+      # A bare IP can never be sent as the TLS SNI by a client, so keep a real
+      # host name for it; otherwise the haproxy SNI split would route the proxy
+      # traffic to the website.
+      if [[ ${server} =~ ${regex[ip]} ]]; then
+        config[domain]="${defaults[domain]}"
+      else
+        config[domain]="${server}"
+      fi
+    fi
+    update_config_file
+    break
+  done
+}
+
+function config_transport_menu {
+  local transport
+  while true; do
+    transport=$(ui_radiolist "Transport" "Select the transport protocol:" "${config[transport]}" \
+      "tcp" "tcp" \
+      "http" "http" \
+      "grpc" "grpc" \
+      "ws" "ws" \
+      "tuic" "tuic" \
+      "hysteria2" "hysteria2" \
+      "shadowtls" "shadowtls" \
+      "anytls" "anytls")
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    if [[ ${transport} == 'ws' && ${config[security]} == 'reality' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "ws" transport with "reality" TLS certificate. Use other transports or change TLS certificate to "letsencrypt" or "selfsigned"'
+      continue
+    fi
+    if [[ ${transport} == 'tuic' && ${config[security]} == 'reality' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "tuic" transport with "reality" TLS certificate. Use other transports or change TLS certificate to "letsencrypt" or "selfsigned"'
+      continue
+    fi
+    if [[ ${transport} == 'tuic' && ${config[core]} == 'xray' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "tuic" transport with "xray" core. Use other transports or change core to "sing-box"'
+      continue
+    fi
+    if [[ ${transport} == 'hysteria2' && ${config[security]} == 'reality' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "hysteria2" transport with "reality" TLS certificate. Use other transports or change TLS certificate to "letsencrypt" or "selfsigned"'
+      continue
+    fi
+    if [[ ${transport} == 'hysteria2' && ${config[core]} == 'xray' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "hysteria2" transport with "xray" core. Use other transports or change core to "sing-box"'
+      continue
+    fi
+    if [[ ${transport} == 'shadowtls' && ${config[core]} == 'xray' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "shadowtls" transport with "xray" core. Use other transports or change core to "sing-box"'
+      continue
+    fi
+    if [[ ${transport} == 'anytls' && ${config[core]} == 'xray' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "anytls" transport with "xray" core. Use other transports or change core to "sing-box"'
+      continue
+    fi
+    if [[ ${transport} == 'anytls' && ${config[security]} == 'reality' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "anytls" transport with "reality" TLS certificate. Use other transports or change TLS certificate to "letsencrypt" or "selfsigned"'
+      continue
+    fi
+    if [[ ${config[transport]} != 'shadowtls' && ${transport} == 'shadowtls' && ${config[security]} != 'reality' ]]; then
+      config[domain]="${defaults[domain]}"
+    fi
+    config[transport]=$transport
+    update_config_file
+    break
+  done
+}
+
+function config_camouflage_menu {
+  local camouflage
+  while true; do
+    camouflage=$(ui_input "Camouflage Site" "Remote site that unauthenticated probes are relayed to (reality / shadowtls).\nIt must be a real site whose certificate matches the SNI, so the SNI follows it unless it is set separately.\nOptional \":port\" suffix, port 443 by default.\n\nDefault: ${defaults[camouflage]}" \
+      "${config[camouflage]}")
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    if [[ $camouflage != 'self' ]] && [[ ! $camouflage =~ ${regex[domain_port]} ]]; then
+      message_box "Invalid Domain" '"'"${camouflage}"'" is not a valid domain (or "self").'
+      continue
+    fi
+    if [[ $camouflage != 'self' && $camouflage =~ : ]] && (( ${camouflage#*:} > 65535 )); then
+      message_box "Invalid Port" 'The camouflage port must be between 1 and 65535.'
+      continue
+    fi
+    if [[ $camouflage == 'self' ]]; then
+      if [[ ! ${config[server]} =~ ${regex[domain]} ]]; then
+        message_box "Invalid Configuration" 'The "self" camouflage needs a domain in Server Address: a real certificate is issued for it.'
+        continue
+      fi
+      config[camouflage]='self'
+      config[domain]="${config[server]}"
+    else
+      config[camouflage]=$camouflage
+      if [[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]]; then
+        config[domain]="${camouflage%%:*}"
+      fi
+    fi
+    update_config_file
+    break
+  done
+}
+
+function config_sni_domain_menu {
+  local sni_domain
+  while true; do
+    sni_domain=$(ui_input "SNI Domain" "Enter the SNI domain clients use:" "${config[domain]}")
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    if [[ ! $sni_domain =~ ${regex[domain_port]} ]]; then
+      message_box "Invalid Domain" '"'"${sni_domain}"'" in not a valid domain.'
+      continue
+    fi
+    if [[ $sni_domain =~ : ]] && (( ${sni_domain#*:} > 65535 )); then
+      message_box "Invalid Port" 'The SNI port must be between 1 and 65535.'
+      continue
+    fi
+    config[domain]=$sni_domain
+    # In reality / shadowtls the fallback site has to answer with a certificate
+    # for this very name, so the two are kept in sync here just like the CLI does
+    # when only --domain is given. Otherwise a probe would receive a certificate
+    # that does not match the SNI it sent, which is what it looks for.
+    if [[ ${config[security]} == 'reality' || ${config[transport]} == 'shadowtls' ]]; then
+      config[camouflage]="${sni_domain%%:*}"
+    fi
+    update_config_file
+    break
+  done
+}
+
+function config_security_menu {
+  local security
+  local free_80=true
+  while true; do
+    security=$(ui_radiolist "Security Type" "Select the security type:" "${config[security]}" \
+      "reality" "reality" \
+      "letsencrypt" "letsencrypt" \
+      "selfsigned" "selfsigned")
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    if [[ ! ${config[server]} =~ ${regex[domain]} && ${security} == 'letsencrypt' ]]; then
+      message_box 'Invalid Configuration' 'You have to assign a valid domain to server if you want to use "letsencrypt" as security type'
+      continue
+    fi
+    if [[ ${config[transport]} == 'ws' && ${security} == 'reality' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "reality" TLS certificate with "ws" transport protocol. Change TLS certificate to "letsencrypt" or "selfsigned" or use other transport protocols'
+      continue
+    fi
+    if [[ ${config[transport]} == 'tuic' && ${security} == 'reality' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "reality" TLS certificate with "tuic" transport. Change TLS certificate to "letsencrypt" or "selfsigned" or use other transports'
+      continue
+    fi
+    if [[ ${config[transport]} == 'hysteria2' && ${security} == 'reality' ]]; then
+      message_box 'Invalid Configuration' 'You cannot use "reality" TLS certificate with "hysteria2" transport. Change TLS certificate to "letsencrypt" or "selfsigned" or use other transports'
+      continue
+    fi
+    if [[ ${security} == 'letsencrypt' ]]; then
+      if port_in_use 80; then
+        free_80=false
+        for container in $(${docker_cmd} -p ${compose_project} ps -q); do
+          if docker port "${container}" | grep -q ':80$'; then
+            free_80=true
+            break
+          fi
+        done
+      fi
+      if [[ ${free_80} != 'true' ]]; then
+        message_box 'Port 80 must be free if you want to use "letsencrypt" as the security option.'
+        continue
+      fi
+    fi
+    if [[ ${security} != 'reality' && ${config[transport]} != 'shadowtls' ]]; then
+      # A bare IP can never be an SNI; keep a host name so the haproxy split
+      # still reaches the engine.
+      if [[ ${config[server]} =~ ${regex[ip]} ]]; then
+        config[domain]="${defaults[domain]}"
+      else
+        config[domain]="${config[server]}"
+      fi
+    fi
+    if [[ ${config[security]} != 'reality' && ${security} == 'reality' && ${config[transport]} != 'shadowtls' ]]; then
+      # reality falls back to a remote site, so its SNI has to be that site, not
+      # the default one - otherwise the returned certificate would not match.
+      config[domain]="${config[camouflage]:-${defaults[camouflage]}}"
+      config[domain]="${config[domain]%%:*}"
+    fi
+    config[security]="${security}"
+    update_config_file
+    break
+  done
+}
+
+function config_port_menu {
+  local port
+  while true; do
+    port=$(ui_input "Port" "Enter the server port number:" "${config[port]}")
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    if [[ ! $port =~ ${regex[port]} ]]; then
+      message_box "Invalid Port" "Port must be an integer"
+      continue
+    fi
+    if ((port < 1 || port > 65535)); then
+      message_box "Invalid Port" "Port must be between 1 to 65535"
+      continue
+    fi
+    if [[ ${port} -eq 80 ]]; then
+      message_box "Invalid Port" "Port 80 is reserved for the letsencrypt ACME challenge. Use another port (default: ${defaults[port]})."
+      continue
+    fi
+    if [[ ${config[http_port]} != 'OFF' && ${port} -eq ${config[http_port]} ]]; then
+      message_box "Invalid Port" "The proxy port must differ from the website port (${config[http_port]})."
+      continue
+    fi
+    config[port]=$port
+    update_config_file
+    break
+  done
+}
+
+function config_http_port_menu {
+  local http_port
+  # The ACME HTTP-01 challenge always needs port 80, and build_config pins the
+  # HTTP port to 80 in this mode. Offering a choice that the next full run would
+  # overwrite anyway (and rejecting the mandatory 80) is worse than doing nothing.
+  if needs_certbot; then
+    config[http_port]=80
+    update_config_file
+    message_box "HTTP Port" "This mode serves the ACME HTTP-01 challenge on port 80 (letsencrypt, or camouflage self); the HTTP port has been kept at 80."
+    return
+  fi
+  while true; do
+    http_port=$(ui_input "HTTP Port" "Host port of the local website served by nginx out of ./website.\nIn the letsencrypt mode it also carries the ACME HTTP-01 challenge (always port 80).\n\nEnter \"off\" to leave it unpublished. Default: ${defaults[http_port]}" \
+      "${config[http_port]}")
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    if [[ ${http_port,,} == 'off' ]]; then
+      config[http_port]='OFF'
+    elif [[ ! ${http_port} =~ ${regex[port]} ]] || ((http_port < 1 || http_port > 65535)); then
+      message_box "Invalid Port" "Port must be an integer between 1 and 65535, or \"off\""
+      continue
+    elif [[ ${http_port} -eq 80 ]]; then
+      message_box "Port 80" "Port 80 is only bound by the ACME challenge (letsencrypt or camouflage self). Pick another port (default: ${defaults[http_port]})."
+      continue
+    elif [[ ${http_port} -eq ${config[port]} ]]; then
+      message_box "Port In Use" "Port ${config[port]} belongs to the proxy; pick another port for the website."
+      continue
+    else
+      config[http_port]=${http_port}
+    fi
+    update_config_file
+    break
+  done
+}
+
+function config_safenet_menu {
+  local safenet
+  safenet=$(ui_radiolist "Safe Internet" "Block malware and adult content?" \
+    "$([[ "${config[safenet]}" == 'ON' ]] && echo 'Enable' || echo 'Disable')" \
+    "Enable" "Enable" \
+    "Disable" "Disable")
+  if [[ $? -ne 0 ]]; then
+    return
+  fi
+  config[safenet]=$([[ $safenet == 'Enable' ]] && echo ON || echo OFF)
+  update_config_file
+}
+
+function config_bbr_menu {
+  local bbr
+  bbr=$(ui_radiolist "BBR" "Enable the BBR congestion control algorithm?" \
+    "$([[ "${config[bbr]}" == 'ON' ]] && echo 'Enable' || echo 'Disable')" \
+    "Enable" "Enable" \
+    "Disable" "Disable")
+  if [[ $? -ne 0 ]]; then
+    return
+  fi
+  config[bbr]=$([[ $bbr == 'Enable' ]] && echo ON || echo OFF)
+  update_config_file
+  # Unlike the other toggles this one is not carried by a container config, so
+  # the kernel is updated here instead of waiting for the next invocation.
+  tune_kernel
+  message_box "BBR" "BBR: $(bbr_summary)"
+}
+
+function config_warp_menu {
+  local warp
+  local warp_license
+  local error
+  local temp_file
+  local exit_code
+  local old_warp=${config[warp]}
+  local old_warp_license=${config[warp_license]}
+  while true; do
+    warp=$(ui_radiolist "WARP" "Enable Cloudflare WARP?" \
+      "$([[ "${config[warp]}" == 'ON' ]] && echo 'Enable' || echo 'Disable')" \
+      "Enable" "Enable" \
+      "Disable" "Disable")
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    if [[ $warp == 'Disable' ]]; then
+      config[warp]=OFF
+      if [[ -n ${config[warp_id]} && -n ${config[warp_token]} ]]; then
+        warp_delete_account "${config[warp_id]}" "${config[warp_token]}"
+      fi
+      return
+    fi
+    if [[ -z ${config[warp_private_key]} || \
+          -z ${config[warp_token]} || \
+          -z ${config[warp_id]} || \
+          -z ${config[warp_client_id]} || \
+          -z ${config[warp_interface_ipv4]} || \
+          -z ${config[warp_interface_ipv6]} ]]; then
+      temp_file=$(mktemp)
+      warp_create_account > "${temp_file}"
+      exit_code=$?
+      error=$(< "${temp_file}")
+      rm -f "${temp_file}"
+      if [[ ${exit_code} -ne 0 ]]; then
+        message_box "WARP account creation error" "${error}"
+        continue
+      fi
+    fi
+    config[warp]=ON
+    while true; do
+      warp_license=$(ui_input "WARP+ License" "Enter the WARP+ license.\nType \"none\" to drop the license and go back to the free WARP account." "${config[warp_license]}")
+      if [[ $? -ne 0 ]]; then
+        break
+      fi
+      if [[ ${warp_license} == 'none' ]]; then
+        warp_license=''
+      fi
+      if [[ -n "${warp_license}" && ! $warp_license =~ ${regex[warp_license]} ]]; then
+        message_box "Invalid Input" "Invalid WARP+ License"
+        continue
+      fi
+      if [[ -n "${warp_license}" ]]; then
+        temp_file=$(mktemp)
+        warp_add_license "${config[warp_id]}" "${config[warp_token]}" "${warp_license}" > "${temp_file}"
+        exit_code=$?
+        error=$(< "${temp_file}")
+        rm -f "${temp_file}"
+        if [[ ${exit_code} -ne 0 ]]; then
+          message_box "WARP license error" "${error}"
+          continue
+        fi
+      fi
+      update_config_file
+      return
+    done
+  done
+  config[warp]=$old_warp
+  config[warp_license]=$old_warp_license
+}
+
+function config_tgbot_menu {
+  local tgbot
+  local tgbot_token
+  local tgbot_admins
+  local old_tgbot=${config[tgbot]}
+  local old_tgbot_token=${config[tgbot_token]}
+  local old_tgbot_admins=${config[tgbot_admins]}
+  while true; do
+    tgbot=$(ui_radiolist "Telegram Bot" "Enable the Telegram bot?" \
+      "$([[ "${config[tgbot]}" == 'ON' ]] && echo 'Enable' || echo 'Disable')" \
+      "Enable" "Enable" \
+      "Disable" "Disable")
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    if [[ $tgbot == 'Disable' ]]; then
+      config[tgbot]=OFF
+      update_config_file
+      return
+    fi
+    config[tgbot]=ON
+    while true; do
+      tgbot_token=$(ui_input "Telegram Bot Token" "Enter the Telegram Bot Token:" "${config[tgbot_token]}")
+      if [[ $? -ne 0 ]]; then
+        break
+      fi
+      if [[ ! $tgbot_token =~ ${regex[tgbot_token]} ]]; then
+        message_box "Invalid Input" "Invalid Telegram Bot Token"
+        continue
+      fi 
+      if ! curl -sSfL -m 3 "https://api.telegram.org/bot${tgbot_token}/getMe" >/dev/null 2>&1; then
+        message_box "Invalid Input" "Telegram Bot Token is incorrect. Check it again."
+        continue
+      fi
+      config[tgbot_token]=$tgbot_token
+      while true; do
+        tgbot_admins=$(ui_input "Telegram Bot Admins" "Enter the Telegram Bot admins: usernames without the leading '@', or numeric user ids, separated by a comma." "${config[tgbot_admins]}")
+        if [[ $? -ne 0 ]]; then
+          break
+        fi
+        if [[ ! $tgbot_admins =~ ${regex[tgbot_admins]} || $tgbot_admins =~ .+_$ || $tgbot_admins =~ .+_,.+ ]]; then
+          message_box "Invalid Input" "Invalid Admin\nEvery admin must be a Telegram username without the leading '@' character or a numeric user id, separated by ',' with no extra space."
+          continue
+        fi
+        config[tgbot_admins]=$tgbot_admins
+        update_config_file
+        return
+      done
+    done
+  done
+  config[tgbot]=$old_tgbot
+  config[tgbot_token]=$old_tgbot_token
+  config[tgbot_admins]=$old_tgbot_admins
+}
+
+function backup_menu {
+  local backup_password
+  local backup_choice
+  local result
+  backup_choice=$(ui_menu "Backup" "Protect the backup file with a password?" \
+    "1" "No password" \
+    "2" "Set a password")
+  if [[ $? -ne 0 ]]; then
+    return
+  fi
+  if [[ ${backup_choice} == '2' ]]; then
+    backup_password=$(ui_input "Backup" "Enter the password for the backup file:")
+    if [[ $? -ne 0 ]]; then
+      return
+    fi
+  else
+    backup_password=''
+  fi
+  if result=$(backup "${backup_password}" 2>&1); then
+    ui_title "Backup"
+    ui_out ""
+    ui_out "The backup has been created and uploaded."
+    ui_out "Download it here:"
+    ui_out ""
+    ui_out "${result}"
+    ui_out ""
+    ui_out "The link is valid for 3 days."
+    ui_pause
+  else
+    message_box "Backup Failed" "${result}"
+  fi
+}
+
+function restore_backup_menu {
+  local backup_file
+  local backup_password
+  local password_choice
+  local result
+  while true; do
+    backup_file=$(ui_input "Restore Backup" "Enter the backup file path or URL:")
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    if [[ ! $backup_file =~ ${regex[file_path]} ]] && [[ ! $backup_file =~ ${regex[url]} ]]; then
+      message_box "Invalid Backup path of URL" "Backup file path or URL is not valid."
+      continue
+    fi
+    password_choice=$(ui_menu "Restore Backup" "Is the backup file protected by a password?" \
+      "1" "No password" \
+      "2" "It has a password")
+    if [[ $? -ne 0 ]]; then
+      continue
+    fi
+    if [[ ${password_choice} == '2' ]]; then
+      backup_password=$(ui_input "Restore Backup" "Enter the password of the backup file:")
+      if [[ $? -ne 0 ]]; then
+        continue
+      fi
+    else
+      backup_password=''
+    fi
+    if result=$(restore "${backup_file}" "${backup_password}" 2>&1); then
+      parse_config_file
+      parse_users_file
+      build_config
+      update_config_file
+      update_users_file
+      message_box "Backup Restore Successful" "Backup has been restored successfully."
+      args[restart]=true
+      break
+    else
+      message_box "Backup Restore Failed" "${result}"
+    fi
+  done
+}
+
+function restart_docker_compose {
+  ${docker_cmd} --project-directory "${config_path}" -p ${compose_project} down --remove-orphans --timeout 2 || true
+  ${docker_cmd} --project-directory "${config_path}" -p ${compose_project} up --build -d --remove-orphans
+}
+
+function restart_tgbot_compose {
+  ${docker_cmd} --project-directory "${config_path}/tgbot" -p ${tgbot_project} down --remove-orphans --timeout 2 || true
+  ${docker_cmd} --project-directory "${config_path}/tgbot" -p ${tgbot_project} up --build -d --remove-orphans
+  tgbot_dockerfile_changed=false
+}
+
+function restart_container {
+  if [[ -z "$(${docker_cmd} ls | grep "${path[compose]}" | grep running || true)" ]]; then
+    restart_docker_compose
+    return
+  fi
+  if ${docker_cmd} --project-directory ${config_path} -p ${compose_project} ps --services "$1" | grep "$1"; then
+    ${docker_cmd} --project-directory ${config_path} -p ${compose_project} restart --timeout 2 "$1"
+  fi
+}
+
+function warp_api {
+  local verb=$1
+  local resource=$2
+  local data=$3
+  local token=$4
+  local team_token=$5
+  local endpoint=https://api.cloudflareclient.com/v0a1922
+  local temp_file
+  local error
+  local header
+  local response_body
+  local response_code
+  local -a curl_args
+  local -a headers=(
+    "User-Agent: okhttp/3.12.1"
+    "CF-Client-Version: a-6.3-1922"
+    "Content-Type: application/json"
+  )
+  temp_file=$(mktemp)
+  if [[ -n ${token} ]]; then
+    headers+=("Authorization: Bearer ${token}")
+  fi
+  if [[ -n ${team_token} ]]; then
+    headers+=("Cf-Access-Jwt-Assertion: ${team_token}")
+  fi
+  curl_args=(-sLX "${verb}" -m 15 -w '%{http_code}' -o "${temp_file}" "${endpoint}${resource}")
+  for header in "${headers[@]}"; do
+    curl_args+=(-H "${header}")
+  done
+  if [[ -n ${data} ]]; then
+    curl_args+=(-d "${data}")
+  fi
+  response_code=$(curl "${curl_args[@]}" 2>/dev/null || true)
+  response_body=$(cat "${temp_file}" 2>/dev/null || true)
+  rm -f "${temp_file}"
+  if [[ ! ${response_code} =~ ^[1-9][0-9]*$ ]]; then
+    return 1
+  fi
+  if ((response_code > 399)); then
+    error=$(echo "${response_body}" | jq -r '.errors[0].message' 2> /dev/null || true)
+    if [[ ${error} != 'null' ]]; then
+      echo "${error}"
+    fi
+    return 2
+  fi
+  echo "${response_body}"
+}
+
+# Generate a WireGuard (Curve25519) key pair with the system openssl and print
+# "<private key> <public key>" as raw base64, which is the format both the
+# Cloudflare registration API and the WireGuard/ sing-box configuration expect.
+function warp_generate_keypair {
+  local key_file
+  local private_key
+  local public_key
+  key_file=$(mktemp)
+  if ! openssl genpkey -algorithm X25519 -out "${key_file}" >/dev/null 2>&1; then
+    rm -f "${key_file}"
+    return 1
+  fi
+  # The DER encoding of an X25519 key ends with the raw 32 byte key.
+  private_key=$(openssl pkey -in "${key_file}" -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\n' || true)
+  public_key=$(openssl pkey -in "${key_file}" -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\n' || true)
+  rm -f "${key_file}"
+  if [[ -z ${private_key} || -z ${public_key} ]]; then
+    return 1
+  fi
+  echo "${private_key} ${public_key}"
+}
+
+# Register a free WARP device directly against the Cloudflare client API.
+# This replaces the third-party wgcf image that was used before: the key pair is
+# generated locally and the single registration call returns the device token,
+# the client id and the interface addresses.
+function warp_create_account {
+  local response
+  local key_pair
+  local private_key
+  local public_key
+  local payload
+  local tos
+  if ! key_pair=$(warp_generate_keypair); then
+    echo "WARP account creation has been failed! (cannot generate a WireGuard key pair with openssl)"
+    return 1
+  fi
+  private_key=${key_pair%% *}
+  public_key=${key_pair##* }
+  tos=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  payload=$(printf '{"key":"%s","install_id":"","fcm_token":"","tos":"%s","model":"PC","serial_number":"","locale":"en_US"}' "${public_key}" "${tos}")
+  # The assignment must be guarded: under `set -e` a failing command
+  # substitution would abort the script before the error could be reported.
+  if ! response=$(warp_api "POST" "/reg" "${payload}" ""); then
+    if [[ -n ${response} ]]; then
+      echo "${response}"
+    fi
+    echo "WARP account creation has been failed!"
+    return 1
+  fi
+  config[warp_private_key]=${private_key}
+  config[warp_token]=$(echo "${response}" | jq -r '.token // empty' 2>/dev/null || true)
+  config[warp_id]=$(echo "${response}" | jq -r '.id // empty' 2>/dev/null || true)
+  config[warp_client_id]=$(echo "${response}" | jq -r '.config.client_id // empty' 2>/dev/null || true)
+  config[warp_interface_ipv4]=$(echo "${response}" | jq -r '.config.interface.addresses.v4 // empty' 2>/dev/null || true)
+  config[warp_interface_ipv6]=$(echo "${response}" | jq -r '.config.interface.addresses.v6 // empty' 2>/dev/null || true)
+  if [[ -z ${config[warp_token]} || -z ${config[warp_id]} || -z ${config[warp_client_id]} ]]; then
+    echo "WARP account creation has been failed!"
+    return 1
+  fi
+  if [[ -z ${config[warp_interface_ipv4]} || -z ${config[warp_interface_ipv6]} ]]; then
+    echo "WARP account creation returned no interface address!"
+    return 1
+  fi
+  update_config_file
+}
+
+function warp_add_license {
+  local id=$1
+  local token=$2
+  local license=$3
+  local data
+  local response
+  data='{"license": "'"${license}"'"}'
+  if ! response=$(warp_api "PUT" "/reg/${id}/account" "${data}" "${token}"); then
+    if [[ -n ${response} ]]; then
+      echo "${response}"
+    fi
+    return 1
+  fi
+  config[warp_license]=${license}
+  update_config_file
+}
+
+function warp_delete_account {
+  local id=$1
+  local token=$2
+  warp_api "DELETE" "/reg/${id}" "" "${token}" >/dev/null 2>&1 || true
+  config[warp_private_key]=""
+  config[warp_token]=""
+  config[warp_id]=""
+  config[warp_client_id]=""
+  config[warp_interface_ipv4]=""
+  config[warp_interface_ipv6]=""
+  update_config_file
+}
+
+# Decode the first three bytes of the WARP client id into a JSON array.
+# Uses only base64/od, so it also works inside the minimal tgbot container where
+# xxd is not installed (the previous xxd based version silently broke there).
+function warp_decode_reserved {
+  local client_id=$1
+  local bytes
+  local byte
+  local reserved=""
+  bytes=$(printf '%s' "${client_id}" | base64 -d 2>/dev/null | od -An -tu1 -N3 2>/dev/null || true)
+  for byte in ${bytes}; do
+    reserved="${reserved:+${reserved}, }${byte}"
+  done
+  echo "[${reserved}]"
+}
+
+# Check whether a TCP port is already in use. lsof is not installed by default on
+# every supported distro, and without a fallback the letsencrypt port 80 check
+# silently passed (and the certificate request then failed later on).
+function port_in_use {
+  local port=$1
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -i :"${port}" >/dev/null 2>&1 && return 0
+    return 1
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | grep -qE "[:.]${port}[[:space:]]" && return 0
+    return 1
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | grep -qE "[:.]${port}[[:space:]]" && return 0
+    return 1
+  fi
+  return 1
+}
+
+function check_reload {
+  local -A restart
+  RELOAD_PENDING=0
+  generate_config
+  for key in "${!path[@]}"; do
+    if [[ "${md5["$key"]}" != $(get_md5 "${path[$key]}") ]]; then
+      restart["${service["$key"]}"]='true'
+      md5["$key"]=$(get_md5 "${path[$key]}")
+    fi
+  done
+  # In the passthrough modes nginx is the process that reads the website
+  # certificate (haproxy must not terminate TLS there), so a changed
+  # certificate has to restart it as well.
+  if [[ "${restart[server_crt]}" == 'true' || "${restart[server_key]}" == 'true' ]]; then
+    if engine_owns_tls; then
+      restart[nginx]='true'
+    fi
+  fi
+  if [[ "${restart[tgbot]}" == 'true' && "${config[tgbot]}" == 'ON' ]]; then
+    restart_tgbot_compose
+  fi
+  if [[ "${config[tgbot]}" == 'OFF' ]]; then
+    ${docker_cmd} --project-directory ${config_path}/tgbot -p ${tgbot_project} down --remove-orphans --timeout 2 >/dev/null 2>&1 || true
+  fi
+  if [[ "${restart[compose]}" == 'true' ]]; then
+    restart_docker_compose
+    return
+  fi
+  for key in "${!restart[@]}"; do
+    if [[ $key != 'none' && $key != 'tgbot' ]]; then
+      restart_container "${key}"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Operator interface
+# ---------------------------------------------------------------------------
+# Every screen is plain text: a numbered list and one line-based prompt. The
+# full-screen whiptail dialogs this replaces needed roughly 32 terminal rows
+# and a cursor, and mobile SSH clients offer neither, which made the menus
+# unusable there. Nothing clears the screen either, so the scrollback survives
+# and the earlier answers stay readable.
+#
+# Only the helpers below talk to the operator; every menu goes through them, so
+# the wording and the accepted keys are the same everywhere.
+#
+# Conventions:
+#   * choices are made by number, never with a cursor
+#   * q, or an empty line, steps back out of a list
+#   * an empty answer to a prompt keeps the current value, and steps back when
+#     there is no current value to keep
+#   * Ctrl-D always steps back
+#   * an answer that is not understood is explained and the prompt repeats
+#
+# Only the answer is written to stdout, so a caller can capture it with $()
+# while the screen itself stays visible on stderr.
+
+function ui_out {
+  printf '%b\n' "${1:-}" >&2
+}
+
+function ui_title {
+  ui_out ""
+  ui_out "===== ${BACKTITLE} :: $1 ====="
+}
+
+function ui_error {
+  ui_out ""
+  ui_out "  Not understood: $1"
+  ui_out ""
+}
+
+function ui_pause {
+  if [[ -t 0 ]]; then
+    printf '\nPress Enter to continue ... ' >&2
+    read -r || true
+  fi
+  ui_out ""
+}
+
+# Reads one answer, tolerating the carriage return that some mobile terminals
+# and pasted text append. Returns 1 on Ctrl-D, which every caller reads as
+# "go back".
+function ui_read {
+  ui_answer=''
+  IFS= read -r ui_answer || return 1
+  ui_answer=${ui_answer%$'\r'}
+  return 0
+}
+
+# Draws the numbered list the two selection helpers share. <current> is marked
+# when it is not empty.
+function ui_draw_list {
+  local title=$1
+  local prompt=$2
+  local current=$3
+  shift 3
+  local index=1
+  ui_title "${title}"
+  ui_out ""
+  ui_out "${prompt}"
+  ui_out ""
+  while [[ $# -gt 1 ]]; do
+    if [[ -n ${current} && $1 == "${current}" ]]; then
+      ui_out "  ${index}) $2  (current)"
+    else
+      ui_out "  ${index}) $2"
+    fi
+    index=$((index + 1))
+    shift 2
+  done
+  ui_out ""
+  ui_out "  q) Back"
+  ui_out ""
+  if ((index == 2)); then
+    printf 'Choose [1]: ' >&2
+  else
+    printf 'Choose [1-%s]: ' "$((index - 1))" >&2
+  fi
+}
+
+# Chooses from a numbered list. Everything the operator reads goes to stderr;
+# only the chosen key goes to stdout, so the caller can capture it with $()
+# without the list leaking into the value.
+function ui_choice {
+  local title=$1
+  local prompt=$2
+  local current=$3
+  local kind=$4
+  shift 4
+  local count=$(( $# / 2 ))
+  local index
+  while true; do
+    if [[ ${kind} == 'current' ]]; then
+      ui_draw_list "${title}" "${prompt}" "${current}" "$@"
+    else
+      ui_draw_list "${title}" "${prompt}" "" "$@"
+    fi
+    if ! ui_read; then
+      ui_out ""
+      return 1
+    fi
+    case ${ui_answer} in
+      ''|q|Q)
+        return 1
+        ;;
+    esac
+    if [[ ${ui_answer} =~ ^[0-9]+$ ]] && ((ui_answer >= 1 && ui_answer <= count)); then
+      index=$(( (ui_answer - 1) * 2 + 1 ))
+      printf '%s\n' "${@:index:1}"
+      return 0
+    fi
+    ui_error "enter a number between 1 and ${count}, or q to go back."
+  done
+}
+
+# ui_menu <title> <prompt> <key> <label> [<key> <label> ...]
+# Echoes the key that was picked. Returns 1 when stepping back.
+function ui_menu {
+  ui_choice "$1" "$2" "" list "${@:3}"
+}
+
+# ui_radiolist <title> <prompt> <current> <key> <label> [<key> <label> ...]
+# Echoes the key that was picked, marking <current> in the list. Returns 1 when
+# stepping back.
+function ui_radiolist {
+  ui_choice "$1" "$2" "$3" current "${@:4}"
+}
+
+# ui_input <title> <prompt> [current]
+# Echoes the answer. An empty answer keeps <current>, and returns 1 when there
+# is no current value to keep.
+function ui_input {
+  local title=$1
+  local prompt=$2
+  local current=${3:-}
+  ui_title "${title}"
+  ui_out ""
+  ui_out "${prompt}"
+  ui_out ""
+  if [[ -n ${current} ]]; then
+    ui_out "Current value: ${current}"
+    printf 'New value [Enter keeps it]: ' >&2
+  else
+    printf 'Enter a value [Enter goes back]: ' >&2
+  fi
+  if ! ui_read; then
+    ui_out ""
+    return 1
+  fi
+  ui_out ""
+  if [[ -z ${ui_answer} ]]; then
+    if [[ -n ${current} ]]; then
+      printf '%s\n' "${current}"
+      return 0
+    fi
+    return 1
+  fi
+  printf '%s\n' "${ui_answer}"
+  return 0
+}
+
+# ui_yesno <title> <prompt> [y|n]
+# Returns 0 for yes and 1 for no, which is also what stepping back returns, so
+# every caller treats 1 as "change nothing".
+function ui_yesno {
+  local title=$1
+  local prompt=$2
+  local default=${3:-n}
+  local hint='[y/N]'
+  if [[ ${default} == 'y' ]]; then
+    hint='[Y/n]'
+  fi
+  ui_title "${title}"
+  ui_out ""
+  ui_out "${prompt}"
+  ui_out ""
+  printf 'Confirm %s: ' "${hint}" >&2
+  if ! ui_read; then
+    ui_out ""
+    return 1
+  fi
+  ui_out ""
+  case ${ui_answer} in
+    y|Y|yes|YES|Yes)
+      return 0
+      ;;
+    '')
+      if [[ ${default} == 'y' ]]; then
+        return 0
+      fi
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+function message_box {
+  ui_title "$1"
+  ui_out ""
+  ui_out "$2"
+  ui_pause
+}
+
+function get_md5 {
+  local file_path
+  file_path=$1
+  md5sum "${file_path}" 2>/dev/null | cut -f1 -d' ' || true
+}
+
+function generate_file_list {
+  path[config]="${config_path}/config"
+  path[users]="${config_path}/users"
+  path[compose]="${config_path}/docker-compose.yml"
+  path[engine]="${config_path}/engine.conf"
+  path[haproxy]="${config_path}/haproxy.cfg"
+  path[nginx_conf]="${config_path}/nginx.conf"
+  path[website]="${config_path}/website/index.html"
+  path[certbot_deployhook]="${config_path}/certbot/deployhook.sh"
+  path[certbot_dockerfile]="${config_path}/certbot/Dockerfile"
+  path[certbot_startup]="${config_path}/certbot/startup.sh"
+  path[server_pem]="${config_path}/certificate/server.pem"
+  path[server_key]="${config_path}/certificate/server.key"
+  path[server_crt]="${config_path}/certificate/server.crt"
+  path[tgbot_script]="${config_path}/tgbot/tgbot.py"
+  path[tgbot_dockerfile]="${config_path}/tgbot/Dockerfile"
+  path[tgbot_compose]="${config_path}/tgbot/docker-compose.yml"
+
+  service[config]='none'
+  service[users]='none'
+  service[compose]='compose'
+  service[engine]='engine'
+  service[haproxy]='haproxy'
+  service[nginx_conf]='nginx'
+  service[website]='nginx'
+  service[certbot_deployhook]='certbot'
+  service[certbot_dockerfile]='compose'
+  service[certbot_startup]='certbot'
+  service[server_pem]='haproxy'
+  service[server_key]='engine'
+  service[server_crt]='engine'
+  service[tgbot_script]='tgbot'
+  service[tgbot_dockerfile]='compose'
+  service[tgbot_compose]='tgbot'
+
+  for key in "${!path[@]}"; do
+    md5["$key"]=$(get_md5 "${path[$key]}")
+  done
+}
+
+# The current kernel state, read back from /proc instead of assumed. Both helpers
+# are tolerant so they can also run where /proc/sys is not mounted.
+function current_congestion_control {
+  cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true
+}
+
+function current_qdisc {
+  cat /proc/sys/net/core/default_qdisc 2>/dev/null || true
+}
+
+function bbr_supported {
+  local available
+  available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)
+  [[ ${available} == *bbr* ]]
+}
+
+# One place decides how the BBR state is described, so the installer output, the
+# management menu and --show-server-config can never disagree.
+function bbr_summary {
+  local kernel_cc
+  local kernel_qdisc
+  if [[ ${config[bbr]} != 'ON' ]]; then
+    echo "${config[bbr]}"
+    return 0
+  fi
+  kernel_cc=$(current_congestion_control); kernel_cc="${kernel_cc:-unknown}"
+  kernel_qdisc=$(current_qdisc); kernel_qdisc="${kernel_qdisc:-unknown}"
+  echo "${config[bbr]} (kernel: ${kernel_cc}, qdisc: ${kernel_qdisc})"
+}
+
+function load_bbr_modules {
+  # Writing net.ipv4.tcp_congestion_control only auto-loads the module on some
+  # kernels and net.core.default_qdisc never does, so both are loaded explicitly.
+  # Inside a container that cannot see its host's /lib/modules this fails, which
+  # is why the outcome is not treated as an error here - bbr_supported decides.
+  modprobe tcp_bbr >/dev/null 2>&1 || true
+  modprobe sch_fq >/dev/null 2>&1 || true
+}
+
+function tune_kernel {
+  # The path is a parameter only so the regression suite can write to a scratch
+  # file instead of the real /etc; every caller in this script omits it.
+  local sysctl_file="${1:-/etc/sysctl.d/99-reality.conf}"
+  local bbr_block
+  local line key value
+  local failed=()
+  if [[ ${config[bbr]} == 'OFF' ]]; then
+    bbr_block='# BBR is turned off'
+  else
+    load_bbr_modules
+    if bbr_supported; then
+      bbr_block=$'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr'
+    else
+      bbr_block='# BBR was requested but this kernel does not offer it'
+      echo 'Warning: this kernel does not offer the bbr congestion control algorithm (it ships with Linux 4.9 and newer, and a container cannot load modules from a host it cannot see). Continuing without BBR; every other tunable below is still applied.'
+    fi
+  fi
+  # nf_conntrack_max below is meaningless until the module is there, and on a
+  # minimal system that is what used to make one key fail silently.
+  modprobe nf_conntrack >/dev/null 2>&1 || true
+  cat >"${sysctl_file}" <<EOF
+fs.file-max = 200000
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.netdev_max_backlog = 250000
+net.core.somaxconn = 4096
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.ip_local_port_range = 10000 65000
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_max_tw_buckets = 5000
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mem = 25600 51200 102400
+net.ipv4.tcp_rmem = 4096 65536 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+vm.swappiness = 10
+${bbr_block}
+net.netfilter.nf_conntrack_max=1000000
+EOF
+  # Every key is written on its own instead of relying on `sysctl -p`, whose
+  # errors used to be thrown away: a kernel that rejected one line could leave
+  # BBR unapplied while the installer reported success. Failures are collected
+  # and reported rather than hidden.
+  while IFS= read -r line; do
+    [[ ${line} == *=* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key// /}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    if ! sysctl -qw "${key}=${value}" >/dev/null 2>&1; then
+      failed+=("${key}")
+    fi
+  done <"${sysctl_file}"
+  if [[ ${#failed[@]} -gt 0 ]]; then
+    echo "Warning: these kernel settings are not available on this system and were skipped: ${failed[*]}"
+  fi
+  if [[ ${config[bbr]} == 'OFF' ]]; then
+    # Revert only what this script would have set, so a congestion control the
+    # user picked themselves is never overwritten.
+    if [[ "$(current_congestion_control)" == 'bbr' ]]; then
+      sysctl -qw net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+    fi
+    if [[ "$(current_qdisc)" == 'fq' ]]; then
+      sysctl -qw net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
+    fi
+    echo "BBR is disabled (congestion control: $(current_congestion_control), qdisc: $(current_qdisc))."
+    return 0
+  fi
+  if [[ "$(current_congestion_control)" == 'bbr' ]]; then
+    echo "BBR is enabled (congestion control: $(current_congestion_control), qdisc: $(current_qdisc))."
+  else
+    echo "Warning: BBR was requested but is not active; the kernel reports \"$(current_congestion_control)\" as the congestion control."
+  fi
+}
+
+function configure_docker {
+  local docker_config="/etc/docker/daemon.json"
+  local config_modified=false
+  local temp_file
+  # The bot container runs this script for --list-users / --show-user and has no
+  # /etc/docker of its own. Without the mkdir the redirect below fails and set -e
+  # aborts the whole script, so every bot command dies before it prints anything.
+  if [[ ! -d "${docker_config%/*}" ]]; then
+    mkdir -p "${docker_config%/*}" 2>/dev/null || return 0
+  fi
+  temp_file=$(mktemp)
+  if [[ ! -f "${docker_config}" ]] || [[ ! -s "${docker_config}" ]]; then
+    echo '{"experimental": true, "ip6tables": true}' | jq . > "${docker_config}"
+    config_modified=true
+  else
+    if ! jq . "${docker_config}" &> /dev/null; then
+      echo '{"experimental": true, "ip6tables": true}' | jq . > "${docker_config}"
+      config_modified=true
+    else
+      if jq 'if .experimental != true or .ip6tables != true then .experimental = true | .ip6tables = true else . end' "${docker_config}" | jq . > "${temp_file}"; then
+        if ! cmp --silent "${docker_config}" "${temp_file}"; then
+          mv "${temp_file}" "${docker_config}"
+          config_modified=true
+        fi
+      fi
+    fi
+  fi
+  rm -f "${temp_file}"
+  # Container images carry no systemctl. Treat "cannot manage docker here" as
+  # "nothing to restart" instead of letting the missing binary print errors.
+  if [[ "${config_modified}" = true ]] || ! systemctl is-active --quiet docker 2>/dev/null; then
+    systemctl restart docker 2>/dev/null || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Actions that are not part of the install flow.
+# ---------------------------------------------------------------------------
+
+# Newest tag of a pinned image, restricted to the same "shape" as the pinned one
+# (same optional "v" prefix and suffix such as "-alpine"), so that a version is
+# compared like for like. Returns non-zero when the registry cannot be reached.
+function latest_image_tag {
+  local ref=$1
+  local repo="${ref%:*}"
+  local tags
+  local pattern
+  case "${ref}" in
+    ghcr.io/xtls/xray-core:*)    pattern='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    ghcr.io/sagernet/sing-box:*) pattern='^v[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    nginx:*)                     pattern='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    certbot/certbot:*)           pattern='^v[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    haproxy:*)                   pattern='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    python:*)                    pattern='^[0-9]+\.[0-9]+\.[0-9]+-alpine$' ;;
+    *)                           return 1 ;;
+  esac
+  # nginx.org names the stable branch on its download page. The Docker Hub tag
+  # API is paginated (1381 nginx tags) and its first page holds a single bare
+  # version (the mainline one), so sorting a page either reported mainline or
+  # came back empty. Ask the project page instead.
+  if [[ ${ref} == nginx:* ]]; then
+    local page stable
+    page=$(curl -fsSL -m 20 https://nginx.org/en/download.html) || return 1
+    stable=$(printf '%s' "${page}" \
+      | sed 's/</\n</g' \
+      | awk '/Stable version/{found=1;next} found' \
+      | grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' \
+      | head -n 1) || true
+    stable="${stable#nginx-}"
+    stable="${stable%.tar.gz}"
+    [[ -n ${stable} ]] || return 1
+    echo "${stable}"
+    return 0
+  fi
+  if [[ ${repo} == ghcr.io/* ]]; then
+    # The GHCR tag list is paginated and comes back in lexicographic order, so
+    # sorting one page reports a long-dead tag (a real run claimed xray
+    # "1.8.23"). GitHub's latest-release endpoint is the authoritative stable
+    # tag, so ask it for the two engines and keep the pin's "v" shape.
+    local gh_repo=''
+    case "${repo}" in
+      ghcr.io/xtls/xray-core)    gh_repo='XTLS/Xray-core' ;;
+      ghcr.io/sagernet/sing-box) gh_repo='SagerNet/sing-box' ;;
+    esac
+    if [[ -n ${gh_repo} ]]; then
+      local gh_tag
+      gh_tag=$(curl -fsSL -m 20 -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/${gh_repo}/releases/latest" \
+        | jq -r '.tag_name // empty' 2>/dev/null) || return 1
+      gh_tag="${gh_tag#v}"
+      [[ -n ${gh_tag} ]] || return 1
+      if [[ ${ref##*:} == v* ]]; then
+        echo "v${gh_tag}"
+      else
+        echo "${gh_tag}"
+      fi
+      return 0
+    fi
+    local ghcr_repo="${repo#ghcr.io/}"
+    local token
+    token=$(curl -fsSL -m 15 "https://ghcr.io/token?scope=repository:${ghcr_repo}:pull&service=ghcr.io" | jq -r '.token // empty' 2>/dev/null) || return 1
+    if [[ -z ${token} ]]; then
+      return 1
+    fi
+    tags=$(curl -fsSL -m 15 -H "Authorization: Bearer ${token}" "https://ghcr.io/v2/${ghcr_repo}/tags/list" | jq -r '.tags[]? // empty' 2>/dev/null) || return 1
+  else
+    local hub_repo="${repo}"
+    if [[ ${hub_repo} != */* ]]; then
+      hub_repo="library/${hub_repo}"
+    fi
+    tags=$(curl -fsSL -m 20 "https://hub.docker.com/v2/repositories/${hub_repo}/tags?page_size=100" | jq -r '.results[]?.name // empty' 2>/dev/null) || return 1
+  fi
+  if [[ -z ${tags} ]]; then
+    return 1
+  fi
+  local filtered
+  filtered=$(printf '%s\n' "${tags}" | grep -E "${pattern}")
+  [[ -n ${filtered} ]] || return 1
+  printf '%s\n' "${filtered}" | sort -V | tail -n 1
+}
+
+function check_update {
+  if ! command -v jq >/dev/null 2>&1; then
+    echo 'The update check needs jq and curl; install them and try again.'
+    return 1
+  fi
+  echo "Pinned images vs. their upstream registries:"
+  local ref pinned latest
+  local outdated=0
+  for ref in "${image[xray]}" "${image[sing-box]}" "${image[nginx]}" "${image[certbot]}" "${image[haproxy]}" "${image[python]}"; do
+    pinned="${ref##*:}"
+    if latest=$(latest_image_tag "${ref}"); then
+      if [[ ${latest} == "${pinned}" ]]; then
+        printf '  ok   %-42s %s\n' "${ref}" "up to date"
+      else
+        printf '  !    %-42s pinned %s, newest %s\n' "${ref}" "${pinned}" "${latest}"
+        outdated=$((outdated + 1))
+      fi
+    else
+      printf '  ?    %-42s registry not reachable\n' "${ref}"
+    fi
+  done
+  if [[ -n ${config[core_version]} ]]; then
+    echo "  i    ${config[core]} uses the --core-version override ${config[core_version]} from the config, not the pin above."
+  fi
+  if [[ ${outdated} -eq 0 ]]; then
+    echo 'All pinned images are current.'
+  else
+    echo "${outdated} image(s) have a newer tag upstream; update the image[] pins after reading the changelog."
+  fi
+}
+
+# Open the ports the stack publishes in the host firewall. ufw and firewalld are
+# handled directly; anything else (or none) just prints the list, because a wrong
+# nftables rule is worse than no rule at all.
+function open_firewall {
+  local tcp_ports=("${config[port]}")
+  local udp_ports=()
+  local port
+  if [[ ${config[http_port]} != 'OFF' ]]; then
+    tcp_ports+=("${config[http_port]}")
+  fi
+  if needs_certbot && [[ -z ${config[dns_provider]} ]]; then
+    tcp_ports+=('80')
+  fi
+  if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
+    udp_ports+=("${config[port]}")
+  fi
+  if [[ -n ${config[ss_port]} ]]; then
+    tcp_ports+=("${config[ss_port]}")
+    udp_ports+=("${config[ss_port]}")
+  fi
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    for port in "${tcp_ports[@]}"; do ufw allow "${port}/tcp" >/dev/null 2>&1 || true; done
+    for port in "${udp_ports[@]}"; do ufw allow "${port}/udp" >/dev/null 2>&1 || true; done
+    echo "Opened in ufw: ${tcp_ports[*]}/tcp"
+    if [[ ${#udp_ports[@]} -gt 0 ]]; then
+      echo "Opened in ufw: ${udp_ports[*]}/udp"
+    fi
+    return 0
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+    for port in "${tcp_ports[@]}"; do firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true; done
+    for port in "${udp_ports[@]}"; do firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1 || true; done
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    echo "Opened in firewalld: ${tcp_ports[*]}/tcp"
+    if [[ ${#udp_ports[@]} -gt 0 ]]; then
+      echo "Opened in firewalld: ${udp_ports[*]}/udp"
+    fi
+    return 0
+  fi
+  echo 'No active ufw/firewalld was detected, so no host rule was changed.'
+  echo "Allow these in your provider's firewall / security group:"
+  echo "  tcp ${tcp_ports[*]}"
+  if [[ ${#udp_ports[@]} -gt 0 ]]; then
+    echo "  udp ${udp_ports[*]}"
+  fi
+  return 0
+}
+
+# A read-only health check of the local stack. It never changes anything.
+function doctor {
+  local -i problems=0
+  local check running
+  echo 'reality doctor'
+  echo '=============='
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    echo 'ok    docker daemon is running'
+  else
+    echo 'FAIL  docker daemon is not running (or docker is not installed)'
+    problems=$((problems + 1))
+  fi
+  for check in engine nginx haproxy; do
+    running=$(${docker_cmd} -p "${compose_project}" ps --status running -q "${check}" 2>/dev/null | head -n 1)
+    if [[ -n ${running} ]]; then
+      echo "ok    service ${check} is running"
+    else
+      echo "FAIL  service ${check} is not running"
+      problems=$((problems + 1))
+    fi
+  done
+  if needs_certbot; then
+    running=$(${docker_cmd} -p "${compose_project}" ps --status running -q certbot 2>/dev/null | head -n 1)
+    if [[ -n ${running} ]]; then
+      echo 'ok    service certbot is running'
+    else
+      echo 'warn  service certbot is not running'
+    fi
+  fi
+  if port_in_use "${config[port]}"; then
+    echo "ok    proxy port ${config[port]} is listening"
+  else
+    echo "FAIL  nothing is listening on the proxy port ${config[port]}"
+    problems=$((problems + 1))
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    check=$(echo | timeout 10 openssl s_client -connect "127.0.0.1:${config[port]}" -servername "${config[domain]%%:*}" -tls1_3 2>/dev/null | grep -c 'TLSv1.3' || true)
+    if [[ ${check} -ge 1 ]]; then
+      echo "ok    TLS 1.3 handshake for SNI ${config[domain]%%:*} on ${config[port]} succeeds"
+    else
+      echo "FAIL  no TLS 1.3 handshake for SNI ${config[domain]%%:*} on ${config[port]}"
+      problems=$((problems + 1))
+    fi
+    if engine_owns_tls; then
+      check=$(echo | timeout 10 openssl s_client -connect "127.0.0.1:${config[port]}" -servername 'doctor.invalid' 2>/dev/null | grep -c 'BEGIN CERTIFICATE' || true)
+      if [[ ${check} -ge 1 ]]; then
+        echo 'ok    a non-proxy SNI still reaches a website certificate'
+      else
+        echo 'warn  a non-proxy SNI did not get a certificate back'
+      fi
+    fi
+  else
+    echo 'warn  openssl is not available; skipping the TLS checks'
+  fi
+  if [[ ${config[http_port]} != 'OFF' ]] && command -v curl >/dev/null 2>&1; then
+    if curl -fsS -m 5 -o /dev/null "http://127.0.0.1:${config[http_port]}/"; then
+      echo "ok    website answers on http://127.0.0.1:${config[http_port]}/"
+    else
+      echo "warn  the website did not answer on http://127.0.0.1:${config[http_port]}/"
+    fi
+  fi
+  if [[ -f ${path[server_pem]} ]] && command -v openssl >/dev/null 2>&1; then
+    check=$(openssl x509 -enddate -noout -in "${path[server_pem]}" 2>/dev/null | cut -d= -f2 || true)
+    if [[ -n ${check} ]]; then
+      echo "info  certificate notAfter: ${check}"
+    fi
+  fi
+  if [[ ${config[server]} =~ ${regex[domain]} ]]; then
+    check=$(getent hosts "${config[server]}" 2>/dev/null | awk '{print $1; exit}' || true)
+    if [[ -n ${check} ]]; then
+      echo "info  ${config[server]} resolves to ${check}"
+    else
+      echo "warn  ${config[server]} does not resolve"
+    fi
+  fi
+  echo
+  echo "Ports to allow in the provider firewall / security group:"
+  echo "  tcp: ${config[port]}$([[ ${config[http_port]} != 'OFF' ]] && echo " ${config[http_port]}" || true)$([[ ${config[security]} == 'letsencrypt' ]] && echo ' 80' || true)"
+  if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
+    echo "  udp: ${config[port]}"
+  fi
+  echo
+  if [[ ${problems} -eq 0 ]]; then
+    echo 'No hard failures found.'
+  else
+    echo "${problems} hard failure(s) found."
+  fi
+  return 0
+}
+
+if ! parse_args "$@"; then
+  show_help
+  exit 1
+fi
+if [[ ${args[help]} == true ]]; then
+  show_help
+  exit 0
+fi
+if [[ $EUID -ne 0 ]]; then
+    echo "This script must be run as root."
+    exit 1
+fi
+# --uninstall runs before the migration on purpose: it removes the old layout
+# itself, so there is nothing to migrate, and migrating first would rewrite the
+# system for an installation that is about to be deleted. It sits after the root
+# check because it needs to stop containers and delete /opt.
+if [[ ${args[uninstall]} == true ]]; then
+  uninstall
+fi
+# Deliberately early: --backup and --restore read the configuration directory
+# directly, so a server still using the old layout has to be migrated before any
+# of them runs.
+migrate_legacy_install
+if [[ ${args[backup]} == true ]]; then
+  if [[ -n ${args[backup_password]} ]]; then
+    backup_url=$(backup "${args[backup_password]}")
+  else
+    backup_url=$(backup)
+  fi
+  if [[ $? -eq 0 ]]; then
+    echo "Backup created successfully. You can download the backup file from this address:"
+    echo "${backup_url}"
+    echo "The URL is valid for 3 days."
+    exit 0
+  fi
+fi
+if [[ -n ${args[restore]} ]]; then
+  if [[ -n ${args[backup_password]} ]]; then
+    restore "${args[restore]}" "${args[backup_password]}"
+  else
+    restore "${args[restore]}"
+  fi
+  if [[ $? -eq 0 ]]; then
+    args[restart]=true
+    echo "Backup has been restored successfully."
+  fi
+  echo "Press Enter to continue ..."
+  read
+  clear
+fi
+generate_file_list
+install_packages
+if [[ ${args[check_update]} == true ]]; then
+  check_update || true
+  exit 0
+fi
+install_docker
+configure_docker
+upgrade
+# Config writes during bootstrap only mark the state dirty; the single
+# flush_reload below replaces the repeated regeneration + container restarts
+# that used to happen on every intermediate write.
+RELOAD_DEFERRED=1
+parse_config_file
+parse_users_file
+build_config
+update_config_file
+update_users_file
+RELOAD_DEFERRED=0
+tune_kernel
+flush_reload
+
+# --open-firewall and --doctor are one-shot diagnostics: they run after the
+# configuration is built so they can use the resolved ports and SNI.
+if [[ ${args[open_firewall]} == true ]]; then
+  open_firewall
+fi
+if [[ ${args[doctor]} == true ]]; then
+  doctor
+  exit 0
+fi
+
+if [[ ${args[menu]} == 'true' ]]; then
+  set +e
+  main_menu
+  set -e
+fi
+if [[ ${args[restart]} == 'true' ]]; then
+  restart_docker_compose
+  if [[ ${config[tgbot]} == 'ON' ]]; then
+    restart_tgbot_compose
+  fi
+fi
+if [[ -z "$(${docker_cmd} ls | grep "${path[compose]}" | grep running || true)" ]]; then
+  restart_docker_compose
+fi
+if [[ ${config[tgbot]} == 'ON' ]]; then
+  if [[ ${tgbot_dockerfile_changed:-false} == true ]]; then
+    restart_tgbot_compose
+  elif [[ -z "$(${docker_cmd} ls | grep "${path[tgbot_compose]}" | grep running || true)" ]]; then
+    restart_tgbot_compose
+  fi
+fi
+if [[ ${args[server-config]} == true ]]; then
+  show_server_config
+  exit 0
+fi
+if [[ -n ${args[list_users]} ]]; then
+  for user in "${!users[@]}"; do
+    echo "${user}"
+  done
+  exit 0
+fi
+if [[ ${#users[@]} -eq 1 ]]; then
+  username="${!users[@]}"
+fi
+if [[ -n ${args[show_config]} ]]; then
+  username="${args[show_config]}"
+  if [[ -z "${users["${username}"]}" ]]; then
+    echo 'User "'"$username"'" does not exists.'
+    exit 1
+  fi
+fi
+if [[ -n ${args[add_user]} ]]; then
+  username="${args[add_user]}"
+fi
+if [[ -n $username ]]; then
+  if [[ -n ${args[format]} && ${args[format]} != 'uri' ]]; then
+    print_client_configuration_formatted "${username}"
+  else
+    print_client_configuration "${username}"
+  fi
+fi
+echo "Command has been executed successfully!"
+exit 0

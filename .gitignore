@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local scratch
+.orig-backup/
+.tmp/
+.tmp-*
+*.diff
+
+# The regression suites and the VPS/ops helpers live in ../tools now, outside
+# this repository, so their scratch output no longer has to be ignored here.
