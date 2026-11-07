@@ -286,6 +286,9 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 
 ## Command line reference
 
+<details>
+<summary>Click to expand the full option table (28 options)</summary>
+
 | Option | Description |
 | --- | --- |
 | `-t, --transport <tcp\|http\|grpc\|ws\|tuic\|hysteria2\|shadowtls>` | Transport protocol (default `tcp`) |
@@ -317,6 +320,8 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `-m, --menu` | Open the management menu |
 | `-u, --uninstall` | Remove the stack and delete `/opt/reality`; an install left by an older release under `/opt/reality-ezpz` and the kernel tuning drop-in go too |
 | `-h, --help` | Show help |
+
+</details>
 
 ---
 

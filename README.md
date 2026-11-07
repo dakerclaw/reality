@@ -250,6 +250,9 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 
 ## 命令行参数
 
+<details>
+<summary>点击展开完整参数表（38 项）</summary>
+
 | 参数 | 说明 |
 | --- | --- |
 | `-t, --transport <tcp\|http\|grpc\|ws\|tuic\|hysteria2\|shadowtls\|anytls>` | 传输协议（默认 `tcp`）；`anytls` 需要 sing-box 内核与真实 / 自签证书（不能配 `reality`），由引擎自己终止 TLS |
@@ -291,6 +294,8 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `-m, --menu` | 打开管理菜单 |
 | `-u, --uninstall` | 卸载服务栈并删除 `/opt/reality`；旧版遗留的 `/opt/reality-ezpz` 与内核调优文件也会一并清理 |
 | `-h, --help` | 查看帮助 |
+
+</details>
 
 ### 伪装目标与「偷自己」
 
