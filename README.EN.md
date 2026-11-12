@@ -242,7 +242,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 | sing-box engine | `ghcr.io/sagernet/sing-box:v1.14.4` | GHCR, published by SagerNet |
 | nginx | `nginx:1.30.6` | Docker Hub official library |
 | haproxy | `haproxy:3.4.7` | Docker Hub official library |
-| certbot | `certbot/certbot:v5.9.0` | Docker Hub, official certbot image |
+| certbot | `certbot/certbot:v5.10.0` | Docker Hub, official certbot image |
 | Telegram bot base | `python:3.15.2-alpine` | Docker Hub official library |
 
 Every image is pinned to the newest **stable** release of its project, never to a

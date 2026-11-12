@@ -52,13 +52,16 @@ MENU="Select an option:"
 #   haproxy   https://hub.docker.com/v2/repositories/library/haproxy/tags
 #   certbot   https://hub.docker.com/v2/repositories/certbot/certbot/tags
 #   python    https://hub.docker.com/v2/repositories/library/python/tags
-#             The bot image is on the newest Python because tgbot.py targets
-#             python-telegram-bot 22.x (asyncio). 13.x vendors a six-based
-#             urllib3 that cannot even be imported on Python 3.12+.
+#             With `name=<major>.<minor>.` and `ordering=last_updated`, because
+#             the plain first page is "whatever was rebuilt most recently", not
+#             "the newest version". The bot image is on the newest Python
+#             because tgbot.py targets python-telegram-bot 22.x (asyncio). 13.x
+#             vendors a six-based urllib3 that cannot even be imported on
+#             Python 3.12+.
 image[xray]="ghcr.io/xtls/xray-core:26.11.9"
 image[sing-box]="ghcr.io/sagernet/sing-box:v1.14.4"
 image[nginx]="nginx:1.30.6"
-image[certbot]="certbot/certbot:v5.9.0"
+image[certbot]="certbot/certbot:v5.10.0"
 image[haproxy]="haproxy:3.4.7"
 image[python]="python:3.15.2-alpine"
 
@@ -4444,6 +4447,30 @@ function latest_image_tag {
     stable="${stable%.tar.gz}"
     [[ -n ${stable} ]] || return 1
     echo "${stable}"
+    return 0
+  fi
+  # library/python has thousands of tags and the bare tag list is ordered by
+  # "last rebuilt", so its first page is a mix of every supported branch - a
+  # real run called 3.12.16-alpine "newer" than the pinned 3.15.2-alpine purely
+  # because that old branch had been rebuilt later. Ask for the pinned minor
+  # instead (name=3.15. with ordering=last_updated): the pin is a compatibility
+  # decision, not "the newest Python that exists", so the check reports patch
+  # updates inside that minor and stays quiet about the other ones.
+  if [[ ${ref} == python:* ]]; then
+    local version family newest
+    version="${ref##*:}"
+    version="${version%%-*}"      # 3.15.2-alpine -> 3.15.2
+    family="${version%.*}"        # 3.15.2        -> 3.15
+    local page_tags
+    page_tags=$(curl -fsSL -m 20 \
+      "https://hub.docker.com/v2/repositories/library/python/tags?page_size=100&ordering=last_updated&name=${family}." \
+      | jq -r '.results[]?.name // empty' 2>/dev/null) || return 1
+    [[ -n ${page_tags} ]] || return 1
+    newest=$(printf '%s\n' "${page_tags}" \
+      | grep -E "^${family//./\\.}\.[0-9]+-alpine$" \
+      | sort -V | tail -n 1) || true
+    [[ -n ${newest} ]] || return 1
+    echo "${newest}"
     return 0
   fi
   if [[ ${repo} == ghcr.io/* ]]; then
