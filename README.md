@@ -208,12 +208,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 
 | 组件 | 镜像 | 来源 |
 | --- | --- | --- |
-| xray 引擎 | `ghcr.io/xtls/xray-core:26.3.27` | GHCR，XTLS 官方发布 |
-| sing-box 引擎 | `ghcr.io/sagernet/sing-box:v1.14.1` | GHCR，SagerNet 官方发布 |
-| nginx | `nginx:1.30.5` | Docker Hub 官方 library |
-| haproxy | `haproxy:3.4.4` | Docker Hub 官方 library |
-| certbot | `certbot/certbot:v5.8.0` | Docker Hub 官方 certbot 镜像 |
-| Telegram 机器人基础镜像 | `python:3.14-alpine` | Docker Hub 官方 library |
+| xray 引擎 | `ghcr.io/xtls/xray-core:26.11.9` | GHCR，XTLS 官方发布 |
+| sing-box 引擎 | `ghcr.io/sagernet/sing-box:v1.14.4` | GHCR，SagerNet 官方发布 |
+| nginx | `nginx:1.30.6` | Docker Hub 官方 library |
+| haproxy | `haproxy:3.4.7` | Docker Hub 官方 library |
+| certbot | `certbot/certbot:v5.9.0` | Docker Hub 官方 certbot 镜像 |
+| Telegram 机器人基础镜像 | `python:3.15.2-alpine` | Docker Hub 官方 library |
 
 每个镜像都钉在各自项目的**最新稳定版**上，不使用 `latest` 一类的浮动 tag，因此不同时间安装的
 两台服务器跑的是同一份代码。xray 从 v26.4 起的版本都被上游标记为 pre-release，所以这里取的是

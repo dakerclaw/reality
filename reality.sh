@@ -45,7 +45,7 @@ MENU="Select an option:"
 # floating tag, so two servers installed on different days run the same code.
 # How to re-check (all of these need no credentials):
 #   xray      https://api.github.com/repos/XTLS/Xray-core/releases/latest
-#             (26.10.31 is the current stable tag per GitHub latest release)
+#             (26.11.9 is the current stable tag per GitHub latest release)
 #   sing-box  https://api.github.com/repos/SagerNet/sing-box/releases/latest
 #   nginx     https://nginx.org/en/download.html          (the "Stable version"
 #             line; the odd-numbered minor branch is mainline)
@@ -55,7 +55,7 @@ MENU="Select an option:"
 #             The bot image is on the newest Python because tgbot.py targets
 #             python-telegram-bot 22.x (asyncio). 13.x vendors a six-based
 #             urllib3 that cannot even be imported on Python 3.12+.
-image[xray]="ghcr.io/xtls/xray-core:26.10.31"
+image[xray]="ghcr.io/xtls/xray-core:26.11.9"
 image[sing-box]="ghcr.io/sagernet/sing-box:v1.14.4"
 image[nginx]="nginx:1.30.6"
 image[certbot]="certbot/certbot:v5.9.0"

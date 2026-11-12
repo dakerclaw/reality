@@ -238,12 +238,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 
 | Component | Image | Registry |
 | --- | --- | --- |
-| xray engine | `ghcr.io/xtls/xray-core:26.3.27` | GHCR, published by XTLS |
-| sing-box engine | `ghcr.io/sagernet/sing-box:v1.14.1` | GHCR, published by SagerNet |
-| nginx | `nginx:1.30.5` | Docker Hub official library |
-| haproxy | `haproxy:3.4.4` | Docker Hub official library |
-| certbot | `certbot/certbot:v5.8.0` | Docker Hub, official certbot image |
-| Telegram bot base | `python:3.14-alpine` | Docker Hub official library |
+| xray engine | `ghcr.io/xtls/xray-core:26.11.9` | GHCR, published by XTLS |
+| sing-box engine | `ghcr.io/sagernet/sing-box:v1.14.4` | GHCR, published by SagerNet |
+| nginx | `nginx:1.30.6` | Docker Hub official library |
+| haproxy | `haproxy:3.4.7` | Docker Hub official library |
+| certbot | `certbot/certbot:v5.9.0` | Docker Hub, official certbot image |
+| Telegram bot base | `python:3.15.2-alpine` | Docker Hub official library |
 
 Every image is pinned to the newest **stable** release of its project, never to a
 floating tag such as `latest`, so two servers installed months apart run exactly
