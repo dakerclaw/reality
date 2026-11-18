@@ -50,6 +50,9 @@ with three design rules on top of the upstream feature set:
   the fallback target stays a remote site, never your own
 * Password-protected backup / restore of users and configuration
 * Kernel tunables, IPv6 support, `tcp`/`http`/`grpc`/`ws` multiplexing behind haproxy
+* A public IPv6 address is detected during the install: when there is one, every
+  printed client link also comes in an IPv6 flavour (tagged `-ipv6`); otherwise
+  the output says so and only the IPv4 link is shown
 
 ---
 

@@ -28,6 +28,9 @@ declare -A service
 declare -A md5
 declare -A regex
 declare -A image
+# Host IPv6 snapshot: filled once per run by detect_ipv6/ensure_ipv6.
+ipv6_address=''
+ipv6_checked=false
 
 config_path="/opt/reality"
 compose_project='reality'
@@ -2484,14 +2487,67 @@ function generate_config {
 }
 
 function get_ipv6 {
-  curl -fsSL -m 3 --ipv6 https://cloudflare.com/cdn-cgi/trace 2> /dev/null | grep ip | cut -d '=' -f2
+  # -6: a host without IPv6 fails here in milliseconds, which is the answer
+  # we want (the caller treats an empty result as "no IPv6").
+  curl -6 -fsSL -m 3 https://cloudflare.com/cdn-cgi/trace 2> /dev/null | grep -m1 '^ip=' | cut -d '=' -f2
+}
+
+# Detects whether this host is reachable over IPv6, once per run, and records
+# the answer in ipv6_address (empty = no usable public IPv6). Detection runs
+# during the install flow and before --show-user prints anything, never inside
+# the link printers: those stay offline so test mode and the Telegram bot cannot
+# be slowed down or broken by a probe. A ULA (fc00::/7), a link-local
+# (fe80::/10), a loopback or IPv4-mapped address is not reachable from the
+# internet, so only a global unicast address is accepted.
+function detect_ipv6 {
+  ipv6_checked=true
+  local address
+  address=$(get_ipv6) || true
+  case "${address}" in
+    '') ;;
+    *.*) ;;                 # IPv4-mapped (::ffff:203.0.113.10) or a fake answer
+    *%*) ;;                 # scoped (fe80::1%eth0) - local to one link
+    *)
+      case "${address,,}" in
+        fc*|fd*) ;;                                    # ULA
+        fe8*|fe9*|fea*|feb*) ;;                        # link-local fe80::/10
+        ::1|::) ;;                                     # loopback / unspecified
+        *) ipv6_address="${address}" ;;
+      esac
+      ;;
+  esac
+  if [[ -n ${ipv6_address} ]]; then
+    echo "IPv6: ${ipv6_address}"
+  else
+    echo 'IPv6: none detected, client links will carry IPv4 only.'
+  fi
+  return 0
+}
+
+# Runs the detection exactly once per invocation, however many entry points ask
+# for it (the install flow, --show-user, the menu).
+function ensure_ipv6 {
+  if [[ ${ipv6_checked} == true ]]; then
+    return 0
+  fi
+  detect_ipv6
+}
+
+# Sets ipv6_address for this link: the snapshot only counts when the configured
+# server address is a literal IPv4, because the twin link is produced by
+# swapping that literal. A domain can resolve to anything, so it gets no twin.
+function resolve_link_ipv6 {
+  ipv6_link_address=''
+  if [[ -n ${ipv6_address} && ${config[server]} =~ ${regex[ip]} ]]; then
+    ipv6_link_address="${ipv6_address}"
+  fi
 }
 
 function print_client_configuration {
   local username=$1
   local client_config
-  local ipv6
   local client_config_ipv6
+  local ipv6_link_address
   local ss_config=''
   local ss_config_ipv6=''
   if [[ ${config[transport]} == 'tuic' ]]; then
@@ -2567,15 +2623,18 @@ function print_client_configuration {
     echo ""
     qrencode -t ansiutf8 "${ss_config}"
   fi
-  ipv6=$(get_ipv6)
-  if [[ -n $ipv6 ]]; then
+  # Links are printed with the address family that was verified at detection
+  # time. A domain cannot be substituted for a literal address, so an IPv6 twin
+  # is only offered when --server is an IP.
+  resolve_link_ipv6
+  if [[ -n ${ipv6_link_address} ]]; then
     if [[ ${config[transport]} != 'shadowtls' ]]; then
-      client_config_ipv6=$(echo "$client_config" | sed "s/@${config[server]//./\\.}:/@[${ipv6}]:/" | sed "s/#${username}/#${username}-ipv6/")
+      client_config_ipv6=$(echo "$client_config" | sed "s/@${config[server]//./\\.}:/@[${ipv6_link_address}]:/" | sed "s/#${username}/#${username}-ipv6/")
     else
-      client_config_ipv6=$(echo "$client_config" | sed "s/\"server\":\"${config[server]//./\\.}\"/\"server\":\"${ipv6}\"/")
+      client_config_ipv6=$(echo "$client_config" | sed "s/\"server\":\"${config[server]//./\\.}\"/\"server\":\"${ipv6_link_address}\"/")
     fi
     if [[ -n ${ss_config} ]]; then
-      ss_config_ipv6=$(echo "$ss_config" | sed "s/@${config[server]//./\\.}:/@[${ipv6}]:/" | sed "s/#${username}-ss/#${username}-ss-ipv6/")
+      ss_config_ipv6=$(echo "$ss_config" | sed "s/@${config[server]//./\\.}:/@[${ipv6_link_address}]:/" | sed "s/#${username}-ss/#${username}-ss-ipv6/")
     fi
     echo ""
     echo "==================IPv6 Config======================"
@@ -4755,6 +4814,11 @@ RELOAD_DEFERRED=1
 parse_config_file
 parse_users_file
 build_config
+# One IPv6 probe per run, kept outside the link printers so --show-user, --doctor
+# and the Telegram bot reuse the snapshot instead of hitting the network again.
+# It runs here, after build_config has resolved the server address, and before
+# any client link is printed later in this invocation.
+ensure_ipv6
 update_config_file
 update_users_file
 RELOAD_DEFERRED=0
