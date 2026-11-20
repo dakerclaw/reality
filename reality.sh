@@ -141,6 +141,11 @@ defaults[core]=sing-box
 # the tested pin from the image[] block above is used.
 defaults[core_version]=""
 defaults[security]=reality
+# Optional second, UDP-only inbound. OFF keeps the stack single-protocol;
+# hysteria2 / tuic add a QUIC inbound on <port>/udp next to the main TCP
+# transport, which is what lets reality and a QUIC protocol share one port
+# number. The QUIC side uses the local certificate (insecure=1 on clients).
+defaults[quic_transport]="OFF"
 defaults[server]=$(curl -fsSL --ipv4 -m 5 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -m1 '^ip=' | cut -d '=' -f2 || true)
 defaults[tgbot]=OFF
 defaults[tgbot_token]=""
@@ -172,6 +177,7 @@ config_items=(
   "private_key"
   "short_id"
   "transport"
+  "quic_transport"
   "domain"
   "camouflage"
   "server"
@@ -233,12 +239,17 @@ function show_help {
   echo ""
   echo "Usage: reality.sh [-t|--transport=tcp|http|grpc|ws|tuic|hysteria2|shadowtls|anytls] [-d|--domain=<domain>] [--camouflage=<domain[:port]>] [--server=<server>]
   [--regenerate] [--default] [-r|--restart] [--enable-safenet=true|false] [--enable-bbr=true|false] [--port=<port>] [--http-port=<port|off>] [-c|--core=xray|sing-box]
-  [--enable-warp=true|false] [--warp-license=<license>] [--security=reality|letsencrypt|selfsigned] [-m|--menu] [--show-server-config]
+  [--enable-warp=true|false] [--warp-license=<license>] [--security=reality|letsencrypt|selfsigned] [--quic-transport=hysteria2|tuic|off]
+  [-m|--menu] [--show-server-config]
   [--add-user=<username>] [--lists-users] [--show-user=<username>] [--delete-user=<username>] [--backup] [--restore=<url|file>]
   [--backup-password=<password>] [-u|--uninstall]"
   echo ""
   echo "  -t, --transport <tcp|http|grpc|ws|tuic|hysteria2|shadowtls|anytls> Transport protocol (default: ${defaults[transport]})"
   echo "                            anytls needs the sing-box core and a real or self-signed certificate (not reality)"
+  echo "      --quic-transport <hysteria2|tuic|off>"
+  echo "                            Add a second, UDP-only inbound on <port>/udp next to the main transport"
+  echo "                            (sing-box only, TCP main transport): reality over TCP and a QUIC protocol"
+  echo "                            then run on the same port number; the QUIC side uses the local certificate"
   echo "  -d, --domain <domain>     Domain to use as SNI (default: ${defaults[domain]})"
   echo "      --camouflage <domain[:port]|self> Remote site the camouflage falls back to in the reality and shadowtls modes."
   echo "                            Unauthenticated probes are relayed to it, so it must be a real site whose certificate"
@@ -293,7 +304,7 @@ function show_help {
 
 function parse_args {
   local opts
-  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,core-version:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,harden-docker:,ss-port:,format:,dns-provider:,dns-credentials:,hysteria2-up:,hysteria2-down:,tuic-congestion:,open-firewall,check-update,doctor,help -- "$@")
+  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,camouflage:,server:,regenerate,default,restart,uninstall,enable-safenet:,enable-bbr:,port:,http-port:,warp-license:,enable-warp:,core:,core-version:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,backup-password:,enable-tgbot:,tgbot-token:,tgbot-admins:,harden-docker:,ss-port:,format:,dns-provider:,dns-credentials:,hysteria2-up:,hysteria2-down:,tuic-congestion:,quic-transport:,open-firewall,check-update,doctor,help -- "$@")
   if [[ $? -ne 0 ]]; then
     return 1
   fi
@@ -582,6 +593,21 @@ function parse_args {
             return 1
             ;;
         esac
+        ;;
+      --quic-transport)
+        case "${2,,}" in
+          ''|off|none)
+            args[quic_transport]="OFF"
+            ;;
+          hysteria2|tuic)
+            args[quic_transport]="${2,,}"
+            ;;
+          *)
+            echo "Invalid QUIC transport: $2 (hysteria2, tuic or off)"
+            return 1
+            ;;
+        esac
+        shift 2
         ;;
       --harden-docker)
         case "$2" in
@@ -931,6 +957,31 @@ function build_config {
   if [[ ${config[transport]} == 'anytls' && ${config[security]} == 'reality' ]]; then
     echo 'You cannot use "anytls" transport with "reality" TLS certificate. Use other transports or change TLS certificate to letsencrypt or selfsigned'
     exit 1
+  fi
+  # The optional QUIC co-install is a second inbound on <port>/udp: it needs a
+  # TCP main transport (otherwise it would collide with the main inbound) and
+  # the sing-box core (xray implements neither hysteria2 nor tuic).
+  case ${config[quic_transport],,} in
+    ''|off|none)
+      config[quic_transport]="OFF"
+      ;;
+    hysteria2|tuic)
+      config[quic_transport]="${config[quic_transport],,}"
+      ;;
+    *)
+      echo "Invalid QUIC transport: ${config[quic_transport]} (hysteria2, tuic or off)"
+      exit 1
+      ;;
+  esac
+  if [[ ${config[quic_transport]} != 'OFF' ]]; then
+    if [[ ${config[core]} != 'sing-box' ]]; then
+      echo "The QUIC co-install (--quic-transport ${config[quic_transport]}) needs the sing-box core; xray has no ${config[quic_transport]} inbound."
+      exit 1
+    fi
+    if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
+      echo "The main transport is already ${config[transport]}; the QUIC co-install needs a TCP main transport (for example tcp with reality)."
+      exit 1
+    fi
   fi
   # Shadowsocks 2022 is a second, plain inbound on a port of its own: it carries
   # no TLS, so it cannot share the SNI-routed proxy port with the website.
@@ -1385,6 +1436,7 @@ function generate_docker_compose {
   local haproxy_http_port=''
   local haproxy_cert_volume=''
   local haproxy_depends=''
+  local engine_cert_mounts=''
   local nginx_service
   local haproxy_service
   if engine_owns_tls; then
@@ -1407,7 +1459,17 @@ function generate_docker_compose {
     fi
     haproxy_cert_volume="    - ./${path[server_pem]#${config_path}/}:/usr/local/etc/haproxy/server.pem"
   fi
-  if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
+  # The engine terminates TLS itself for these transports, and a QUIC
+  # co-install always does. Under reality the mounted pair is the locally
+  # generated self-signed certificate, which the QUIC clients skip-verify.
+  if [[ ${config[quic_transport]:-OFF} != 'OFF' ]]; then
+    engine_cert_mounts='yes'
+  elif [[ ${config[security]:-} != 'reality' ]] && [[ ${config[transport]:-} =~ ^(http|tcp|tuic|hysteria2|anytls)$ ]]; then
+    engine_cert_mounts='yes'
+  fi
+  # A QUIC co-install publishes the same number on UDP: the main transport keeps
+  # <port>/tcp, the second inbound answers QUIC on <port>/udp.
+  if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' || ${config[quic_transport]:-OFF} != 'OFF' ]]; then
     engine_ports="
     - ${config[port]}:443/udp"
   fi
@@ -1500,8 +1562,8 @@ ${engine_ports}
       TZ: Etc/UTC
     volumes:
     - ./${path[engine]#${config_path}/}:/etc/${config[core]}/config.json
-    $([[ ${config[security]} != 'reality' ]] && { [[ ${config[transport]} == 'http' ]] || [[ ${config[transport]} == 'tcp' ]] || [[ ${config[transport]} == 'tuic' ]] || [[ ${config[transport]} == 'hysteria2' ]] || [[ ${config[transport]} == 'anytls' ]]; } && echo "- ./${path[server_crt]#${config_path}/}:/etc/${config[core]}/server.crt" || true)
-    $([[ ${config[security]} != 'reality' ]] && { [[ ${config[transport]} == 'http' ]] || [[ ${config[transport]} == 'tcp' ]] || [[ ${config[transport]} == 'tuic' ]] || [[ ${config[transport]} == 'hysteria2' ]] || [[ ${config[transport]} == 'anytls' ]]; } && echo "- ./${path[server_key]#${config_path}/}:/etc/${config[core]}/server.key" || true)
+    $([[ -n ${engine_cert_mounts} ]] && echo "- ./${path[server_crt]#${config_path}/}:/etc/${config[core]}/server.crt" || true)
+    $([[ -n ${engine_cert_mounts} ]] && echo "- ./${path[server_key]#${config_path}/}:/etc/${config[core]}/server.key" || true)
     networks:
     - reality
 ${nginx_service}
@@ -1982,6 +2044,8 @@ function generate_engine_config {
   local tls_object=""
   local warp_object=""
   local ss_users_object=""
+  local quic_users_object=""
+  local quic_extra=''
   # The camouflage site is what unauthenticated probes reach; it is a separate
   # deployment input from the SNI, and its optional ":port" suffix defaults to 443.
   local camouflage_host="${config[camouflage]%%:*}"
@@ -1998,6 +2062,11 @@ function generate_engine_config {
   local hysteria2_bandwidth=', "ignore_client_bandwidth": true'
   if [[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]]; then
     hysteria2_bandwidth=', "ignore_client_bandwidth": false, "up_mbps": '"${config[hysteria2_up]}"', "down_mbps": '"${config[hysteria2_down]}"''
+  fi
+  if [[ ${config[quic_transport]:-OFF} == 'hysteria2' ]]; then
+    quic_extra=', "obfs": {"type": "salamander", "password": "'"${config[service_path]}"'"}'"${hysteria2_bandwidth}"', "masquerade": "https://'"${config[server]}:${config[port]}"'"'
+  elif [[ ${config[quic_transport]:-OFF} == 'tuic' ]]; then
+    quic_extra=', "congestion_control": "'"${config[tuic_congestion]}"'", "auth_timeout": "3s", "zero_rtt_handshake": false, "heartbeat": "10s"'
   fi
   local temp_file
   if [[ ${config[transport]} == 'tuic' ]]; then
@@ -2076,6 +2145,17 @@ function generate_engine_config {
       else
         users_object=${users_object}'{"uuid": "'"${users[${user}]}"'", "flow": "'"$([[ ${config[transport]} == 'tcp' ]] && echo 'xtls-rprx-vision' || true)"'", "name": "'"${user}"'"}'
       fi
+      if [[ ${config[quic_transport]:-OFF} == 'tuic' ]]; then
+        if [ -n "$quic_users_object" ]; then
+          quic_users_object="${quic_users_object},"$'\n'
+        fi
+        quic_users_object=${quic_users_object}'{"uuid": "'"${users[${user}]}"'", "password": "'"$(echo -n "${user}${users[${user}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)"'", "name": "'"${user}"'"}'
+      elif [[ ${config[quic_transport]:-OFF} == 'hysteria2' ]]; then
+        if [ -n "$quic_users_object" ]; then
+          quic_users_object="${quic_users_object},"$'\n'
+        fi
+        quic_users_object=${quic_users_object}'{"password": "'"$(echo -n "${user}${users[${user}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)"'", "name": "'"${user}"'"}'
+      fi
       if [[ -n ${config[ss_port]} ]]; then
         if [ -n "$ss_users_object" ]; then
           ss_users_object="${ss_users_object},"$'\n'
@@ -2142,6 +2222,16 @@ function generate_engine_config {
       fi
       )
     }
+    $(if [[ ${config[quic_transport]:-OFF} != 'OFF' ]]; then
+    echo ', {
+      "type": "'"${config[quic_transport]}"'",
+      "tag": "quic",
+      "listen": "::",
+      "listen_port": 443,
+      "users": ['"${quic_users_object}"'],
+      '"${tls_object}""${quic_extra}"'
+    }'
+    fi )
     $(if [[ ${config[transport]} == 'shadowtls' ]]; then
     echo ', {
       "type": "shadowsocks",
@@ -2543,6 +2633,90 @@ function resolve_link_ipv6 {
   fi
 }
 
+# Builds the client URI of the optional QUIC inbound. <host> is explicit so the
+# IPv6 twin is produced by calling this again with the literal address.
+function quic_client_uri {
+  local username=$1
+  local host=${2:-${config[server]}}
+  local host_display="${host}"
+  local password
+  local insecure=1
+  # An IPv6 literal has to be bracketed inside a URI; the colon of the host and
+  # the one before the port are indistinguishable otherwise.
+  if [[ ${host} == *:* ]]; then
+    host_display="[${host}]"
+  fi
+  password=$(echo -n "${username}${users[${username}]}" | sha256sum | cut -d ' ' -f 1 | head -c 16)
+  # A letsencrypt certificate is valid for the configured domain, so a client
+  # that connects to that very name verifies it; everything else (reality's
+  # self-signed pair, an IPv6 literal) has to skip verification.
+  if [[ ${config[security]} == 'letsencrypt' && ${host} == "${config[domain]%%:*}" ]]; then
+    insecure=0
+  fi
+  if [[ ${config[quic_transport]} == 'tuic' ]]; then
+    printf 'tuic://%s:%s@%s:%s/?congestion_control=%s&udp_relay_mode=quic&allow_insecure=%s#%s-quic\n' \
+      "${users[${username}]}" "${password}" "${host_display}" "${config[port]}" \
+      "${config[tuic_congestion]}" "${insecure}" "${username}"
+  else
+    printf 'hy2://%s@%s:%s/?obfs=salamander&obfs-password=%s%s&insecure=%s#%s-quic\n' \
+      "${password}" "${host_display}" "${config[port]}" "${config[service_path]}" \
+      "$([[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]] && echo "&up=${config[hysteria2_up]}&down=${config[hysteria2_down]}" || true)" \
+      "${insecure}" "${username}"
+  fi
+}
+
+# A genuinely interactive first install asks what to serve. Skipped when a
+# configuration already exists (the choice was made), when stdin is not a
+# terminal (curl | bash, CI, the bot) or when any flag was given, so unattended
+# installs keep their old, silent behaviour.
+function first_install_protocol_prompt {
+  local key
+  local profile
+  if [[ -r ${path[config]} || ! -t 0 ]]; then
+    return 0
+  fi
+  for key in "${!args[@]}"; do
+    if [[ ${key} != 'server' ]]; then
+      return 0
+    fi
+  done
+  profile=$(ui_radiolist "Protocol" \
+    "What should this server serve? reality and a QUIC protocol can share the same port number, because one is TCP and the other UDP." \
+    "reality" \
+    "reality" "reality (TCP ${defaults[port]}, recommended)" \
+    "reality-hysteria2" "reality + hysteria2 (TCP ${defaults[port]} + UDP ${defaults[port]})" \
+    "reality-tuic" "reality + tuic (TCP ${defaults[port]} + UDP ${defaults[port]})" \
+    "hysteria2" "hysteria2 only (UDP ${defaults[port]}, self-signed certificate)" \
+    "tuic" "tuic only (UDP ${defaults[port]}, self-signed certificate)") || return 0
+  case ${profile} in
+    reality-hysteria2)
+      args[transport]=tcp
+      args[security]=reality
+      args[quic_transport]=hysteria2
+      ;;
+    reality-tuic)
+      args[transport]=tcp
+      args[security]=reality
+      args[quic_transport]=tuic
+      ;;
+    hysteria2)
+      args[transport]=hysteria2
+      args[security]=selfsigned
+      args[quic_transport]=OFF
+      ;;
+    tuic)
+      args[transport]=tuic
+      args[security]=selfsigned
+      args[quic_transport]=OFF
+      ;;
+    *)
+      args[transport]=tcp
+      args[security]=reality
+      args[quic_transport]=OFF
+      ;;
+  esac
+}
+
 function print_client_configuration {
   local username=$1
   local client_config
@@ -2550,6 +2724,9 @@ function print_client_configuration {
   local ipv6_link_address
   local ss_config=''
   local ss_config_ipv6=''
+  local quic_config=''
+  local quic_config_ipv6=''
+  local quic_label=''
   if [[ ${config[transport]} == 'tuic' ]]; then
     client_config="tuic://"
     client_config="${client_config}${users[${username}]}"
@@ -2603,6 +2780,17 @@ function print_client_configuration {
   if [[ -n ${config[ss_port]} ]]; then
     ss_config="ss://$(printf '%s' "2022-blake3-aes-128-gcm:$(ss2022_user_key "${username}" "${users[${username}]}")" | base64 | tr -d '\n')@${config[server]}:${config[ss_port]}#${username}-ss"
   fi
+  # The QUIC co-install is a node of its own: same port number, UDP instead of
+  # TCP, its own password. It is printed next to the main link so a client can
+  # use either one.
+  if [[ ${config[quic_transport]:-OFF} != 'OFF' ]]; then
+    quic_config=$(quic_client_uri "${username}")
+    if [[ ${config[quic_transport]} == 'tuic' ]]; then
+      quic_label='TUIC'
+    else
+      quic_label='Hysteria2'
+    fi
+  fi
   echo ""
   echo "=================================================="
   echo "Client configuration:"
@@ -2612,6 +2800,17 @@ function print_client_configuration {
   echo "Or you can scan the QR code:"
   echo ""
   qrencode -t ansiutf8 "${client_config}"
+  if [[ -n ${quic_config} ]]; then
+    echo ""
+    echo "============${quic_label} (QUIC on ${config[port]}/udp)============"
+    echo "Client configuration:"
+    echo ""
+    echo "${quic_config}"
+    echo ""
+    echo "Or you can scan the QR code:"
+    echo ""
+    qrencode -t ansiutf8 "${quic_config}"
+  fi
   if [[ -n ${ss_config} ]]; then
     echo ""
     echo "==================Shadowsocks 2022======================"
@@ -2636,6 +2835,9 @@ function print_client_configuration {
     if [[ -n ${ss_config} ]]; then
       ss_config_ipv6=$(echo "$ss_config" | sed "s/@${config[server]//./\\.}:/@[${ipv6_link_address}]:/" | sed "s/#${username}-ss/#${username}-ss-ipv6/")
     fi
+    if [[ -n ${quic_config} ]]; then
+      quic_config_ipv6=$(quic_client_uri "${username}" "${ipv6_link_address}")
+    fi
     echo ""
     echo "==================IPv6 Config======================"
     echo "Client configuration:"
@@ -2652,6 +2854,14 @@ function print_client_configuration {
       echo "${ss_config_ipv6}"
       echo ""
       qrencode -t ansiutf8 "${ss_config_ipv6}"
+    fi
+    if [[ -n ${quic_config_ipv6} ]]; then
+      echo ""
+      echo "Client configuration (${quic_label} over IPv6):"
+      echo ""
+      echo "${quic_config_ipv6}"
+      echo ""
+      qrencode -t ansiutf8 "${quic_config_ipv6}"
     fi
   fi
 }
@@ -2705,6 +2915,18 @@ function client_singbox_outbound {
   fi
 }
 
+function client_quic_singbox_outbound {
+  local bandwidth_object=''
+  if [[ ${config[quic_transport]} == 'tuic' ]]; then
+    echo '{"type": "tuic", "tag": "proxy-quic", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "uuid": "'"${client_uuid}"'", "password": "'"${client_password}"'", "congestion_control": "'"${config[tuic_congestion]}"'", "udp_relay_mode": "quic", "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "insecure": true, "alpn": ["h3"]}}'
+  else
+    if [[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]]; then
+      bandwidth_object=', "up_mbps": '"${config[hysteria2_up]}"', "down_mbps": '"${config[hysteria2_down]}"''
+    fi
+    echo '{"type": "hysteria2", "tag": "proxy-quic", "server": "'"${client_host}"'", "server_port": '"${client_port}"', "password": "'"${client_password}"'"'"${bandwidth_object}"', "obfs": {"type": "salamander", "password": "'"${config[service_path]}"'"}, "tls": {"enabled": true, "server_name": "'"${client_sni}"'", "insecure": true}}'
+  fi
+}
+
 function client_v2ray_outbound {
   local flow_object=''
   local stream_object=''
@@ -2726,6 +2948,41 @@ function client_v2ray_outbound {
     echo '{"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{"address": "'"${client_host}"'", "port": '"${client_port}"', "users": [{"id": "'"${client_uuid}"'", "encryption": "none"'"${flow_object}"'}]}]}, "streamSettings": {"network": "'"$([[ ${config[transport]} == 'http' ]] && echo xhttp || echo "${config[transport]}")"'", "security": "reality", "realitySettings": {"serverName": "'"${client_sni}"'", "fingerprint": "chrome", "publicKey": "'"${config[public_key]}"'", "shortId": "'"${config[short_id]}"'"}, '"${stream_object}"'}}'
   else
     echo '{"protocol": "vless", "tag": "proxy", "settings": {"vnext": [{"address": "'"${client_host}"'", "port": '"${client_port}"', "users": [{"id": "'"${client_uuid}"'", "encryption": "none"'"${flow_object}"'}]}]}, "streamSettings": {"network": "'"$([[ ${config[transport]} == 'http' ]] && echo xhttp || echo "${config[transport]}")"'", "security": "tls", "tlsSettings": {"serverName": "'"${client_sni}"'", "allowInsecure": '"${client_insecure}"', "fingerprint": "chrome"}, '"${stream_object}"'}}'
+  fi
+}
+
+# Clash entry for the QUIC co-install. The local certificate is what the
+# inbound serves unless letsencrypt issued a real one, and the node may also be
+# reached by an IPv6 literal, so verification is skipped here.
+function client_quic_clash_proxy {
+  local up_down_yaml=''
+  if [[ ${config[quic_transport]} == 'tuic' ]]; then
+    echo "- name: \"${username}-quic\"
+  type: tuic
+  server: ${client_host}
+  port: ${client_port}
+  uuid: ${client_uuid}
+  password: ${client_password}
+  udp-relay-mode: quic
+  congestion-controller: ${config[tuic_congestion]}
+  sni: ${client_sni}
+  alpn: [h3]
+  skip-cert-verify: true"
+  else
+    if [[ -n ${config[hysteria2_up]} && -n ${config[hysteria2_down]} ]]; then
+      up_down_yaml="
+  up: \"${config[hysteria2_up]} Mbps\"
+  down: \"${config[hysteria2_down]} Mbps\""
+    fi
+    echo "- name: \"${username}-quic\"
+  type: hysteria2
+  server: ${client_host}
+  port: ${client_port}
+  password: ${client_password}
+  obfs: salamander
+  obfs-password: ${config[service_path]}
+  sni: ${client_sni}
+  skip-cert-verify: true${up_down_yaml}"
   fi
 }
 
@@ -2808,6 +3065,7 @@ function client_clash_proxy {
 function print_client_configuration_formatted {
   local username=$1
   local outbound
+  local quic_outbound=''
   client_export_params
   case ${args[format]} in
     clash)
@@ -2817,6 +3075,9 @@ function print_client_configuration_formatted {
       fi
       echo "proxies:"
       client_clash_proxy
+      if [[ ${config[quic_transport]:-OFF} != 'OFF' ]]; then
+        client_quic_clash_proxy
+      fi
       ;;
     singbox)
       if [[ ${config[transport]} == 'shadowtls' ]]; then
@@ -2824,11 +3085,19 @@ function print_client_configuration_formatted {
         return 0
       fi
       client_singbox_outbound
+      if [[ ${config[quic_transport]:-OFF} != 'OFF' ]]; then
+        # Two outbounds, one per line: the format is a bare object, so the
+        # operator adds each of them to "outbounds" (tags proxy / proxy-quic).
+        client_quic_singbox_outbound
+      fi
       ;;
     v2ray)
       if ! client_v2ray_outbound; then
         echo 'The v2ray format only covers the vless transports (tcp / ws / grpc / http); use --format singbox for this one.'
         return 1
+      fi
+      if [[ ${config[quic_transport]:-OFF} != 'OFF' ]]; then
+        echo 'The v2ray format cannot express the QUIC co-install; use --format singbox, --format clash, or the default uri link for that node.' >&2
       fi
       ;;
     json)
@@ -2837,13 +3106,17 @@ function print_client_configuration_formatted {
         return 0
       fi
       outbound=$(client_singbox_outbound)
+      if [[ ${config[quic_transport]:-OFF} != 'OFF' ]]; then
+        quic_outbound=",
+    $(client_quic_singbox_outbound)"
+      fi
       echo '{
   "log": {"level": "info"},
   "inbounds": [
     {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080}
   ],
   "outbounds": [
-    '"${outbound}"'
+    '"${outbound}""${quic_outbound}"'
   ],
   "route": {"final": "proxy"}
 }'
@@ -3148,6 +3421,7 @@ function show_server_config {
   fi
   server_config=$server_config$'\n'"Transport: ${config[transport]}"
   server_config=$server_config$'\n'"Security: ${config[security]}"
+  server_config=$server_config$'\n'"QUIC co-install: ${config[quic_transport]:-OFF}"
   server_config=$server_config$'\n'"Safenet: ${config[safenet]}"
   server_config=$server_config$'\n'"BBR: $(bbr_summary)"
   server_config=$server_config$'\n'"WARP: ${config[warp]}"
@@ -3215,7 +3489,8 @@ function configuration_menu {
       "14" "Regenerate Keys" \
       "15" "Restore Defaults" \
       "16" "Create Backup" \
-      "17" "Restore Backup")
+      "17" "Restore Backup" \
+      "18" "QUIC co-install (hysteria2 / tuic)")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -3271,6 +3546,9 @@ function configuration_menu {
       17 )
         restore_backup_menu
         ;;
+      18 )
+        config_quic_menu
+        ;;
     esac
   done
 }
@@ -3294,6 +3572,10 @@ function config_core_menu {
     fi
     if [[ ${core} == 'xray' && ${config[transport]} == 'shadowtls' ]]; then
       message_box 'Invalid Configuration' 'You cannot use "xray" core with "shadowtls" transport. Change core to "sing-box" or use other transports'
+      continue
+    fi
+    if [[ ${core} == 'xray' && ${config[quic_transport]:-OFF} != 'OFF' ]]; then
+      message_box 'Invalid Configuration' 'The QUIC co-install needs "sing-box". Turn the co-install off before switching to "xray"'
       continue
     fi
     if [[ ${core} != ${config[core]} ]]; then
@@ -3390,10 +3672,42 @@ function config_transport_menu {
       message_box 'Invalid Configuration' 'You cannot use "anytls" transport with "reality" TLS certificate. Use other transports or change TLS certificate to "letsencrypt" or "selfsigned"'
       continue
     fi
+    if [[ (${transport} == 'tuic' || ${transport} == 'hysteria2') && ${config[quic_transport]:-OFF} != 'OFF' ]]; then
+      message_box 'Invalid Configuration' "The main transport cannot move to ${transport} while the QUIC co-install is on: the co-install needs a TCP main transport. Turn the co-install off first"
+      continue
+    fi
     if [[ ${config[transport]} != 'shadowtls' && ${transport} == 'shadowtls' && ${config[security]} != 'reality' ]]; then
       config[domain]="${defaults[domain]}"
     fi
     config[transport]=$transport
+    update_config_file
+    break
+  done
+}
+
+function config_quic_menu {
+  local quic
+  while true; do
+    quic=$(ui_radiolist "QUIC co-install" \
+      "Run a second, UDP-only protocol on <port>/udp next to the main transport? Both share the same port number because one is TCP and the other UDP." \
+      "${config[quic_transport]:-OFF}" \
+      "OFF" "Off (single protocol)" \
+      "hysteria2" "hysteria2 on UDP" \
+      "tuic" "tuic on UDP")
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    if [[ ${quic} != 'OFF' ]]; then
+      if [[ ${config[core]} != 'sing-box' ]]; then
+        message_box 'Invalid Configuration' "The QUIC co-install needs the sing-box core; xray has no ${quic} inbound"
+        continue
+      fi
+      if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
+        message_box 'Invalid Configuration' "The main transport is already ${config[transport]}; the QUIC co-install needs a TCP main transport"
+        continue
+      fi
+    fi
+    config[quic_transport]=${quic}
     update_config_file
     break
   done
@@ -4623,7 +4937,7 @@ function open_firewall {
   if needs_certbot && [[ -z ${config[dns_provider]} ]]; then
     tcp_ports+=('80')
   fi
-  if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
+  if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' || ${config[quic_transport]:-OFF} != 'OFF' ]]; then
     udp_ports+=("${config[port]}")
   fi
   if [[ -n ${config[ss_port]} ]]; then
@@ -4692,6 +5006,15 @@ function doctor {
   else
     echo "FAIL  nothing is listening on the proxy port ${config[port]}"
     problems=$((problems + 1))
+  fi
+  # The QUIC co-install answers on the same port number over UDP. sing-box
+  # binds the UDP socket itself, so the TCP probe above proves nothing about it.
+  if [[ ${config[quic_transport]:-OFF} != 'OFF' ]]; then
+    if command -v ss >/dev/null 2>&1 && ss -lun 2>/dev/null | grep -q ":${config[port]} "; then
+      echo "ok    QUIC port ${config[port]}/udp is listening (${config[quic_transport]})"
+    else
+      echo "warn  nothing is listening on the QUIC port ${config[port]}/udp (${config[quic_transport]})"
+    fi
   fi
   if command -v openssl >/dev/null 2>&1; then
     check=$(echo | timeout 10 openssl s_client -connect "127.0.0.1:${config[port]}" -servername "${config[domain]%%:*}" -tls1_3 2>/dev/null | grep -c 'TLSv1.3' || true)
@@ -4799,6 +5122,7 @@ if [[ -n ${args[restore]} ]]; then
   clear
 fi
 generate_file_list
+first_install_protocol_prompt
 install_packages
 if [[ ${args[check_update]} == true ]]; then
   check_update || true

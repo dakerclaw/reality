@@ -28,6 +28,9 @@
 * 自动安装并配置 Docker 与 Compose 插件
 * 引擎可选 `sing-box` / `xray`，默认为 `sing-box`；TLS 可选 `reality` / `letsencrypt` / `selfsigned`，默认为 `reality`。
 * 传输协议：`tcp`、`http`、`grpc`、`ws`、`tuic`、`hysteria2`、`shadowtls`，默认为 `tcp`。
+* **同一端口双协议**：`--quic-transport` 在 TCP 主传输之外再叠加一个 `hysteria2` / `tuic`
+  入口，两者共用同一个端口号（一个走 TCP、一个走 UDP）和同一份用户列表；QUIC 侧使用
+  `server.crt` 自签证书，客户端链接里已带跳过校验的参数。
 * 多用户，每用户独立 UUID / 密码，输出客户端链接与二维码
 * Cloudflare WARP 出口（支持免费版与 WARP+ 授权），不引入任何额外镜像
 * 自动开启 BBR 拥塞控制（加载 `tcp_bbr` + `fq` 队列，写入 `/etc/sysctl.d`），
@@ -67,6 +70,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 安装脚本会把全部内容写入 `/opt/reality`，启动服务栈，输出第一个客户端配置，并在需要时
 打开管理菜单。它同时会把**本脚本自身的一份副本放到 `/opt/reality/reality.sh`**，
 此后所有管理操作都通过这一份执行；因为副本就在配置目录里，每次运行都会被刷新为当前版本。
+
+**首次安装会问要装哪套协议**，前提是：正在终端里直接运行脚本（`bash reality.sh`）、
+还没有任何配置、也没有给任何参数。可选项是 `reality`、`reality + hysteria2`、
+`reality + tuic`、`hysteria2`、`tuic`。用 `curl | bash`（stdin 不是终端）、CI、机器人，
+或已经带了参数时不会询问，按参数 / 默认值安装，行为与以前一致。
 这件事与是否启用 Telegram 机器人无关 —— 机器人只是恰好也挂载同一个目录。
 
 常见用法：
@@ -91,7 +99,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
   --security letsencrypt --server vpn.example.com
 
-# TUIC / hysteria2（QUIC，走 UDP）：不需要域名，用自签证书即可
+# reality 与 hysteria2 同时安装：443/tcp 走 reality，443/udp 走 hysteria2
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --quic-transport hysteria2
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --quic-transport tuic
+
+# TUIC / hysteria2 单独安装（QUIC，走 UDP）：不需要域名，用自签证书即可
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
   --transport hysteria2 --security selfsigned
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
@@ -107,7 +121,7 @@ bash /opt/reality/reality.sh --menu
 
 | 监听用途 | 默认宿主端口 | 由谁控制 | 说明 |
 | --- | --- | --- | --- |
-| 代理 + 网站（HTTPS） | `443/tcp`（tuic / hysteria2 另加 `/udp`） | `--port` | 一个端口两种用途，由 haproxy 按 SNI 分流；`80` 会被拒绝 |
+| 代理 + 网站（HTTPS） | `443/tcp`（tuic / hysteria2 / `--quic-transport` 另加 `/udp`） | `--port` | 一个端口两种用途，由 haproxy 按 SNI 分流；`80` 会被拒绝 |
 | 网站（明文 HTTP） | 不开启（`off`） | `--http-port` | 由 nginx 从 `./website` 目录提供；默认不监听，显式给一个端口才发布（`443` 上的网站不受影响） |
 | ACME 校验 | `80/tcp` | 强制 | **仅** `--security=letsencrypt` 模式使用 |
 
@@ -130,6 +144,33 @@ bash /opt/reality/reality.sh --menu
   所以 `443` 整条留给代理，网站只走 `--http-port`（默认不发布，需要时显式给端口）。
 * 从旧版本升级时，配置里遗留的 `port=8443`（老版本的出厂值）会被自动改成 `443` 并打印
   提示；其他自定义端口保持不变。
+
+---
+
+## 同一端口叠加 QUIC 协议
+
+`--quic-transport <hysteria2|tuic>` 在 TCP 主传输之外再开一个 QUIC 入口。它不是「再装一套」，
+而是在同一个引擎里多一个 inbound：
+
+* **端口**：与主传输共用 `--port` 的**同一个号码**。主传输走 TCP，QUIC 走 UDP，内核里是两张
+  独立的 socket 表，所以 `443/tcp` 和 `443/udp` 可以同时监听，不需要占用第二个端口。
+* **前提**：引擎必须是 sing-box（xray 没有 hysteria2 / tuic inbound），主传输必须是 TCP 类
+  （`tcp` / `http` / `grpc` / `ws` / `shadowtls`）。在管理菜单里把主传输改成 `hysteria2` /
+  `tuic`、或把引擎切到 `xray` 时都会被拦下，并提示先关掉叠加。
+* **证书**：QUIC 侧用 `server.crt` / `server.key`。`reality` 模式平时不生成这两个文件，
+  开启叠加后会自动生成一对自签证书挂进引擎；`letsencrypt` 模式则直接复用申请到的证书。
+  客户端默认跳过校验（`insecure=1` / `allow_insecure=1`），只有 `letsencrypt` 且直连域名时
+  才要求校验。
+* **用户**：与主传输共用同一份用户列表，不需要单独加人。QUIC 的密码由「用户名 + UUID」
+  哈希后的前 16 位字符派生，所以只要用户的 UUID 不变，重装或改配置后密码也不变；
+  tuic 另外还使用 UUID 本身作为 `uuid`。
+* **输出**：打印客户端配置时，主链接之后会再打印一条 QUIC 链接（`hy2://` 或 `tuic://`）
+  和它的 IPv6 版本，二维码同样各一张。`--format clash` 会把 QUIC 节点追加进 `proxies`；
+  `--format singbox` 额外输出一个 `tag: proxy-quic` 的 outbound；`--format json` 把两个
+  outbound 放进同一个 `outbounds` 数组；`--format v2ray` 表达不了 QUIC，会明确提示改用别的格式。
+* **体检**：`--doctor` 会额外检查 `<端口>/udp` 是否在监听，`--open-firewall` 会一并放行该
+  UDP 端口。
+* **切换**：管理菜单第 18 项「QUIC co-install」随时可以开关或换协议，改完重启服务栈即可。
 
 ---
 
@@ -208,6 +249,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
   `tuic` / `hysteria2` / `anytls`，或者 `shadowtls` 传输 —— 也就是说 **TUIC 和 hysteria2 不需要
   域名**，改用 `--security selfsigned` 即可；它们走 QUIC（UDP），客户端链接里已带
   `insecure=1` / `allow_insecure=1` 跳过自签证书校验，记得在服务商防火墙放行 `<端口>/udp`。
+* 拒绝的是「同一个传输」配 `reality`，不是「同一台服务器」。想让 `reality` 和
+  `hysteria2`（或 `tuic`）共存，用 `--quic-transport` 叠加：主传输仍是 `reality` + `tcp`，
+  QUIC 入口另开一个 UDP 监听，两者只是共用端口号和用户列表。
   `selfsigned` 只填 IP 时，SNI 会自动设成默认站点而不是那个 IP ——
   客户端从不把 IP 当作 TLS SNI 发出去，若真设成 IP，`443` 上的 SNI 分流会把代理流量误送到网站。
 * 代价是你借用了别人的域名：请选一个**服务器与客户端都能访问**、且 TLS 指纹普通的站点。
@@ -262,7 +306,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 ## 命令行参数
 
 <details>
-<summary>点击展开完整参数表（38 项）</summary>
+<summary>点击展开完整参数表（39 项）</summary>
 
 | 参数 | 说明 |
 | --- | --- |
@@ -296,6 +340,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `--backup-password <password>` | 为备份设置密码 |
 | `--hysteria2-up <mbps>` / `--hysteria2-down <mbps>` | hysteria2 服务端上下行（Mbps），两个都填才生效：等价于关闭 `ignore_client_bandwidth`，改由服务端按此速率用 Brutal 整形 |
 | `--tuic-congestion <cubic\|new_reno\|bbr>` | tuic v5 的拥塞控制算法（默认 `bbr`） |
+| `--quic-transport <off\|hysteria2\|tuic>` | 在 TCP 主传输之外，用**同一端口号**再叠加一个 QUIC（UDP）入口，共用用户列表；需要 sing-box 内核和 TCP 主传输，默认 `off` |
 | `--ss-port <port\|off>` | 额外开放一个 Shadowsocks 2022（`2022-blake3-aes-128-gcm`）入口，自带独立端口（仅 sing-box；默认关闭）。它不参与 SNI 分流，因为纯 TCP 没有 TLS SNI 可分；每个用户会派生一把稳定的独立密钥 |
 | `--dns-provider <cloudflare>` | 改用 DNS-01 校验来签发证书（默认关闭）：不再需要 80 端口入站，并会自动附带一张 `*.你的域名` 泛域名证书 |
 | `--dns-credentials <path>` | DNS 服务商凭据文件的宿主机路径（Cloudflare 为含 `dns_cloudflare_api_token = ...` 的 ini 文件），会以只读方式挂进 certbot 容器 |

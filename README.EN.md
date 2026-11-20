@@ -37,6 +37,10 @@ with three design rules on top of the upstream feature set:
   `selfsigned` TLS (default `reality`)
 * Transports: `tcp`, `http`, `grpc`, `ws`, `tuic`, `hysteria2`, `shadowtls`
   (default `tcp`)
+* **Two protocols on one port**: `--quic-transport` adds a `hysteria2` or `tuic`
+  listener next to the TCP transport, sharing the same port number (one TCP, one
+  UDP) and the same user list; the QUIC side uses the local `server.crt` and the
+  links ship with certificate verification disabled.
 * Multi-user with per-user UUID/password, client links and QR codes
 * Cloudflare WARP outbound (free and WARP+ license), zero extra images
 * BBR congestion control switched on automatically (`tcp_bbr` + the `fq` qdisc,
@@ -85,6 +89,13 @@ every later management command runs; because that copy lives in the configuratio
 directory, each run refreshes it to the current version. This has nothing to do
 with the Telegram bot being enabled — the bot merely mounts the same directory.
 
+**The first install asks which protocol to serve**, but only when the script is
+run directly from a terminal (`bash reality.sh`), no configuration exists yet and
+no flag was given. The choices are `reality`, `reality + hysteria2`,
+`reality + tuic`, `hysteria2` and `tuic`. A piped `curl | bash` (stdin is not a
+terminal), CI, the bot, or any explicit flag skips the prompt and installs from
+the flags/defaults exactly as before.
+
 Common invocations:
 
 ```bash
@@ -107,7 +118,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
   --security letsencrypt --server vpn.example.com
 
-# TUIC / hysteria2 (QUIC over UDP): no domain needed, a self-signed cert is enough
+# reality plus hysteria2 on the same port: 443/tcp reality, 443/udp hysteria2
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --quic-transport hysteria2
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --quic-transport tuic
+
+# TUIC / hysteria2 on their own (QUIC over UDP): no domain needed, a self-signed cert is enough
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
   --transport hysteria2 --security selfsigned
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
@@ -123,7 +140,7 @@ bash /opt/reality/reality.sh --menu
 
 | Listener | Default host port | Controlled by | Notes |
 | --- | --- | --- | --- |
-| Proxy + website (HTTPS) | `443/tcp` (and `/udp` for tuic/hysteria2) | `--port` | Two jobs on one port, split by SNI in haproxy; `80` is refused |
+| Proxy + website (HTTPS) | `443/tcp` (and `/udp` for tuic/hysteria2/`--quic-transport`) | `--port` | Two jobs on one port, split by SNI in haproxy; `80` is refused |
 | Website (plain HTTP) | off (unpublished) | `--http-port` | Served by nginx out of `./website`; listens only when a port is given (the `443` site stays up either way) |
 | ACME challenge | `80/tcp` | forced | **Only** in `--security=letsencrypt` mode |
 
@@ -153,6 +170,42 @@ Behaviour worth knowing:
   pass a port to enable it).
 * Upgrading from an older release migrates a stored `port=8443` (the old factory
   default) to `443` and says so; any other custom port is left alone.
+
+---
+
+## Stacking a QUIC protocol on the same port
+
+`--quic-transport <hysteria2|tuic>` opens a QUIC entry point next to the TCP
+transport. It is not a second installation; it is one more inbound in the same
+engine:
+
+* **Port**: it shares the *number* of `--port`. The transport runs over TCP, QUIC
+  over UDP, and the kernel keeps separate socket tables for the two, so
+  `443/tcp` and `443/udp` listen at the same time without a second port.
+* **Prerequisites**: the engine has to be sing-box (xray has no hysteria2/tuic
+  inbound) and the main transport has to be a TCP one (`tcp`, `http`, `grpc`,
+  `ws`, `shadowtls`). Switching the transport to `hysteria2`/`tuic` or the engine
+  to `xray` while the co-install is on is refused with a hint to turn it off
+  first.
+* **Certificate**: the QUIC side uses `server.crt`/`server.key`. `reality` does
+  not create that pair, so enabling the co-install generates a self-signed one
+  and mounts it; `letsencrypt` reuses the certificate it obtained. Clients skip
+  verification by default (`insecure=1` / `allow_insecure=1`); verification is
+  only requested in `letsencrypt` mode when the client connects to the domain.
+* **Users**: one list serves both sides, no separate accounts. The QUIC password
+  is derived from the first 16 hex characters of `sha256(user + uuid)`, so it
+  survives a reinstall as long as the UUID does; tuic also carries the UUID as
+  its `uuid`.
+* **Output**: the printed client configuration shows the QUIC link (`hy2://` or
+  `tuic://`) and its IPv6 twin after the main link, each with a QR code.
+  `--format clash` appends the QUIC proxy to `proxies`, `--format singbox`
+  prints an extra outbound tagged `proxy-quic`, `--format json` puts both
+  outbounds into one `outbounds` array, and `--format v2ray` cannot express QUIC
+  and says so.
+* **Health**: `--doctor` also checks that `<port>/udp` is listening, and
+  `--open-firewall` opens that UDP port too.
+* **Switching**: menu entry 18, "QUIC co-install", toggles it or changes the
+  protocol at any time; restart the stack afterwards.
 
 ---
 
@@ -241,6 +294,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
   just `--security selfsigned`. Both run over QUIC (UDP): the links carry
   `insecure=1` for the self-signed certificate, and the provider firewall has to
   allow `<port>/udp`.
+* What is refused is tying `reality` to the *same transport*, not running both on
+  one machine. To serve `reality` and `hysteria2` (or `tuic`) together, stack them
+  with `--quic-transport`: the main transport stays `reality` + `tcp` and the QUIC
+  inbound listens on UDP, sharing only the port number and the user list. See
+  [Stacking a QUIC protocol on the same port](#stacking-a-quic-protocol-on-the-same-port).
 * The trade-off is that you are borrowing someone else's domain: pick a site that
   is reachable from **both** the server and the client, with an ordinary-looking
   TLS stack. See [Security notes](#security-notes).
@@ -300,7 +358,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 ## Command line reference
 
 <details>
-<summary>Click to expand the full option table (28 options)</summary>
+<summary>Click to expand the full option table (29 options)</summary>
 
 | Option | Description |
 | --- | --- |
@@ -312,6 +370,7 @@ RULESET_BASE_URL=https://rules.example.com/sing-box \
 | `--http-port <port\|off>` | Host port of the plain-HTTP website served by nginx (default `off` = unpublished; pass a port to publish it) |
 | `-c, --core <xray\|sing-box>` | Engine (default `sing-box`) |
 | `--security <reality\|letsencrypt\|selfsigned>` | TLS mode (default `reality`) |
+| `--quic-transport <off\|hysteria2\|tuic>` | Add a QUIC (UDP) listener on the **same port number** as the TCP transport, sharing the user list; needs sing-box and a TCP main transport (default `off`) |
 | `--enable-safenet <true\|false>` | Block ads/malware, plus adult content on sing-box |
 | `--enable-bbr <true\|false>` | Enable the BBR congestion control and the `fq` qdisc (default `true`; skipped with a warning on kernels that lack BBR) |
 | `--enable-warp <true\|false>` | Route outbound traffic through Cloudflare WARP |
