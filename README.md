@@ -91,6 +91,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
   --security letsencrypt --server vpn.example.com
 
+# TUIC / hysteria2（QUIC，走 UDP）：不需要域名，用自签证书即可
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --transport hysteria2 --security selfsigned
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --transport tuic --security selfsigned
+
 # 之后随时打开管理菜单
 bash /opt/reality/reality.sh --menu
 ```
@@ -198,8 +204,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 * 只要不涉及 `letsencrypt`，`--server` 直接填公网 IP 即可；能自动探测时脚本会自己探测，
   只有在探测失败且未手工指定时才会以提示信息中止安装。
 * `ws`、`tuic`、`hysteria2` 与 `reality` 组合会被拒绝（它们需要真正的 TLS 终结）。没有域名时
-  可用的组合是 `reality` + `tcp` / `http` / `grpc`、`selfsigned` + `tcp` / `http` / `grpc`，
-  或者 `shadowtls` 传输。`selfsigned` 只填 IP 时，SNI 会自动设成默认站点而不是那个 IP ——
+  可用的组合是 `reality` + `tcp` / `http` / `grpc`、`selfsigned` + `tcp` / `http` / `grpc` /
+  `tuic` / `hysteria2` / `anytls`，或者 `shadowtls` 传输 —— 也就是说 **TUIC 和 hysteria2 不需要
+  域名**，改用 `--security selfsigned` 即可；它们走 QUIC（UDP），客户端链接里已带
+  `insecure=1` / `allow_insecure=1` 跳过自签证书校验，记得在服务商防火墙放行 `<端口>/udp`。
+  `selfsigned` 只填 IP 时，SNI 会自动设成默认站点而不是那个 IP ——
   客户端从不把 IP 当作 TLS SNI 发出去，若真设成 IP，`443` 上的 SNI 分流会把代理流量误送到网站。
 * 代价是你借用了别人的域名：请选一个**服务器与客户端都能访问**、且 TLS 指纹普通的站点。
   详见[安全说明](#安全说明)。

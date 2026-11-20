@@ -107,6 +107,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
 bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
   --security letsencrypt --server vpn.example.com
 
+# TUIC / hysteria2 (QUIC over UDP): no domain needed, a self-signed cert is enough
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --transport hysteria2 --security selfsigned
+bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reality.sh) \
+  --transport tuic --security selfsigned
+
 # open the management menu later
 bash /opt/reality/reality.sh --menu
 ```
@@ -230,7 +236,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dakerclaw/reality/main/reali
   the install with a hint.
 * `ws`, `tuic` and `hysteria2` are refused together with `reality` (they need real
   TLS termination). Without a domain the useful combinations are `reality` with
-  `tcp`/`http`/`grpc`, or the `shadowtls` transport.
+  `tcp`/`http`/`grpc`, `selfsigned` with `tcp`/`http`/`grpc`/`tuic`/`hysteria2`/
+  `anytls`, or the `shadowtls` transport — so **TUIC and hysteria2 need no domain**,
+  just `--security selfsigned`. Both run over QUIC (UDP): the links carry
+  `insecure=1` for the self-signed certificate, and the provider firewall has to
+  allow `<port>/udp`.
 * The trade-off is that you are borrowing someone else's domain: pick a site that
   is reachable from **both** the server and the client, with an ordinary-looking
   TLS stack. See [Security notes](#security-notes).
