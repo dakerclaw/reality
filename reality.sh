@@ -2046,6 +2046,10 @@ function generate_engine_config {
   local ss_users_object=""
   local quic_users_object=""
   local quic_extra=''
+  # tuic is an HTTP/3-shaped protocol and its clients offer ALPN "h3". Without
+  # an explicit list the inbound answers the handshake without selecting one,
+  # and the client drops the connection with CRYPTO_ERROR 0x178.
+  local quic_alpn=''
   # The camouflage site is what unauthenticated probes reach; it is a separate
   # deployment input from the SNI, and its optional ":port" suffix defaults to 443.
   local camouflage_host="${config[camouflage]%%:*}"
@@ -2067,6 +2071,8 @@ function generate_engine_config {
     quic_extra=', "obfs": {"type": "salamander", "password": "'"${config[service_path]}"'"}'"${hysteria2_bandwidth}"', "masquerade": "https://'"${config[server]}:${config[port]}"'"'
   elif [[ ${config[quic_transport]:-OFF} == 'tuic' ]]; then
     quic_extra=', "congestion_control": "'"${config[tuic_congestion]}"'", "auth_timeout": "3s", "zero_rtt_handshake": false, "heartbeat": "10s"'
+    quic_alpn=',
+        "alpn": ["h3"]'
   fi
   local temp_file
   if [[ ${config[transport]} == 'tuic' ]]; then
@@ -2229,7 +2235,11 @@ function generate_engine_config {
       "listen": "::",
       "listen_port": 443,
       "users": ['"${quic_users_object}"'],
-      '"${tls_object}""${quic_extra}"'
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/etc/sing-box/server.crt",
+        "key_path": "/etc/sing-box/server.key"'"${quic_alpn}"'
+      }'"${quic_extra}"'
     }'
     fi )
     $(if [[ ${config[transport]} == 'shadowtls' ]]; then
@@ -5059,7 +5069,7 @@ function doctor {
   echo
   echo "Ports to allow in the provider firewall / security group:"
   echo "  tcp: ${config[port]}$([[ ${config[http_port]} != 'OFF' ]] && echo " ${config[http_port]}" || true)$([[ ${config[security]} == 'letsencrypt' ]] && echo ' 80' || true)"
-  if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' ]]; then
+  if [[ ${config[transport]} == 'tuic' || ${config[transport]} == 'hysteria2' || ${config[quic_transport]:-OFF} != 'OFF' ]]; then
     echo "  udp: ${config[port]}"
   fi
   echo
