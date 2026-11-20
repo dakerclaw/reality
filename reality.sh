@@ -3229,7 +3229,8 @@ function main_menu {
       "2" "Delete User" \
       "3" "View User" \
       "4" "View Server Config" \
-      "5" "Configuration")
+      "5" "Configuration" \
+      "6" "Uninstall")
     if [[ $? -ne 0 ]]; then
       break
     fi
@@ -3248,6 +3249,9 @@ function main_menu {
         ;;
       5 )
         configuration_menu
+        ;;
+      6 )
+        uninstall_menu
         ;;
     esac
   done
@@ -3456,6 +3460,21 @@ function restart_menu {
   if [[ ${config[tgbot]} == 'ON' ]]; then
     restart_tgbot_compose
   fi
+}
+
+# Uninstall is destructive and irreversible: keys, users and the website all go
+# with the directory. The confirmation therefore names what disappears instead of
+# asking the usual "are you sure?", and anything but an explicit yes - including a
+# closed stdin - leaves the stack untouched.
+function uninstall_menu {
+  local prompt
+  prompt=$'This removes every container of the stack and deletes the directory holding the users, the keys and the website. Client configurations stop working immediately.\n\nType yes to uninstall, anything else keeps the current install.'
+  if ! ui_yesno "Uninstall" "${prompt}"; then
+    message_box "Uninstall" "Nothing was removed."
+    return 0
+  fi
+  echo "Uninstalling reality ..."
+  uninstall
 }
 
 function regenerate_menu {

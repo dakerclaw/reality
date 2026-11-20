@@ -37,7 +37,8 @@
   并附带内核 socket / backlog 调优
 * 通过 certbot 申请与自动续期 Letsencrypt 证书
 * 可选「安全上网」模式（拦截广告 / 恶意域名，sing-box 还可拦截成人内容）
-* 对话式文本管理界面（编号选择、无需方向键）与 Telegram 机器人管理用户
+* 对话式文本管理界面（编号选择、无需方向键）与 Telegram 机器人管理用户；
+  主菜单第 6 项可直接卸载（会先要求确认）
 * 自有网站由 nginx 提供：`https://<IP>` 走 `443`（与代理共用一个端口）；明文入口
   `--http-port` 默认关闭，需要时显式打开；`reality` / `shadowtls` 的回落目标仍是远端站点，不会混进来
 * 支持密码保护的备份与恢复（用户 + 配置）
@@ -536,6 +537,10 @@ bash /opt/reality/reality.sh --uninstall   # 不会卸载 Docker 本身
 再删除配置目录与内核调优文件 `/etc/sysctl.d/99-reality.conf`；镜像保留。从更早版本升级上来的
 机器还会一并清理旧部署目录 `/opt/reality-ezpz` 与它的旧 compose 项目 `reality-ezpz`，所以不会留下
 仍占着 443/8080 的容器。需要 root 权限；Docker 本身与 `/etc/docker/daemon.json` 保持不动。
+
+不想记参数也可以走菜单：`bash /opt/reality/reality.sh --menu` → 主菜单第 **6** 项「Uninstall」。
+它会先说清楚要删掉什么（容器、用户、密钥、网站，客户端配置会立刻失效），**输入 `yes` 才会真正
+执行**；直接回车、`n`、`Ctrl-D` 都算取消，不会动任何东西。
 
 ---
 

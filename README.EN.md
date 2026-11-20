@@ -47,7 +47,8 @@ with three design rules on top of the upstream feature set:
   written to `/etc/sysctl.d`), plus kernel socket/backlog tunables
 * Letsencrypt certificate issuance and renewal through certbot
 * Optional "safe internet" mode (blocks ads/malware, optionally adult content)
-* Conversational text menu and Telegram bot for user management
+* Conversational text menu and Telegram bot for user management; main menu
+  entry 6 uninstalls the stack (after an explicit confirmation)
 * nginx serves your own site from `./website` on `https://<ip>` (sharing `443`
   with the proxy); the plain-HTTP `--http-port` entry point is off unless you ask
   for one; in `reality`/`shadowtls`
@@ -587,6 +588,11 @@ certbot, telegram bot), then deletes the configuration directory and the kernel 
 it also cleans up the legacy directory `/opt/reality-ezpz` and its old compose project
 (`reality-ezpz`), so nothing is left holding 443/8080. It needs root; the Docker packages and
 `/etc/docker/daemon.json` are left alone.
+
+No flag needed either: `bash /opt/reality/reality.sh --menu` → main menu entry **6**,
+"Uninstall". It spells out what disappears (containers, users, keys, website, and client
+configurations that stop working at once) and only runs when the answer is `yes`; Enter,
+`n` or `Ctrl-D` cancel and leave everything as it is.
 
 ---
 
